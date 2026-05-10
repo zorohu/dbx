@@ -14,6 +14,7 @@ pub mod query_cancel;
 pub mod redis_ops;
 pub mod saved_sql;
 pub mod schema;
+pub mod schema_snapshot;
 pub mod sql;
 pub mod sql_safety;
 pub mod storage;
