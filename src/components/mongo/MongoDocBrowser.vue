@@ -333,6 +333,9 @@ async function saveDoc() {
     isNew.value = false;
     editFields.value = [];
     await load();
+    if (selectedIdx.value !== null && documents.value[selectedIdx.value]) {
+      editJson.value = JSON.stringify(documents.value[selectedIdx.value], null, 2);
+    }
   } catch (e: unknown) {
     error.value = String(e);
   }
