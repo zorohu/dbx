@@ -32,7 +32,13 @@ jobs:
         run: npx vue-tsc --noEmit
 
       - name: Frontend tests
-        run: pnpm test
+        run: pnpm test:coverage
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: coverage/lcov.info
+          token: ${{ secrets.CODECOV_TOKEN }}
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
