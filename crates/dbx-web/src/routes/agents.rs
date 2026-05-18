@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
@@ -8,44 +7,16 @@ use dbx_core::agent_manager::{
     AgentDriverInfo, AgentManager, AgentRegistry, AgentState, InstalledDriver, JavaRuntimeConfig, JavaRuntimeMode,
     DEFAULT_JRE_KEY,
 };
+use dbx_core::agent_service::{
+    build_agent_list, fetch_registry, find_local_agent_jar, github_url_to_r2_path, install_local_agent,
+    invalidate_registry_cache,
+};
 use futures::Stream;
 use serde::Deserialize;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::broadcast;
 
 use crate::error::AppError;
 use crate::state::WebState;
-
-const REGISTRY_PATH: &str = "https://github.com/t8y2/dbx-agents/releases/latest/download/agent-registry.json";
-const REGISTRY_R2_PATH: &str = "agents/agent-registry.json";
-
-static REGISTRY_CACHE: std::sync::LazyLock<Mutex<Option<(std::time::Instant, AgentRegistry)>>> =
-    std::sync::LazyLock::new(|| Mutex::new(None));
-
-const AGENT_TYPES: &[(&str, &str)] = &[
-    ("dameng", "达梦 DM8"),
-    ("kingbase", "人大金仓 KingbaseES"),
-    ("highgo", "瀚高 HighGo"),
-    ("vastbase", "Vastbase"),
-    ("goldendb", "GoldenDB"),
-    ("access", "Microsoft Access"),
-    ("oracle", "Oracle"),
-    ("oracle-10g", "Oracle 10g"),
-    ("h2", "H2"),
-    ("snowflake", "Snowflake"),
-    ("trino", "Trino (Presto)"),
-    ("hive", "Apache Hive"),
-    ("db2", "IBM DB2"),
-    ("informix", "IBM Informix"),
-    ("neo4j", "Neo4j"),
-    ("cassandra", "Apache Cassandra"),
-    ("bigquery", "Google BigQuery"),
-    ("kylin", "Apache Kylin"),
-    ("sundb", "SunDB"),
-    ("gaussdb", "GaussDB"),
-    ("yashandb", "崖山 YashanDB"),
-    ("tdengine", "TDengine"),
-    ("mongodb", "MongoDB (Legacy)"),
-];
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -63,36 +34,6 @@ pub struct JreRequest {
 #[serde(rename_all = "camelCase")]
 pub struct JavaRuntimeRequest {
     pub config: JavaRuntimeConfig,
-}
-
-fn build_agent_list(am: &AgentManager, registry: Option<&AgentRegistry>) -> Vec<AgentDriverInfo> {
-    let local_state = am.load_state();
-    AGENT_TYPES
-        .iter()
-        .map(|(key, label)| {
-            let installed = am.is_driver_installed(key);
-            let local = local_state.installed_drivers.get(*key);
-            let remote = registry.and_then(|r| r.drivers.get(*key));
-            let jre_key = remote
-                .map(|r| r.jre.clone())
-                .or_else(|| local.map(|l| l.jre.clone()))
-                .unwrap_or_else(|| DEFAULT_JRE_KEY.to_string());
-            AgentDriverInfo {
-                db_type: key.to_string(),
-                label: label.to_string(),
-                version: remote.map(|r| r.version.clone()).unwrap_or_default(),
-                size: remote.map(|r| r.jar.size).unwrap_or(0),
-                installed,
-                installed_version: local.map(|l| l.version.clone()),
-                update_available: match (local, remote) {
-                    (Some(l), Some(r)) => l.version != r.version,
-                    _ => false,
-                },
-                jre: jre_key.clone(),
-                jre_installed: am.is_jre_installed(&jre_key),
-            }
-        })
-        .collect()
 }
 
 pub async fn list_installed_agents_local(
@@ -182,7 +123,7 @@ pub async fn set_agent_java_runtime_config(
 }
 
 pub async fn invalidate_agent_registry_cache() -> Result<Json<serde_json::Value>, AppError> {
-    *REGISTRY_CACHE.lock().await = None;
+    invalidate_registry_cache().await;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -368,65 +309,6 @@ async fn reinstall_jre_core(am: &AgentManager, jre_key: &str, tx: &broadcast::Se
     am.save_state(&local_state)?;
     send_progress(tx, serde_json::json!({ "step": "done" }));
     Ok(())
-}
-
-fn local_agent_jar_candidates(db_type: &str) -> Vec<PathBuf> {
-    let jar_name = format!("dbx-agent-{db_type}.jar");
-    let relative = PathBuf::from("..").join("dbx-agents").join(db_type).join("build").join("libs").join(&jar_name);
-    let nested = PathBuf::from("dbx-agents").join(db_type).join("build").join("libs").join(&jar_name);
-    vec![relative, nested]
-}
-
-fn find_local_agent_jar(db_type: &str) -> Option<PathBuf> {
-    local_agent_jar_candidates(db_type).into_iter().find(|path| path.exists())
-}
-
-fn install_local_agent(am: &AgentManager, db_type: &str, source: PathBuf) -> Result<(), String> {
-    let jar_path = am.driver_jar_path(db_type);
-    let parent = jar_path.parent().ok_or_else(|| format!("Invalid driver path: {}", jar_path.display()))?;
-    std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
-    std::fs::copy(&source, &jar_path).map_err(|err| format!("Failed to copy local agent jar: {err}"))?;
-
-    let mut local_state = am.load_state();
-    local_state.installed_drivers.insert(
-        db_type.to_string(),
-        InstalledDriver {
-            version: "0.1.0-local".to_string(),
-            installed_at: chrono::Utc::now().to_rfc3339(),
-            jre: DEFAULT_JRE_KEY.to_string(),
-        },
-    );
-    am.save_state(&local_state)
-}
-
-async fn fetch_registry() -> Result<AgentRegistry, String> {
-    {
-        let cache = REGISTRY_CACHE.lock().await;
-        if let Some((ts, registry)) = cache.as_ref() {
-            if ts.elapsed() < std::time::Duration::from_secs(300) {
-                return Ok(registry.clone());
-            }
-        }
-    }
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|err| format!("Failed to create HTTP client: {err}"))?;
-    let resp = dbx_core::race_download(&client, REGISTRY_PATH, REGISTRY_R2_PATH, "dbx-agent-manager")
-        .await
-        .map_err(|err| format!("Failed to fetch agent registry: {err}"))?;
-    let registry: AgentRegistry = resp.json().await.map_err(|err| format!("Failed to parse registry: {err}"))?;
-    *REGISTRY_CACHE.lock().await = Some((std::time::Instant::now(), registry.clone()));
-    Ok(registry)
-}
-
-fn github_url_to_r2_path(github_url: &str, category: &str) -> String {
-    let filename = github_url.rsplit('/').next().unwrap_or(github_url);
-    match category {
-        "jre" => format!("agents/jre/{filename}"),
-        "driver" => format!("agents/drivers/{filename}"),
-        _ => format!("agents/{filename}"),
-    }
 }
 
 async fn download_with_progress(

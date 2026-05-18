@@ -1,4 +1,5 @@
 pub mod agent_manager;
+pub mod agent_service;
 pub mod ai;
 pub mod connection;
 pub mod connection_secrets;
