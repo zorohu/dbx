@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch, nextTick } from "vue";
+import type { CSSProperties } from "vue";
 import { useI18n } from "vue-i18n";
 import { X, Pin, ChevronDown, Table2, Code2, TableProperties, Package, Check } from "lucide-vue-next";
 import {
@@ -134,11 +135,11 @@ function activateDataTab(tabId: string) {
   emit("close-driver-store");
 }
 
-const tabsContainerStyle = computed(() => ({
-  "-ms-overflow-style": "none",
-  "scrollbar-width": "none",
-  "-webkit-overflow-scrolling": "touch",
-  "padding-right": showPinnedDataTabsMenu.value ? "36px" : "0px",
+const tabsContainerStyle = computed<CSSProperties>(() => ({
+  msOverflowStyle: "none",
+  scrollbarWidth: "none",
+  WebkitOverflowScrolling: "touch",
+  paddingRight: showPinnedDataTabsMenu.value ? "36px" : "0px",
 }));
 
 const dataTabsMenuContainerClass = computed(() =>
