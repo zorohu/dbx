@@ -482,6 +482,9 @@ fn requires_text_protocol_query(sql: &str) -> bool {
 
     let tokens =
         sql.trim().trim_end_matches(';').split_whitespace().map(|token| token.to_ascii_lowercase()).collect::<Vec<_>>();
+    if tokens.len() >= 2 && tokens[0] == "show" && tokens[1] == "grants" {
+        return true;
+    }
 
     matches!(
         tokens.iter().map(String::as_str).collect::<Vec<_>>().as_slice(),
@@ -625,6 +628,8 @@ mod tests {
         assert!(requires_text_protocol_query("show full processlist"));
         assert!(requires_text_protocol_query("SHOW SLAVE STATUS"));
         assert!(requires_text_protocol_query("show replica status"));
+        assert!(requires_text_protocol_query("SHOW GRANTS"));
+        assert!(requires_text_protocol_query("SHOW GRANTS FOR 'repl'@'%'"));
         assert!(!requires_text_protocol_query("SHOW TABLES"));
         assert!(!requires_text_protocol_query("SELECT * FROM users"));
     }
