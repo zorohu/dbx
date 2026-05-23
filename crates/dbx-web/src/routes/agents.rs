@@ -139,7 +139,7 @@ pub async fn import_agents_from_zip(
     let tmp_dir = state.data_dir.join("tmp");
     std::fs::create_dir_all(&tmp_dir).map_err(|err| AppError(err.to_string()))?;
 
-    while let Some(field) = multipart.next_field().await.map_err(|err| AppError(err.to_string()))? {
+    if let Some(field) = multipart.next_field().await.map_err(|err| AppError(err.to_string()))? {
         let file_name = field.file_name().unwrap_or("offline-drivers.zip").to_string();
         if !file_name.to_ascii_lowercase().ends_with(".zip") {
             return Err(AppError("Offline driver package must be a .zip file".to_string()));

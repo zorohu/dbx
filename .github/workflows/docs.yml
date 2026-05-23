@@ -25,7 +25,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
       - run: cd docs && pnpm install --frozen-lockfile --ignore-workspace && pnpm build
       - name: Deploy to Cloudflare Workers
         working-directory: docs

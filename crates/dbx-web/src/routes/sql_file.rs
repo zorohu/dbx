@@ -42,7 +42,7 @@ pub async fn preview_sql_file(
     let tmp_dir = state.data_dir.join("tmp");
     std::fs::create_dir_all(&tmp_dir).map_err(|e| AppError(e.to_string()))?;
 
-    while let Some(field) = multipart.next_field().await.map_err(|e| AppError(e.to_string()))? {
+    if let Some(field) = multipart.next_field().await.map_err(|e| AppError(e.to_string()))? {
         let file_name = field.file_name().unwrap_or("upload.sql").to_string();
         let data = field.bytes().await.map_err(|e| AppError(e.to_string()))?;
 
