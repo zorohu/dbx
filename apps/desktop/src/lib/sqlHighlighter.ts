@@ -15,9 +15,7 @@ type ShikiHighlighter = Awaited<ReturnType<typeof import("shiki/core").createHig
 
 let highlighterPromise: Promise<ShikiHighlighter> | undefined;
 
-export async function createShikiSqlHighlighter(
-  options: ShikiSqlHighlighterOptions,
-): Promise<SqlHighlighter> {
+export async function createShikiSqlHighlighter(options: ShikiSqlHighlighterOptions): Promise<SqlHighlighter> {
   const highlighter = await getShikiSqlHighlighter();
   return (content, appearance = options.appearance()) =>
     highlighter.codeToHtml(content, {
@@ -33,13 +31,7 @@ function getShikiSqlHighlighter(): Promise<ShikiHighlighter> {
 }
 
 async function loadShikiSqlHighlighter(): Promise<ShikiHighlighter> {
-  const [
-    { createHighlighterCore },
-    { createJavaScriptRegexEngine },
-    githubDark,
-    githubLight,
-    sql,
-  ] = await Promise.all([
+  const [{ createHighlighterCore }, { createJavaScriptRegexEngine }, githubDark, githubLight, sql] = await Promise.all([
     import("shiki/core"),
     import("shiki/engine/javascript"),
     import("shiki/themes/github-dark.mjs"),

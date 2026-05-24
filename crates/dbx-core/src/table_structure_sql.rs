@@ -494,12 +494,8 @@ fn build_primary_key_sql(
         .map(|c| c.name.as_str())
         .collect();
 
-    let new_pk_names: Vec<&str> = options
-        .columns
-        .iter()
-        .filter(|c| !c.marked_for_drop && c.is_primary_key)
-        .map(|c| c.name.as_str())
-        .collect();
+    let new_pk_names: Vec<&str> =
+        options.columns.iter().filter(|c| !c.marked_for_drop && c.is_primary_key).map(|c| c.name.as_str()).collect();
 
     if old_pk_names == new_pk_names {
         return Vec::new();
@@ -520,10 +516,7 @@ fn build_primary_key_sql(
             StructureDialect::Postgres => {
                 let raw_table = options.table_name.split('.').last().unwrap_or(&options.table_name);
                 let pk_name = format!("{}_pkey", clean(raw_table));
-                statements.push(format!(
-                    "ALTER TABLE {table} DROP CONSTRAINT {};",
-                    quote_ident(dialect, &pk_name)
-                ));
+                statements.push(format!("ALTER TABLE {table} DROP CONSTRAINT {};", quote_ident(dialect, &pk_name)));
             }
             StructureDialect::Mysql => {
                 statements.push(format!("ALTER TABLE {table} DROP PRIMARY KEY;"));
@@ -533,11 +526,7 @@ fn build_primary_key_sql(
     }
 
     if !new_pk_names.is_empty() {
-        let pk_list = new_pk_names
-            .iter()
-            .map(|n| quote_ident(dialect, n))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let pk_list = new_pk_names.iter().map(|n| quote_ident(dialect, n)).collect::<Vec<_>>().join(", ");
         statements.push(format!("ALTER TABLE {table} ADD PRIMARY KEY ({pk_list});"));
     }
 
@@ -1590,10 +1579,7 @@ mod tests {
         });
 
         assert_eq!(result.warnings, Vec::<String>::new());
-        assert_eq!(
-            result.statements,
-            vec!["ALTER TABLE \"public\".\"users\" ADD PRIMARY KEY (\"id\");"]
-        );
+        assert_eq!(result.statements, vec!["ALTER TABLE \"public\".\"users\" ADD PRIMARY KEY (\"id\");"]);
     }
 
     #[test]
@@ -1621,10 +1607,7 @@ mod tests {
         });
 
         assert_eq!(result.warnings, Vec::<String>::new());
-        assert_eq!(
-            result.statements,
-            vec!["ALTER TABLE \"public\".\"users\" DROP CONSTRAINT \"users_pkey\";"]
-        );
+        assert_eq!(result.statements, vec!["ALTER TABLE \"public\".\"users\" DROP CONSTRAINT \"users_pkey\";"]);
     }
 
     #[test]
@@ -1670,10 +1653,7 @@ mod tests {
         assert_eq!(result.warnings, Vec::<String>::new());
         assert_eq!(
             result.statements,
-            vec![
-                "ALTER TABLE `users` DROP PRIMARY KEY;",
-                "ALTER TABLE `users` ADD PRIMARY KEY (`uuid`);",
-            ]
+            vec!["ALTER TABLE `users` DROP PRIMARY KEY;", "ALTER TABLE `users` ADD PRIMARY KEY (`uuid`);",]
         );
     }
 

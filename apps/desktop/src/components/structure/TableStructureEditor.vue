@@ -208,22 +208,11 @@ async function loadStructure(silent = false) {
   errorMessage.value = "";
   try {
     await store.ensureConnected(props.connectionId);
-    const nextColumns = await api.getColumns(
-      props.connectionId,
-      props.database,
-      targetSchema.value,
-      props.tableName,
-    );
+    const nextColumns = await api.getColumns(props.connectionId, props.database, targetSchema.value, props.tableName);
     const [nextIndexes, nextForeignKeys, nextTriggers] = await Promise.all([
-      api
-        .listIndexes(props.connectionId, props.database, targetSchema.value, props.tableName)
-        .catch(() => []),
-      api
-        .listForeignKeys(props.connectionId, props.database, targetSchema.value, props.tableName)
-        .catch(() => []),
-      api
-        .listTriggers(props.connectionId, props.database, targetSchema.value, props.tableName)
-        .catch(() => []),
+      api.listIndexes(props.connectionId, props.database, targetSchema.value, props.tableName).catch(() => []),
+      api.listForeignKeys(props.connectionId, props.database, targetSchema.value, props.tableName).catch(() => []),
+      api.listTriggers(props.connectionId, props.database, targetSchema.value, props.tableName).catch(() => []),
     ]);
     columns.value = createColumnDrafts(nextColumns);
     indexes.value = createIndexDrafts(nextIndexes);
@@ -406,15 +395,7 @@ onMounted(() => {
 });
 
 watch(
-  [
-    isCreateMode,
-    databaseType,
-    () => props.schema,
-    () => props.tableName,
-    newTableName,
-    columns,
-    indexes,
-  ],
+  [isCreateMode, databaseType, () => props.schema, () => props.tableName, newTableName, columns, indexes],
   () => {
     void refreshSqlPreview();
   },
@@ -442,9 +423,7 @@ watch(
     </div>
 
     <div v-if="isCreateMode" class="flex items-center gap-2">
-      <label class="shrink-0 text-[11px] font-medium text-muted-foreground">{{
-        t("structureEditor.tableName")
-      }}</label>
+      <label class="shrink-0 text-[11px] font-medium text-muted-foreground">{{ t("structureEditor.tableName") }}</label>
       <Input
         v-model="newTableName"
         :placeholder="t('contextMenu.duplicateNamePlaceholder')"
@@ -550,7 +529,9 @@ watch(
                       :loading-text="t('common.loading')"
                       :allow-custom="true"
                       trigger-class="h-6 w-full font-mono text-[11px]"
-                      @update:model-value="(v: string) => column.dataType = combineDataType(v, splitDataType(column.dataType).params)"
+                      @update:model-value="
+                        (v: string) => (column.dataType = combineDataType(v, splitDataType(column.dataType).params))
+                      "
                     />
                     <Input
                       v-else
@@ -564,7 +545,9 @@ watch(
                       :model-value="splitDataType(column.dataType).params"
                       class="h-6 min-w-16 font-mono text-[11px]"
                       :disabled="isColumnTypeDisabled(column)"
-                      @update:model-value="column.dataType = combineDataType(splitDataType(column.dataType).baseType, String($event))"
+                      @update:model-value="
+                        column.dataType = combineDataType(splitDataType(column.dataType).baseType, String($event))
+                      "
                     />
                   </td>
                   <td class="border-b border-r px-1.5 py-1">
@@ -584,7 +567,11 @@ watch(
                       type="checkbox"
                       class="h-3.5 w-3.5"
                       :disabled="isPrimaryKeyDisabled(column)"
-                      @change="() => { if (column.isPrimaryKey) column.isNullable = false; }"
+                      @change="
+                        () => {
+                          if (column.isPrimaryKey) column.isNullable = false;
+                        }
+                      "
                     />
                   </td>
                   <td class="border-b border-r px-1.5 py-1">
@@ -828,9 +815,7 @@ watch(
                         </DropdownMenuCheckboxItem>
                       </DropdownMenuContent>
                     </DropdownMenu>
-                    <span v-else class="text-[11px] text-muted-foreground">{{
-                      index.includedColumns.join(", ")
-                    }}</span>
+                    <span v-else class="text-[11px] text-muted-foreground">{{ index.includedColumns.join(", ") }}</span>
                   </td>
                   <td class="border-b border-r px-1.5 py-1">
                     <Input
@@ -841,11 +826,7 @@ watch(
                     />
                   </td>
                   <td class="border-b border-r px-1.5 py-1">
-                    <Input
-                      v-model="index.comment"
-                      class="h-6 text-[11px]"
-                      :disabled="!canEditIndexComment(index)"
-                    />
+                    <Input v-model="index.comment" class="h-6 text-[11px]" :disabled="!canEditIndexComment(index)" />
                   </td>
                   <td class="border-b px-1.5 py-1">
                     <Badge v-if="index.isPrimary" variant="outline">{{ t("structureEditor.primary") }}</Badge>
@@ -895,11 +876,7 @@ watch(
               {{ t("structureEditor.emptyReadonly") }}
             </div>
             <div v-else class="space-y-1.5">
-              <div
-                v-for="trigger in triggers"
-                :key="trigger.name"
-                class="rounded-md border px-2 py-1.5 text-[11px]"
-              >
+              <div v-for="trigger in triggers" :key="trigger.name" class="rounded-md border px-2 py-1.5 text-[11px]">
                 <div class="font-medium">{{ trigger.name }}</div>
                 <div class="mt-1 font-mono text-muted-foreground">{{ trigger.timing }} {{ trigger.event }}</div>
               </div>
@@ -912,7 +889,11 @@ watch(
         <div class="flex items-center justify-between border-b px-2 py-1.5 text-[11px] font-medium">
           <div class="flex items-center gap-1.5">
             <span>{{ t("structureEditor.sqlPreview") }}</span>
-            <Badge v-if="!saving && pendingStatements.length && warnings.length === 0" variant="outline" class="h-4 px-1 text-[10px]">
+            <Badge
+              v-if="!saving && pendingStatements.length && warnings.length === 0"
+              variant="outline"
+              class="h-4 px-1 text-[10px]"
+            >
               <Check class="h-3 w-3" />
               {{ t("structureEditor.ready") }}
             </Badge>
@@ -936,7 +917,8 @@ watch(
           <pre
             v-if="pendingStatements.length"
             class="whitespace-pre-wrap break-words rounded-md bg-muted/40 p-2 font-mono text-[11px] leading-4"
-            v-html="highlightedSql" />
+            v-html="highlightedSql"
+          />
           <div v-else class="flex h-full items-center justify-center text-sm text-muted-foreground">
             {{ t("structureEditor.noChanges") }}
           </div>

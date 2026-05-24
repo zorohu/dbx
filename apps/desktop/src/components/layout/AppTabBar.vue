@@ -120,7 +120,8 @@ function tabColorStyle(tab: QueryTab) {
 }
 
 function tabIconClass(tab: QueryTab) {
-  if (tab.mode === "data" || tab.mode === "objects" || tab.mode === "structure") return "text-emerald-600 dark:text-emerald-400";
+  if (tab.mode === "data" || tab.mode === "objects" || tab.mode === "structure")
+    return "text-emerald-600 dark:text-emerald-400";
   return "text-blue-600 dark:text-blue-400";
 }
 

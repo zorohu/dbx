@@ -209,7 +209,9 @@ export const useQueryStore = defineStore("query", () => {
       return existing.id;
     }
 
-    const title = resolvedTableName ? t("structureEditor.editTabTitle", { tableName: resolvedTableName }) : t("structureEditor.createTitle");
+    const title = resolvedTableName
+      ? t("structureEditor.editTabTitle", { tableName: resolvedTableName })
+      : t("structureEditor.createTitle");
     const id = uuid();
     const tab: QueryTab = {
       id,

@@ -126,7 +126,11 @@ export function useNavigationTargets(dialogs: {
   ) {
     if (!context.tableName) {
       try {
-        await connectionStore.refreshObjectListTreeNode(context.connectionId, context.database, context.schema || undefined);
+        await connectionStore.refreshObjectListTreeNode(
+          context.connectionId,
+          context.database,
+          context.schema || undefined,
+        );
       } catch {}
       return;
     }
