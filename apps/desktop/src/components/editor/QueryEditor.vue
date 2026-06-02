@@ -331,6 +331,22 @@ function selectAllSqlFromContextMenu() {
   focusEditor();
 }
 
+function selectSqlLineFromGutter(
+  currentView: EditorViewType,
+  line: { from: number; to: number },
+  event: Event,
+): boolean {
+  if (!(event instanceof MouseEvent) || event.button !== 0) return false;
+  event.preventDefault();
+  currentView.dispatch({
+    selection: { anchor: line.from, head: line.to },
+    scrollIntoView: true,
+    userEvent: "select.pointer",
+  });
+  currentView.focus();
+  return true;
+}
+
 const contextMenuItems = computed<ContextMenuItem[]>(() => [
   {
     label: executeContextMenuLabel.value,
@@ -1324,7 +1340,11 @@ onMounted(async () => {
           return { dom };
         },
       }),
-      lineNumbers(),
+      lineNumbers({
+        domEventHandlers: {
+          mousedown: selectSqlLineFromGutter,
+        },
+      }),
       highlightActiveLineGutter(),
       highlightSpecialChars(),
       history(),

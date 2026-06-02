@@ -143,6 +143,7 @@ export function buildEditorFontThemeRules(
       zIndex: "10",
     },
     ".cm-lineNumbers .cm-gutterElement": {
+      cursor: "pointer",
       paddingRight: "16px",
       userSelect: "none",
     },
