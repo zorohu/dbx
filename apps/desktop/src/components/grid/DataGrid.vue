@@ -2977,6 +2977,9 @@ const canvasScrollTop = ref(0);
 const canvasHoverCell = ref<{ rowIndex: number; visibleColIdx: number } | null>(null);
 const useCanvasGridRows = computed(() => dataGridRenderMode.value === "canvas");
 const canvasContentHeight = computed(() => Math.max(1, displayItems.value.length * CANVAS_DATA_GRID_ROW_HEIGHT));
+const canvasRenderStyleKey = computed(
+  () => `${settingsStore.editorSettings.theme}:${settingsStore.editorSettings.uiScale}:${isDark.value}`,
+);
 let canvasResizeObserver: ResizeObserver | null = null;
 let canvasDrawFrame = 0;
 
@@ -3299,8 +3302,10 @@ function drawCanvasGrid() {
     width: Math.max(1, canvasViewportWidth.value || scroller.clientWidth),
     height: Math.max(1, canvasViewportHeight.value || scroller.clientHeight),
     isDark: isDark.value,
+    styleKey: canvasRenderStyleKey.value,
     rows: displayItems.value,
     renderedColumnWidths: renderedColumnWidths.value,
+    renderedColumnOffsets: renderedColumnOffsets.value,
     visibleColumnIndexes: visibleColumnIndexes.value,
     rowNumberWidth: DATA_GRID_ROW_NUM_WIDTH,
     hoverCell: canvasHoverCell.value,
@@ -3331,6 +3336,7 @@ watch(
     searchMatchSet,
     currentSearchMatch,
     isDark,
+    canvasRenderStyleKey,
     isScrolling,
     hoveredDetailCell,
     detailCell,

@@ -1,6 +1,10 @@
 import type { CellValue } from "@/lib/cellValue";
 import type { RowStatus } from "@/lib/gridRowStatus";
-import { DATA_GRID_DARK_SEARCH_COLORS, resolveDataGridPaintTheme } from "@/lib/dataGridPaintTheme";
+import {
+  DATA_GRID_DARK_SEARCH_COLORS,
+  resolveDataGridPaintTheme,
+  type DataGridPaintTheme,
+} from "@/lib/dataGridPaintTheme";
 
 export const CANVAS_DATA_GRID_ROW_HEIGHT = 26;
 
@@ -40,8 +44,10 @@ export interface DrawCanvasDataGridOptions {
   width: number;
   height: number;
   isDark: boolean;
+  styleKey?: string;
   rows: CanvasDataGridRow[];
   renderedColumnWidths: number[];
+  renderedColumnOffsets?: number[];
   visibleColumnIndexes: number[];
   rowNumberWidth: number;
   hoverCell: CanvasHoverCell | null;
@@ -61,6 +67,20 @@ export interface DrawCanvasDataGridOptions {
 type NumericCanvasContext = CanvasRenderingContext2D & {
   fontVariantNumeric?: string;
 };
+
+interface CanvasRenderState {
+  cacheKey: string;
+  normalFont: string;
+  tabularFont: string;
+  semiboldFont: string;
+  italicFont: string;
+  theme: DataGridPaintTheme;
+  searchFill: string;
+  currentSearchFill: string;
+  currentSearchBorder: string;
+}
+
+const canvasRenderStateCache = new WeakMap<HTMLCanvasElement, CanvasRenderState>();
 
 function setCanvasNumericVariant(ctx: CanvasRenderingContext2D, value: "normal" | "tabular-nums") {
   const numericCtx = ctx as NumericCanvasContext;
@@ -118,44 +138,10 @@ function firstVisibleColumn(offsets: number[], contentStart: number): number {
   return low;
 }
 
-export function drawCanvasDataGrid(options: DrawCanvasDataGridOptions) {
-  const {
-    canvas,
-    scroller,
-    width,
-    height,
-    isDark,
-    rows,
-    renderedColumnWidths,
-    visibleColumnIndexes,
-    rowNumberWidth,
-    hoverCell,
-    isScrolling,
-    editingCell,
-    singleSelectedCell,
-    searchMatchKeys,
-    currentSearchMatch,
-    formatCell,
-    isRowActive,
-    isRowSelected,
-    rowCellsUseSelectionVisual,
-    cellIsSelected,
-    cellCanHover,
-  } = options;
-  const dpr = window.devicePixelRatio || 1;
-  const pixelWidth = Math.floor(width * dpr);
-  const pixelHeight = Math.floor(height * dpr);
-  if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
-    canvas.width = pixelWidth;
-    canvas.height = pixelHeight;
-  }
-  canvas.style.width = `${width}px`;
-  canvas.style.height = `${height}px`;
-
-  const ctx = canvas.getContext("2d");
-  if (!ctx) return;
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  ctx.clearRect(0, 0, width, height);
+function resolveCanvasRenderState(canvas: HTMLCanvasElement, isDark: boolean, styleKey?: string): CanvasRenderState {
+  const cacheKey = `${styleKey ?? "default"}:${isDark ? "dark" : "light"}`;
+  const cached = canvasRenderStateCache.get(canvas);
+  if (cached?.cacheKey === cacheKey) return cached;
 
   const canvasStyle = getComputedStyle(canvas);
   const fontFamily =
@@ -186,9 +172,74 @@ export function drawCanvasDataGrid(options: DrawCanvasDataGridOptions) {
     getVar: (name) => canvasStyle.getPropertyValue(name),
     isDark,
   });
-  const searchFill = isDark ? DATA_GRID_DARK_SEARCH_COLORS.match : theme.cellSearch;
-  const currentSearchFill = isDark ? DATA_GRID_DARK_SEARCH_COLORS.current : theme.cellCurrentSearch;
-  const currentSearchBorder = isDark ? DATA_GRID_DARK_SEARCH_COLORS.currentBorder : theme.cellCurrentSearchBorder;
+  const state = {
+    cacheKey,
+    normalFont,
+    tabularFont,
+    semiboldFont,
+    italicFont,
+    theme,
+    searchFill: isDark ? DATA_GRID_DARK_SEARCH_COLORS.match : theme.cellSearch,
+    currentSearchFill: isDark ? DATA_GRID_DARK_SEARCH_COLORS.current : theme.cellCurrentSearch,
+    currentSearchBorder: isDark ? DATA_GRID_DARK_SEARCH_COLORS.currentBorder : theme.cellCurrentSearchBorder,
+  };
+  canvasRenderStateCache.set(canvas, state);
+  return state;
+}
+
+export function drawCanvasDataGrid(options: DrawCanvasDataGridOptions) {
+  const {
+    canvas,
+    scroller,
+    width,
+    height,
+    isDark,
+    styleKey,
+    rows,
+    renderedColumnWidths,
+    renderedColumnOffsets,
+    visibleColumnIndexes,
+    rowNumberWidth,
+    hoverCell,
+    isScrolling,
+    editingCell,
+    singleSelectedCell,
+    searchMatchKeys,
+    currentSearchMatch,
+    formatCell,
+    isRowActive,
+    isRowSelected,
+    rowCellsUseSelectionVisual,
+    cellIsSelected,
+    cellCanHover,
+  } = options;
+  const dpr = window.devicePixelRatio || 1;
+  const pixelWidth = Math.floor(width * dpr);
+  const pixelHeight = Math.floor(height * dpr);
+  if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
+    canvas.width = pixelWidth;
+    canvas.height = pixelHeight;
+  }
+  const canvasWidth = `${width}px`;
+  const canvasHeight = `${height}px`;
+  if (canvas.style.width !== canvasWidth) canvas.style.width = canvasWidth;
+  if (canvas.style.height !== canvasHeight) canvas.style.height = canvasHeight;
+
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, width, height);
+
+  const {
+    normalFont,
+    tabularFont,
+    semiboldFont,
+    italicFont,
+    theme,
+    searchFill,
+    currentSearchFill,
+    currentSearchBorder,
+  } = resolveCanvasRenderState(canvas, isDark, styleKey);
 
   const scrollTop = scroller.scrollTop;
   const scrollLeft = scroller.scrollLeft;
@@ -200,7 +251,7 @@ export function drawCanvasDataGrid(options: DrawCanvasDataGridOptions) {
   ctx.font = normalFont;
   ctx.textBaseline = "middle";
 
-  const offsets = columnOffsets(renderedColumnWidths);
+  const offsets = renderedColumnOffsets ?? columnOffsets(renderedColumnWidths);
   const contentStart = Math.max(0, scrollLeft - rowNumberWidth);
   const firstCol = firstVisibleColumn(offsets, contentStart);
   const columnOffset = offsets[firstCol] ?? 0;
