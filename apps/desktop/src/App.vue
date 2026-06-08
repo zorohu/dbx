@@ -454,10 +454,9 @@ async function openSqlFile() {
   try {
     if (isTauriRuntime()) {
       const { open } = await import("@tauri-apps/plugin-dialog");
-      const { readTextFile } = await import("@tauri-apps/plugin-fs");
       const path = await open({ filters: [{ name: "SQL", extensions: ["sql"] }], multiple: false });
       if (path) {
-        const content = await readTextFile(path as string);
+        const content = await api.readExternalSqlFile(path as string);
         queryStore.updateSql(tab.id, content);
       }
     } else {
