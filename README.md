@@ -159,6 +159,8 @@ DBX also provides a dedicated CLI package for terminal, script, and Codex workfl
 
 ```bash
 npm install -g @dbx-app/cli
+# or via Homebrew
+brew tap t8y2/dbx && brew install dbx-cli
 dbx connections list --json
 dbx query local "select 1" --json
 ```

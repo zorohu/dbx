@@ -159,6 +159,8 @@ DBX 也提供独立 CLI 包，适合终端、脚本和 Codex 工作流：
 
 ```bash
 npm install -g @dbx-app/cli
+# 或通过 Homebrew
+brew tap t8y2/dbx && brew install dbx-cli
 dbx connections list --json
 dbx query local "select 1" --json
 ```
