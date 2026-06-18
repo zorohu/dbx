@@ -1569,14 +1569,14 @@ fn uses_tcp_probe(config: &ConnectionConfig, host: &str, port: u16) -> bool {
     if database_capabilities::skips_tcp_probe(&config.db_type) {
         return false;
     }
-    if is_original_hostname_endpoint(config, host, port) {
+    if is_original_endpoint(config, host, port) {
         return false;
     }
     true
 }
 
-fn is_original_hostname_endpoint(config: &ConnectionConfig, host: &str, port: u16) -> bool {
-    host == config.host && port == config.port && host.parse::<std::net::IpAddr>().is_err()
+fn is_original_endpoint(config: &ConnectionConfig, host: &str, port: u16) -> bool {
+    host == config.host && port == config.port
 }
 
 async fn detect_ob_oracle_mode(config: &ConnectionConfig, pool: &db::mysql::MySqlPool) -> MysqlMode {
@@ -2326,17 +2326,18 @@ mod tests {
     }
 
     #[test]
-    fn mysql_hostname_connections_skip_tcp_probe() {
+    fn mysql_direct_connections_skip_tcp_probe() {
         let mut config = mysql_config(Some("app"));
         config.host = "mysql.example.com".to_string();
 
         assert!(!uses_tcp_probe(&config, "mysql.example.com", 3306));
-        assert!(uses_tcp_probe(&config, "192.0.2.10", 3306));
+        config.host = "192.0.2.10".to_string();
+        assert!(!uses_tcp_probe(&config, "192.0.2.10", 3306));
         assert!(uses_tcp_probe(&config, "127.0.0.1", 53306));
     }
 
     #[test]
-    fn native_hostname_connections_skip_tcp_probe() {
+    fn native_direct_connections_skip_tcp_probe() {
         for db_type in [
             DatabaseType::Postgres,
             DatabaseType::Redshift,
@@ -2351,7 +2352,8 @@ mod tests {
             config.host = "db.example.com".to_string();
 
             assert!(!uses_tcp_probe(&config, "db.example.com", config.port), "{db_type:?} hostname");
-            assert!(uses_tcp_probe(&config, "192.0.2.10", config.port), "{db_type:?} ip");
+            config.host = "192.0.2.10".to_string();
+            assert!(!uses_tcp_probe(&config, "192.0.2.10", config.port), "{db_type:?} ip");
             assert!(uses_tcp_probe(&config, "127.0.0.1", 54000), "{db_type:?} forwarded");
         }
     }
