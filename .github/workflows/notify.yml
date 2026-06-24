@@ -1,4 +1,4 @@
-name: QQ Notify
+name: Notifications
 
 on:
   # issues:
@@ -161,6 +161,16 @@ jobs:
       #         delim = "EOF_ANALYSIS"
       #         f.write(f"analysis<<{delim}\n{text}\n{delim}\n")
       #     PYEOF
+
+      - name: Send to Feishu
+        if: ${{ steps.msg.outputs.skip != 'true' && github.event_name != 'release' }}
+        env:
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          MSG_CONTENT: ${{ steps.msg.outputs.msg }}
+        run: |
+          curl -s -X POST "$FEISHU_WEBHOOK_URL" \
+            -H 'Content-Type: application/json' \
+            -d "$(jq -n --arg text "$MSG_CONTENT" '{msg_type: "text", content: {text: $text}}')"
 
       - name: Send to QQ group
         if: steps.msg.outputs.skip != 'true'
