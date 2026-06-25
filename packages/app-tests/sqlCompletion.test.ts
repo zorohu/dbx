@@ -974,6 +974,18 @@ test("returns function signature help inside function arguments", () => {
   });
 });
 
+test("returns cast signature with AS syntax", () => {
+  const sql = "select cast(created_at ";
+  const signature = getSqlFunctionSignatureHelp(sql, sql.length);
+
+  assert.deepEqual(signature, {
+    name: "CAST",
+    signature: "CAST(expression AS type)",
+    activeParameter: 0,
+    parameters: ["expression AS type"],
+  });
+});
+
 test("returns null signature help outside function calls", () => {
   assert.equal(getSqlFunctionSignatureHelp("select created_at from users", "select created_at".length), null);
 });

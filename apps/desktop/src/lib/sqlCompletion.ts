@@ -786,7 +786,7 @@ const SQL_FUNCTION_SIGNATURES = new Map<string, string[]>([
   ["COALESCE", ["value", "...values"]],
   ["IFNULL", ["expression", "fallback"]],
   ["NULLIF", ["expression1", "expression2"]],
-  ["CAST", ["expression", "type"]],
+  ["CAST", ["expression AS type"]],
   ["CONVERT", ["expression", "type"]],
   ["GREATEST", ["...values"]],
   ["LEAST", ["...values"]],
