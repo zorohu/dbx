@@ -1172,6 +1172,7 @@ export default {
     viewData: "View Data",
     editStructure: "Edit Structure",
     refreshChildren: "Refresh",
+    expandAll: "Expand All",
     pin: "Pin",
     unpin: "Unpin",
     refreshTab: "Refresh Data",

@@ -10,6 +10,7 @@ import {
   Eye,
   ChevronRight,
   ChevronDown,
+  ChevronsDown,
   Loader2,
   FolderOpen,
   FolderClosed,
@@ -594,6 +595,14 @@ function refreshActiveKvBrowserAfterOpen(mode: "etcd" | "zookeeper", connectionI
 async function loadMoreObjectGroupChildren() {
   try {
     await connectionStore.loadMoreObjectGroupChildren(props.node);
+  } catch (e: any) {
+    toast(t("connection.connectFailed", { message: translateBackendError(t, e?.message || String(e)) }), 5000);
+  }
+}
+
+async function loadAllObjectGroupChildren() {
+  try {
+    await connectionStore.loadAllObjectGroupChildren(props.node);
   } catch (e: any) {
     toast(t("connection.connectFailed", { message: translateBackendError(t, e?.message || String(e)) }), 5000);
   }
@@ -3958,6 +3967,7 @@ function treeItemMenuItems(): ContextMenuItem[] {
   // 9. Group Labels (group-columns, group-tables, etc.)
   if (isGroupLabel(node)) {
     const hasGroupCreateAction = (node.type === "group-tables" && canCreateTable.value) || (node.type === "group-views" && !!node.connectionId && !!node.database);
+    const canLoadAllObjectGroup = node.type === "group-tables" || node.type === "group-views" || node.type === "group-materialized-views";
     if (node.type === "group-tables" && canCreateTable.value) {
       items.push({ label: t("contextMenu.createTable"), action: createTable, icon: Plus });
     }
@@ -3966,6 +3976,14 @@ function treeItemMenuItems(): ContextMenuItem[] {
     }
     if (hasGroupCreateAction) {
       items.push({ label: "", separator: true });
+    }
+    if (canLoadAllObjectGroup) {
+      items.push({
+        label: t("contextMenu.expandAll"),
+        action: loadAllObjectGroupChildren,
+        icon: ChevronsDown,
+        disabled: node.isLoading,
+      });
     }
     if (node.type !== "group-partitions") {
       items.push({

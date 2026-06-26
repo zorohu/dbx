@@ -990,6 +990,7 @@ export default {
     viewData: "Ver datos",
     editStructure: "Editar estructura",
     refreshChildren: "Actualizar",
+    expandAll: "Expandir todo",
     pin: "Fijar",
     unpin: "Desfijar",
     refreshTab: "Actualizar datos",

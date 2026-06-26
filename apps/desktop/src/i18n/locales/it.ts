@@ -1097,6 +1097,7 @@ export default {
     viewData: "Visualizza Dati",
     editStructure: "Modifica Struttura",
     refreshChildren: "Aggiorna",
+    expandAll: "Espandi tutto",
     pin: "Fissa",
     unpin: "Sblocca",
     refreshTab: "Aggiorna Dati",

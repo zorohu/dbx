@@ -1151,6 +1151,7 @@ export default {
     viewData: "データを表示",
     editStructure: "構造を編集",
     refreshChildren: "更新",
+    expandAll: "すべて展開",
     pin: "ピン留め",
     unpin: "ピン留め解除",
     refreshTab: "データを更新",

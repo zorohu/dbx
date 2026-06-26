@@ -1171,6 +1171,7 @@ export default {
     viewData: "查看数据",
     editStructure: "编辑表结构",
     refreshChildren: "刷新",
+    expandAll: "展开全部",
     pin: "置顶",
     unpin: "取消置顶",
     refreshTab: "刷新数据",

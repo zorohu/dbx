@@ -2028,6 +2028,31 @@ export const useConnectionStore = defineStore("connection", () => {
     }
   }
 
+  async function loadAllObjectGroupChildren(parent: TreeNode) {
+    if (!parent.connectionId || !hasTreeNodeDatabaseContext(parent)) return;
+    if (!objectTypesForGroupNode(parent.type)) return;
+    parent.isLoading = true;
+    try {
+      await ensureConnected(parent.connectionId);
+      if (!isTreeNodeChildrenLoaded(parent.id)) {
+        await loadObjectGroupChildren(parent);
+      }
+
+      let loadMoreNode = parent.children?.find((child) => child.type === "load-more");
+      while (loadMoreNode?.loadMore) {
+        loadMoreNode.isLoading = true;
+        await loadMoreObjectGroupChildren(loadMoreNode);
+        loadMoreNode = parent.children?.find((child) => child.type === "load-more");
+      }
+      parent.isExpanded = true;
+    } catch (e) {
+      recordMetadataLoadError(parent.connectionId, e);
+      throw e;
+    } finally {
+      parent.isLoading = false;
+    }
+  }
+
   function normalizedObjectTreeKind(type: string): DatabaseObjectTreeKind {
     return normalizeSidebarObjectKind(type);
   }
@@ -3635,6 +3660,7 @@ export const useConnectionStore = defineStore("connection", () => {
     loadTables,
     loadObjectGroupChildren,
     loadMoreObjectGroupChildren,
+    loadAllObjectGroupChildren,
     loadTableGroups,
     loadColumns,
     loadIndexes,

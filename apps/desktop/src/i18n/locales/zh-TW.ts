@@ -1077,6 +1077,7 @@ export default {
     viewData: "檢視資料",
     editStructure: "編輯資料表結構",
     refreshChildren: "重新整理",
+    expandAll: "展開全部",
     pin: "置頂",
     unpin: "取消置頂",
     refreshTab: "重新整理資料",
