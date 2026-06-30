@@ -37,6 +37,30 @@ fn registry_with_jre_driver(db_type: &str, driver_version: &str, jre: &str, jre_
     registry
 }
 
+fn registry_with_native_driver(db_type: &str, version: &str, jre: &str) -> AgentRegistry {
+    let mut drivers = std::collections::HashMap::new();
+    drivers.insert(
+        db_type.to_string(),
+        DriverInfo {
+            version: version.to_string(),
+            label: db_type.to_string(),
+            min_app_version: "0.1.0".to_string(),
+            jre: jre.to_string(),
+            jar: Some(ArtifactInfo {
+                url: format!("https://example.com/dbx-agent-{db_type}-legacy-placeholder.jar"),
+                size: 0,
+            }),
+            native: [(
+                AgentManager::current_platform().to_string(),
+                ArtifactInfo { url: format!("https://example.com/dbx-agent-{db_type}"), size: 42 },
+            )]
+            .into_iter()
+            .collect(),
+        },
+    );
+    AgentRegistry { jre: None, jres: std::collections::HashMap::new(), drivers }
+}
+
 #[test]
 fn built_in_agent_list_includes_expected_driver_labels() {
     let manager = test_manager("labels");
@@ -80,6 +104,7 @@ fn agent_list_marks_installed_driver_update_when_registry_version_differs() {
     assert_eq!(h2.version, "0.2.0");
     assert_eq!(h2.size, 42);
     assert_eq!(h2.jre, "21");
+    assert!(h2.requires_java_runtime);
     assert!(h2.update_available);
 }
 
@@ -174,7 +199,53 @@ fn agent_list_does_not_require_jre_for_native_agent() {
     let dameng = agents.iter().find(|agent| agent.db_type == "dameng").unwrap();
 
     assert!(dameng.installed);
+    assert!(!dameng.requires_java_runtime);
     assert!(dameng.jre_installed);
+}
+
+#[test]
+fn agent_list_does_not_require_jre_for_registry_native_agent() {
+    let manager = test_manager("registry-native-no-jre");
+    let registry = registry_with_native_driver("xugu", "0.2.0", DEFAULT_JRE_KEY);
+
+    let agents = build_agent_list(&manager, Some(&registry));
+    let xugu = agents.iter().find(|agent| agent.db_type == "xugu").unwrap();
+
+    assert!(!xugu.installed);
+    assert_eq!(xugu.jre, DEFAULT_JRE_KEY);
+    assert!(!xugu.requires_java_runtime);
+    assert!(xugu.jre_installed);
+}
+
+#[test]
+fn agent_list_keeps_jre_requirement_for_installed_jar_when_registry_has_native() {
+    let manager = test_manager("installed-jar-registry-native");
+    let jar_path = manager.driver_jar_path("xugu");
+    std::fs::create_dir_all(jar_path.parent().unwrap()).unwrap();
+    std::fs::write(&jar_path, b"jar").unwrap();
+    manager
+        .save_state(&dbx_core::agent_manager::AgentState {
+            installed_drivers: [(
+                "xugu".to_string(),
+                InstalledDriver {
+                    version: "0.2.0".to_string(),
+                    installed_at: "2026-05-18T00:00:00Z".to_string(),
+                    jre: DEFAULT_JRE_KEY.to_string(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        })
+        .unwrap();
+    let registry = registry_with_native_driver("xugu", "0.2.0", DEFAULT_JRE_KEY);
+
+    let agents = build_agent_list(&manager, Some(&registry));
+    let xugu = agents.iter().find(|agent| agent.db_type == "xugu").unwrap();
+
+    assert!(xugu.installed);
+    assert!(xugu.requires_java_runtime);
+    assert!(!xugu.jre_installed);
 }
 
 #[test]

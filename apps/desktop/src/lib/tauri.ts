@@ -66,6 +66,7 @@ export interface AgentDriverInfo {
   installed: boolean;
   installed_version: string | null;
   update_available: boolean;
+  requires_java_runtime?: boolean;
   jre: string;
   jre_installed: boolean;
 }

@@ -184,9 +184,13 @@ pub fn build_agent_list(am: &AgentManager, registry: Option<&AgentRegistry>) -> 
     agent_catalog::driver_store_entries()
         .map(|(key, label)| {
             let installed = am.is_driver_installed(key);
-            let requires_java_runtime = am.driver_requires_java_runtime(key);
             let local = local_state.installed_drivers.get(key);
             let remote = registry.and_then(|r| agent_registry_driver(r, key));
+            let requires_java_runtime = if installed {
+                am.driver_requires_java_runtime(key)
+            } else {
+                remote.is_some_and(|driver| driver.native.get(AgentManager::current_platform()).is_none())
+            };
             let jre_key = remote
                 .map(|r| r.jre.clone())
                 .or_else(|| local.map(|l| l.jre.clone()))
@@ -209,6 +213,7 @@ pub fn build_agent_list(am: &AgentManager, registry: Option<&AgentRegistry>) -> 
                     (Some(l), Some(r)) => l.version != r.version || jre_update_available,
                     _ => false,
                 },
+                requires_java_runtime,
                 jre: jre_key.clone(),
                 jre_installed: !installed || !requires_java_runtime || am.is_jre_installed(&jre_key),
             }

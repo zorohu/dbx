@@ -347,6 +347,7 @@ pub struct AgentDriverInfo {
     pub installed: bool,
     pub installed_version: Option<String>,
     pub update_available: bool,
+    pub requires_java_runtime: bool,
     pub jre: String,
     pub jre_installed: bool,
 }
