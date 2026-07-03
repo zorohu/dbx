@@ -59,7 +59,7 @@ export type DesktopIconTheme = "default" | "black";
 
 export type InterfaceLayout = "separated" | "classic";
 
-export type UpdateDownloadSource = "official" | "cnb";
+export type UpdateDownloadSource = "official" | "cnb" | "atomgit";
 export type SqlSemanticDiagnosticsMode = "auto" | "enabled" | "disabled";
 export type OpenTabsRestoreMode = "all" | "pinned" | "none";
 
@@ -533,6 +533,7 @@ function normalizeTableFontSize(value: unknown): number {
 }
 
 function normalizeUpdateDownloadSource(value: unknown): UpdateDownloadSource {
+  if (value === "atomgit") return "atomgit";
   return value === "cnb" ? "cnb" : DEFAULT_EDITOR_SETTINGS.updateDownloadSource;
 }
 
