@@ -116,7 +116,6 @@ import { renderWktOnCanvas, isHexGeometry } from "@/lib/dataGrid/geometryPreview
 import { buildDataGridCellDetail, buildDataGridColumnDetail, buildDataGridRowDetail, dataGridColumnDetailJson, dataGridColumnDetailTsv, dataGridRowDetailJson, dataGridRowDetailTsv, filterDataGridDetailFields, type DataGridCellDetail } from "@/lib/dataGrid/dataGridDetail";
 import { applyColumnFormatter, buildColumnFormatterKey, normalizeColumnFormatter, resolveColumnFormatter, type ColumnFormatterConfig, type DateTimeFormatterUnit, DateTimePatterns } from "@/lib/dataGrid/columnFormatter";
 import { temporalCellEditorKind, type TemporalCellEditorKind } from "@/lib/dataGrid/dataGridTemporalEditor";
-import { isEnumColumn, enumValuesForColumn } from "@/lib/dataGrid/dataGridEnumEditor";
 import { isCancelSearchShortcut, isCopyCurrentRowShortcut, isDeleteCurrentRowShortcut, isFocusSearchShortcut, isModRShortcut, isSaveShortcut, isToggleTransposeShortcut } from "@/lib/editor/keyboardShortcuts";
 import { dataGridHeaderContentWidth, scrollbarGutterWidth } from "@/lib/dataGrid/dataGridScrollGutter";
 import { canGoNextDataGridPage } from "@/lib/dataGrid/dataGridPagination";
@@ -3997,11 +3996,11 @@ function temporalEditorKindForColumn(columnIndex: number): TemporalCellEditorKin
 }
 
 function enumValuesForGridColumn(columnIndex: number): string[] {
-  return enumValuesForColumn(tableColumnForGridColumn(columnIndex));
+  return tableColumnForGridColumn(columnIndex)?.enum_values ?? [];
 }
 
 function isEnumGridColumn(columnIndex: number): boolean {
-  return isEnumColumn(tableColumnForGridColumn(columnIndex));
+  return (tableColumnForGridColumn(columnIndex)?.enum_values?.length ?? 0) > 0;
 }
 
 function isEnumGridColumnNullable(columnIndex: number): boolean {

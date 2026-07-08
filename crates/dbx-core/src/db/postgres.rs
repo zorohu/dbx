@@ -2059,9 +2059,13 @@ const POSTGRES_COLUMNS_SQL: &str = "SELECT a.attname AS column_name, \
              CASE WHEN t.typname = 'numeric' AND a.atttypmod > 0 \
                THEN (a.atttypmod - 4) & 65535 ELSE NULL END AS numeric_scale, \
              CASE WHEN t.typname IN ('varchar', 'bpchar') AND a.atttypmod > 0 \
-               THEN a.atttypmod - 4 ELSE NULL END AS character_maximum_length \
+               THEN a.atttypmod - 4 ELSE NULL END AS character_maximum_length, \
+             CASE WHEN enum_t.oid IS NULL THEN NULL \
+               ELSE COALESCE((SELECT array_to_json(array_agg(e.enumlabel ORDER BY e.enumsortorder))::text \
+                              FROM pg_enum e WHERE e.enumtypid = enum_t.oid), '[]') END AS enum_values \
              FROM pg_attribute a \
              JOIN pg_type t ON t.oid = a.atttypid \
+             LEFT JOIN pg_type enum_t ON enum_t.oid = CASE WHEN t.typtype = 'd' THEN t.typbasetype WHEN t.typtype = 'e' THEN t.oid ELSE NULL END AND enum_t.typtype = 'e' \
              LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum \
              LEFT JOIN pg_depend dep ON dep.refobjid = a.attrelid AND dep.refobjsubid = a.attnum AND dep.deptype = 'i' \
              LEFT JOIN pg_sequence pseq ON pseq.seqrelid = dep.objid \
@@ -2088,7 +2092,8 @@ const POSTGRES_COLUMNS_COMPAT_SQL: &str = "SELECT a.attname AS column_name, \
              CASE WHEN t.typname = 'numeric' AND a.atttypmod > 0 \
                THEN (a.atttypmod - 4) & 65535 ELSE NULL END AS numeric_scale, \
              CASE WHEN t.typname IN ('varchar', 'bpchar') AND a.atttypmod > 0 \
-               THEN a.atttypmod - 4 ELSE NULL END AS character_maximum_length \
+               THEN a.atttypmod - 4 ELSE NULL END AS character_maximum_length, \
+             NULL::text AS enum_values \
              FROM pg_attribute a \
              JOIN pg_type t ON t.oid = a.atttypid \
              LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum \
@@ -2119,10 +2124,16 @@ const POSTGRES_COLUMNS_INFORMATION_SCHEMA_SQL: &str = "SELECT c.column_name, \
              NULL::text AS column_extra, \
              CAST(c.numeric_precision AS int) AS numeric_precision, \
              CAST(c.numeric_scale AS int) AS numeric_scale, \
-             CAST(c.character_maximum_length AS int) AS character_maximum_length \
+             CAST(c.character_maximum_length AS int) AS character_maximum_length, \
+             NULL::text AS enum_values \
              FROM information_schema.columns c \
              WHERE c.table_schema = $1 AND c.table_name = $2 \
              ORDER BY c.ordinal_position";
+
+fn parse_enum_values_from_row(row: &Row, index: usize) -> Option<Vec<String>> {
+    let raw = row.try_get::<_, Option<String>>(index).ok().flatten()?;
+    serde_json::from_str::<Vec<String>>(&raw).ok()
+}
 
 /// Read a boolean column from a PostgreSQL row, tolerating databases that
 /// encode booleans as integers (0/1) or text ('t'/'f') instead of the standard
@@ -2181,6 +2192,7 @@ fn column_info_from_row(row: &Row) -> ColumnInfo {
         numeric_precision: row.try_get::<_, Option<i32>>(7).ok().flatten(),
         numeric_scale: row.try_get::<_, Option<i32>>(8).ok().flatten(),
         character_maximum_length: row.try_get::<_, Option<i32>>(9).ok().flatten(),
+        enum_values: parse_enum_values_from_row(row, 10),
     }
 }
 
@@ -3184,7 +3196,81 @@ pub async fn copy_in(pool: &Pool, sql: &str, data: &[u8]) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
+    use std::time::Instant;
     use tokio_postgres::types::FromSql;
+
+    struct DockerPostgres {
+        name: String,
+        port: u16,
+    }
+
+    impl DockerPostgres {
+        fn url(&self) -> String {
+            format!("postgres://postgres:postgres@127.0.0.1:{}/postgres?sslmode=disable", self.port)
+        }
+    }
+
+    impl Drop for DockerPostgres {
+        fn drop(&mut self) {
+            let _ = Command::new("docker").args(["rm", "-f", &self.name]).status();
+        }
+    }
+
+    fn docker_ready() -> bool {
+        Command::new("docker")
+            .args(["version", "--format", "{{.Server.Version}}"])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+
+    async fn start_docker_postgres() -> Option<DockerPostgres> {
+        if !docker_ready() {
+            eprintln!("skipping docker-backed postgres test because Docker is unavailable");
+            return None;
+        }
+
+        let port = portpicker::pick_unused_port().expect("pick unused postgres port");
+        let container = DockerPostgres { name: format!("dbx-postgres-enum-{}", uuid::Uuid::new_v4()), port };
+
+        let status = Command::new("docker")
+            .args([
+                "run",
+                "-d",
+                "--rm",
+                "--name",
+                &container.name,
+                "-e",
+                "POSTGRES_PASSWORD=postgres",
+                "-e",
+                "POSTGRES_USER=postgres",
+                "-e",
+                "POSTGRES_DB=postgres",
+                "-p",
+                &format!("{port}:5432"),
+                "postgres:16-alpine",
+            ])
+            .status()
+            .expect("start docker postgres");
+        assert!(status.success(), "docker run postgres container should succeed");
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            match connect(&container.url(), Duration::from_secs(2)).await {
+                Ok(pool) => {
+                    drop(pool);
+                    return Some(container);
+                }
+                Err(_) if Instant::now() < deadline => tokio::time::sleep(Duration::from_millis(500)).await,
+                Err(error) => panic!("docker postgres did not become ready: {error}"),
+            }
+        }
+    }
+
+    fn state_enum_values(columns: &[ColumnInfo]) -> Option<Vec<String>> {
+        columns.iter().find(|column| column.name == "state").and_then(|column| column.enum_values.clone())
+    }
 
     // --- pg_quote_ident ---
 
@@ -3653,6 +3739,8 @@ mod tests {
         assert!(POSTGRES_COLUMNS_SQL.contains("generated always as identity"));
         assert!(POSTGRES_COLUMNS_SQL.contains("COALESCE(c.is_nullable = 'YES', NOT a.attnotnull)"));
         assert!(POSTGRES_COLUMNS_SQL.contains("LEFT JOIN information_schema.columns"));
+        assert!(POSTGRES_COLUMNS_SQL.contains("pg_enum"));
+        assert!(POSTGRES_COLUMNS_SQL.contains("AS enum_values"));
     }
 
     #[test]
@@ -3663,6 +3751,8 @@ mod tests {
         assert!(POSTGRES_COLUMNS_COMPAT_SQL.contains("col_description"));
         assert!(POSTGRES_COLUMNS_COMPAT_SQL.contains("COALESCE(c.is_nullable = 'YES', NOT a.attnotnull)"));
         assert!(POSTGRES_COLUMNS_COMPAT_SQL.contains("LEFT JOIN information_schema.columns"));
+        assert!(POSTGRES_COLUMNS_COMPAT_SQL.contains("NULL::text AS enum_values"));
+        assert!(!POSTGRES_COLUMNS_COMPAT_SQL.contains("pg_enum"));
     }
 
     #[test]
@@ -3670,8 +3760,40 @@ mod tests {
         assert!(POSTGRES_COLUMNS_INFORMATION_SCHEMA_SQL.contains("information_schema.columns"));
         assert!(POSTGRES_COLUMNS_INFORMATION_SCHEMA_SQL.contains("information_schema.table_constraints"));
         assert!(POSTGRES_COLUMNS_INFORMATION_SCHEMA_SQL.contains("information_schema.key_column_usage"));
+        assert!(POSTGRES_COLUMNS_INFORMATION_SCHEMA_SQL.contains("NULL::text AS enum_values"));
         assert!(!POSTGRES_COLUMNS_INFORMATION_SCHEMA_SQL.contains("pg_attribute"));
         assert!(!POSTGRES_COLUMNS_INFORMATION_SCHEMA_SQL.contains("regclass"));
+    }
+
+    #[tokio::test]
+    async fn postgres_column_metadata_query_returns_enum_values_against_real_postgres() {
+        let Some(container) = start_docker_postgres().await else {
+            return;
+        };
+
+        let pool = connect(&container.url(), Duration::from_secs(5)).await.expect("connect postgres");
+        let schema = format!("dbx_enum_meta_{}", std::process::id());
+        let schema_ident = format!("\"{}\"", schema.replace('\"', "\"\""));
+        let table = format!("{schema_ident}.orders");
+        let type_ident = format!("{schema_ident}.\"status\"");
+
+        execute_query(&pool, &format!("CREATE SCHEMA {schema_ident}")).await.expect("create schema");
+        execute_query(&pool, &format!("CREATE TYPE {type_ident} AS ENUM ('pending', 'active', 'archived')"))
+            .await
+            .expect("create enum type");
+        execute_query(&pool, &format!("CREATE TABLE {table} (id integer PRIMARY KEY, state {type_ident} NOT NULL)"))
+            .await
+            .expect("create table");
+
+        let client =
+            checkout_postgres_client(&pool, None, crate::db::connection_timeout()).await.expect("checkout client");
+
+        let columns =
+            get_columns_with_sql(&client, POSTGRES_COLUMNS_SQL, &schema, "orders").await.expect("primary columns");
+        assert_eq!(
+            state_enum_values(&columns),
+            Some(vec!["pending".to_string(), "active".to_string(), "archived".to_string()])
+        );
     }
 
     #[tokio::test]
