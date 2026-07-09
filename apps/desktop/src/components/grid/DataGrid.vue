@@ -4293,6 +4293,14 @@ const displayRowRefs = computed<DisplayRowRef[]>(() => {
 
 const displayRowCount = computed(() => displayRowRefs.value.length);
 
+const displayRowIndexByIdLookup = computed(() => {
+  const lookup = new Map<number, number>();
+  displayRowRefs.value.forEach((ref, index) => {
+    lookup.set(ref.id, index);
+  });
+  return lookup;
+});
+
 function rowItemFromDisplayRef(ref: DisplayRowRef): RowItem {
   if (ref.isNew) {
     return {
@@ -4324,7 +4332,8 @@ function displayItemAt(rowIndex: number): RowItem | undefined {
 }
 
 function displayRowIndexById(rowId: number): number {
-  return displayRowRefs.value.findIndex((ref) => ref.id === rowId);
+  // Multi-row actions call getRowItem for each selected row; keep that lookup O(1).
+  return displayRowIndexByIdLookup.value.get(rowId) ?? -1;
 }
 
 const displayItems = computed<RowItem[]>(() => displayRowRefs.value.map(rowItemFromDisplayRef));
