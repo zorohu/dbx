@@ -854,6 +854,11 @@ fn build_data_grid_save_statements(options: &DataGridSaveStatementOptions) -> Ve
             .iter()
             .enumerate()
             .filter_map(|(index, column)| Some((column.as_deref()?, row.get(index).unwrap_or(&Value::Null))))
+            .filter(|(column, value)| {
+                let column_info = column_info_for(column_info, column);
+                // Empty generated values must be omitted so the database can apply AUTO_INCREMENT/IDENTITY semantics.
+                !column_info.is_some_and(is_auto_generated_column) || !grid_value_is_empty(value)
+            })
             .filter(|(column, _)| {
                 !is_grid_insert_omitted_column(
                     options.database_type,
@@ -1780,6 +1785,10 @@ fn is_auto_generated_column(column: &DataGridColumnInfo) -> bool {
         .to_ascii_lowercase()
         .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
         .any(|part| matches!(part, "auto_increment" | "autoincrement" | "identity"))
+}
+
+fn grid_value_is_empty(value: &Value) -> bool {
+    value.is_null() || value.as_str().is_some_and(str::is_empty)
 }
 
 fn is_grid_insert_omitted_column(
@@ -3490,6 +3499,32 @@ mod tests {
             result.statements,
             vec![r#"INSERT INTO "OnlineLogs" ("OnlineLogId", "LogTime") VALUES (42, '2026-06-12T00:00:00Z');"#]
         );
+    }
+
+    #[test]
+    fn prepare_data_grid_save_omits_empty_mysql_auto_increment_value() {
+        let result = prepare_data_grid_save(DataGridSaveStatementOptions {
+            database_type: Some(DatabaseType::Mysql),
+            table_meta: DataGridTableMeta {
+                catalog: None,
+                schema: Some("app".to_string()),
+                table_name: "users".to_string(),
+                primary_keys: vec!["id".to_string()],
+                columns: Some(vec![
+                    pk_column("id", "BIGINT", false, Some("auto_increment")),
+                    column("name", "VARCHAR", false, None),
+                ]),
+            },
+            columns: vec!["id".to_string(), "name".to_string()],
+            source_columns: None,
+            rows: vec![],
+            dirty_rows: vec![],
+            deleted_rows: vec![],
+            new_rows: vec![vec![json!(""), json!("Ada")]],
+        });
+
+        assert_eq!(result.validation_error, None);
+        assert_eq!(result.statements, vec!["INSERT INTO `app`.`users` (`name`) VALUES ('Ada');"]);
     }
 
     #[test]
