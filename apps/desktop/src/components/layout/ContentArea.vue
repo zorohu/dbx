@@ -5,7 +5,7 @@ import { appendDebugLog, isDebugLoggingEnabled } from "@/lib/backend/debugLog";
 import { canReloadUnavailableDataTab } from "@/lib/table/tableDataRefresh";
 import type { CSSProperties } from "vue";
 import { useI18n } from "vue-i18n";
-import { Check, Columns3, Columns3Cog, EyeOff, Loader2, Search, TableProperties, ChevronDown, ChevronUp, Inbox, RefreshCcw, Wrench, Toolbox, Database, Download, Upload, X, Pin, Rows3, SquareDashed, Minus, Plus } from "@lucide/vue";
+import { Check, Columns3, Columns3Cog, EyeOff, Loader2, Search, TableProperties, ChevronDown, ChevronUp, Inbox, RefreshCcw, Wrench, Toolbox, Database, Download, Upload, X, Pin, Rows3, SquareDashed, Minus, Plus, ShieldAlert } from "@lucide/vue";
 import { Splitpanes, Pane } from "splitpanes";
 import "splitpanes/dist/splitpanes.css";
 import { Button } from "@/components/ui/button";
@@ -80,6 +80,7 @@ import { formatElapsedSeconds } from "@/lib/common/elapsedTime";
 import type { CustomSaveHandler } from "@/composables/useDataGridEditor";
 import type { QueryTab, ConnectionConfig, TableInfoTab, TreeNode, VectorCollectionMeta, ObjectBrowserViewport } from "@/types/database";
 import { sqlFormatDialectForDbType, type SqlFormatDialect } from "@/lib/sql/sqlFormatter";
+import { productionContextForDatabase } from "@/lib/database/productionSafety";
 
 type DataGridHandle = {
   onToolbarRefresh: () => Promise<void> | void;
@@ -156,7 +157,7 @@ const emit = defineEmits<{
   openConnectionSettings: [connectionId: string, initialTab: "advanced"];
 }>();
 
-const { t } = useI18n();
+const { t, locale } = useI18n();
 const queryStore = useQueryStore();
 const connectionStore = useConnectionStore();
 const settingsStore = useSettingsStore();
@@ -206,6 +207,13 @@ const activeTableMeta = computed(() => props.activeTab.tableMeta);
 const activeDataTabTableMeta = computed(() => tableMetaForDataTab(props.activeTab));
 const activeEffectiveDatabaseType = computed(() => effectiveDatabaseTypeForConnection(props.activeConnection));
 const activeDataTabExecutionDatabase = computed(() => dataTabExecutionDatabase(props.activeConnection, props.activeTab.database, activeDataTabTableMeta.value?.catalog));
+const activeProductionContext = computed(() => productionContextForDatabase(props.activeConnection, props.activeTab.database));
+const productionWatermarkText = computed(() => (locale.value.startsWith("zh") ? "生产环境" : "PROD"));
+const productionSessionDetail = computed(() => {
+  if (!activeProductionContext.value.active) return "";
+  if (activeProductionContext.value.reason === "connection") return t("production.connection");
+  return activeProductionContext.value.databases.join(", ") || t("production.databases");
+});
 
 function findNodeInTree(nodes: TreeNode[], id: string): TreeNode | undefined {
   for (const node of nodes) {
@@ -732,15 +740,23 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
 </script>
 
 <template>
-  <div class="flex flex-col flex-1 min-h-0">
+  <div class="production-session-shell flex flex-col flex-1 min-h-0" :class="{ 'production-session-shell--active': activeProductionContext.active }">
+    <div v-if="activeProductionContext.active" class="production-session-strip flex h-7 shrink-0 items-center gap-2 border-b border-red-500/35 bg-red-500/10 px-3 text-xs font-semibold text-red-800 shadow-[inset_0_1px_0_rgb(239_68_68_/_0.28)] dark:text-red-200">
+      <ShieldAlert class="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+      <span class="font-mono uppercase tracking-normal">{{ t("production.title") }}</span>
+      <span v-if="productionSessionDetail" class="min-w-0 truncate rounded-[4px] border border-red-500/25 bg-background/65 px-1.5 py-0.5 font-medium text-red-700 dark:text-red-200">{{ productionSessionDetail }}</span>
+    </div>
     <!-- Query mode: editor + results -->
     <template v-if="activeTab.mode === 'query'">
       <Splitpanes horizontal class="query-output-splitpanes flex-1 min-h-0 overflow-hidden" @resized="onResultsResized">
         <Pane class="min-h-0" :size="editorPaneSize" :min-size="resultsPaneOpen ? 15 : 100">
           <div class="h-full flex flex-col relative">
+            <div v-if="activeProductionContext.active" class="production-watermark pointer-events-none absolute inset-0 z-10 grid select-none" aria-hidden="true">
+              <span v-for="index in 4" :key="index" class="production-watermark__label whitespace-nowrap font-mono text-6xl font-extrabold text-red-700/[0.24] dark:text-red-200/[0.2]">{{ productionWatermarkText }}</span>
+            </div>
             <QueryEditor
               ref="queryEditorRef"
-              class="flex-1"
+              class="relative z-0 flex-1"
               :model-value="activeTab.sql"
               :connection-id="activeTab.connectionId"
               :database="activeTab.database"
@@ -1554,9 +1570,39 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
   isolation: isolate;
 }
 
+.production-session-shell--active {
+  box-shadow: inset 3px 0 0 color-mix(in oklch, var(--destructive) 78%, transparent);
+}
+
+.production-session-strip {
+  background-image: linear-gradient(90deg, color-mix(in oklch, var(--destructive) 14%, transparent), color-mix(in oklch, var(--destructive) 7%, transparent));
+}
+
 .query-output-splitpanes :deep(> .splitpanes__splitter) {
   z-index: 1;
   flex: 0 0 3px;
+}
+
+.production-watermark {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-rows: repeat(2, minmax(0, 1fr));
+  gap: 3rem;
+  overflow: hidden;
+  padding: 3rem 2.5rem;
+}
+
+.production-watermark__label {
+  align-self: center;
+  justify-self: center;
+  transform: rotate(-22deg);
+}
+
+@media (max-width: 700px) {
+  .production-watermark {
+    grid-template-columns: 1fr;
+    gap: 1.5rem;
+    padding-inline: 1rem;
+  }
 }
 
 .result-tab-scroll::-webkit-scrollbar {
