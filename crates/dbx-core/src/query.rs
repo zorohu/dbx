@@ -130,12 +130,14 @@ impl DbOperationBudget {
 /// Uses config_for_pool_key to correctly resolve configs when pool_key includes
 /// a database suffix (e.g., "prod:app" → config stored under "prod").
 pub async fn check_read_only_for_connection(state: &AppState, pool_key: &str, sql: &str) -> Result<(), String> {
-    let conn_name = {
+    let connection = {
         let configs = state.configs.read().await;
-        crate::connection::config_for_pool_key(pool_key, &configs).filter(|c| c.read_only).map(|c| c.name.clone())
+        crate::connection::config_for_pool_key(pool_key, &configs)
+            .filter(|config| config.read_only)
+            .map(|config| (config.name.clone(), config.db_type))
     };
-    if let Some(name) = conn_name {
-        crate::query_execution_sql::check_read_only(sql, &name)?;
+    if let Some((name, database_type)) = connection {
+        crate::query_execution_sql::check_read_only(sql, &name, database_type)?;
     }
     Ok(())
 }
@@ -146,13 +148,15 @@ pub async fn check_read_only_for_connection_multi(
     pool_key: &str,
     statements: &[impl AsRef<str>],
 ) -> Result<(), String> {
-    let conn_name = {
+    let connection = {
         let configs = state.configs.read().await;
-        crate::connection::config_for_pool_key(pool_key, &configs).filter(|c| c.read_only).map(|c| c.name.clone())
+        crate::connection::config_for_pool_key(pool_key, &configs)
+            .filter(|config| config.read_only)
+            .map(|config| (config.name.clone(), config.db_type))
     };
-    if let Some(name) = conn_name {
+    if let Some((name, database_type)) = connection {
         for sql in statements {
-            crate::query_execution_sql::check_read_only(sql.as_ref(), &name)?;
+            crate::query_execution_sql::check_read_only(sql.as_ref(), &name, database_type)?;
         }
     }
     Ok(())
@@ -1100,18 +1104,18 @@ pub async fn do_execute(
     let _activity_touch = state.pool_activity_touch(pool_key);
 
     let query_timeout = resolve_query_timeout(options.timeout_secs);
-    let (_duckdb_attached_names, conn_name_if_readonly) = {
+    let (_duckdb_attached_names, read_only_connection) = {
         let configs = state.configs.read().await;
         let config = crate::connection::config_for_pool_key(pool_key, &configs);
         let attached = config
             .map(|c| c.attached_databases.iter().map(|db| db.name.clone()).collect::<Vec<_>>())
             .unwrap_or_default();
-        let conn_name = config.filter(|c| c.read_only).map(|c| c.name.clone());
-        (attached, conn_name)
+        let connection = config.filter(|config| config.read_only).map(|config| (config.name.clone(), config.db_type));
+        (attached, connection)
     };
     let operation_budget = operation_budget_for_pool_key(state, pool_key, query_timeout).await;
-    if let Some(name) = conn_name_if_readonly {
-        crate::query_execution_sql::check_read_only(sql, &name)?;
+    if let Some((name, database_type)) = read_only_connection {
+        crate::query_execution_sql::check_read_only(sql, &name, database_type)?;
     }
     let pool_db_type = connection_database_type_for_pool_key(state, pool_key).await;
     let connections = state.connections.read().await;

@@ -785,7 +785,7 @@ async fn try_export_mysql_query_result_stream(
     state.touch_pool_activity(&pool_key).await;
     let _activity_touch = state.pool_activity_touch(&pool_key);
 
-    let (mysql_dialect, read_only_connection_name) = {
+    let (mysql_dialect, read_only_connection) = {
         let configs = state.configs.read().await;
         let config = configs.get(&request.connection_id);
         (
@@ -797,11 +797,11 @@ async fn try_export_mysql_query_result_stream(
                     )
                 })
                 .unwrap_or_default(),
-            config.filter(|config| config.read_only).map(|config| config.name.clone()),
+            config.filter(|config| config.read_only).map(|config| (config.name.clone(), config.db_type)),
         )
     };
-    if let Some(name) = read_only_connection_name {
-        crate::query_execution_sql::check_read_only(&request.sql, &name)?;
+    if let Some((name, database_type)) = read_only_connection {
+        crate::query_execution_sql::check_read_only(&request.sql, &name, database_type)?;
     }
 
     let xlsx_hard_limit_active = xlsx_hard_limit_active(format, request);
