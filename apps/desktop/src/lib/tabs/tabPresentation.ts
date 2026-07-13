@@ -1,6 +1,8 @@
 ﻿import { useConnectionStore } from "@/stores/connectionStore";
 import { useSettingsStore } from "@/stores/settingsStore";
-import type { ConnectionConfig, QueryResult, QueryTab } from "@/types/database";
+import { splitMongoCommandRanges } from "@/lib/mongo/mongoShellCommand";
+import { executableStatementRanges, splitSqlStatementRanges, type SqlTextRange } from "@/lib/sql/sqlStatementRanges";
+import type { ConnectionConfig, DatabaseType, QueryResult, QueryTab } from "@/types/database";
 
 type Translate = (key: string, params?: Record<string, unknown>) => string;
 export type OutputView = "result" | "summary" | "explain" | "chart";
@@ -145,8 +147,39 @@ export function queryResultStatementLabel(result: Pick<QueryResult, "sourceLabel
   return result.sourceLabel;
 }
 
+export function middleEllipsis(value: string, maxLength = 24): string {
+  if (value.length <= maxLength) return value;
+  if (maxLength <= 3) return ".".repeat(Math.max(0, maxLength));
+  const visibleLength = maxLength - 3;
+  const startLength = Math.ceil(visibleLength / 2);
+  const endLength = Math.floor(visibleLength / 2);
+  const end = endLength > 0 ? value.slice(-endLength) : "";
+  return `${value.slice(0, startLength)}...${end}`;
+}
+
 export function resultSqlForGrid(tab: Pick<QueryTab, "result" | "resultBaseSql" | "lastExecutedSql" | "sql">): string {
   return tab.result?.sourceStatement || tab.resultBaseSql || tab.lastExecutedSql || tab.sql;
+}
+
+/**
+ * Resolves a result's executed statement back to its current editor range.
+ * A stale or ambiguous source is ignored instead of highlighting a different
+ * statement that happens to have the same text.
+ */
+export function resultSourceRange(editorSql: string, result: Pick<QueryResult, "sourceStatement"> | undefined, resultIndex: number | undefined, databaseType?: DatabaseType): SqlTextRange | undefined {
+  const sourceStatement = result?.sourceStatement;
+  if (!sourceStatement) return undefined;
+
+  const statements = databaseType === "redis" ? executableStatementRanges(editorSql, databaseType) : databaseType === "mongodb" ? splitMongoCommandRanges(editorSql).map(({ from, to, text }) => ({ from, to, sql: text })) : splitSqlStatementRanges(editorSql, databaseType);
+  const indexed = typeof resultIndex === "number" ? statements[resultIndex] : undefined;
+  if (indexed?.sql === sourceStatement) {
+    return { from: indexed.from, to: indexed.to, sql: indexed.sql };
+  }
+
+  const matches = statements.filter((statement) => statement.sql === sourceStatement);
+  if (matches.length !== 1) return undefined;
+  const [match] = matches;
+  return { from: match.from, to: match.to, sql: match.sql };
 }
 
 export function queryResultBaseSql(tab: Pick<QueryTab, "result" | "resultBaseSql" | "lastExecutedSql" | "sql">): string {
@@ -157,12 +190,23 @@ export function queryResultExecutionSql(tab: Pick<QueryTab, "result" | "resultBa
   return tab.resultSortedSql || resultSqlForGrid(tab);
 }
 
-export function tabularResultItems(results: QueryResult[] | undefined): { result: QueryResult; index: number; n: number; label?: string; title?: string }[] {
+export function tabularResultItems(results: QueryResult[] | undefined): { result: QueryResult; index: number; n: number; label?: string; displayLabel?: string; labelTruncated: boolean; title?: string }[] {
   if (!results) return [];
   return results
     .map((result, index) => ({ result, index }))
     .filter((item) => item.result.columns.length > 0)
-    .map((item, ordinal) => ({ ...item, n: ordinal + 1, label: queryResultStatementLabel(item.result), title: item.result.sourceStatement }));
+    .map((item, ordinal) => {
+      const label = queryResultStatementLabel(item.result);
+      const displayLabel = label ? middleEllipsis(label) : undefined;
+      return {
+        ...item,
+        n: ordinal + 1,
+        label,
+        displayLabel,
+        labelTruncated: !!label && displayLabel !== label,
+        title: item.result.sourceLabel || item.result.sourceStatement,
+      };
+    });
 }
 
 export function activeResultRun(tab: Pick<QueryTab, "resultRuns" | "activeResultRunId">) {

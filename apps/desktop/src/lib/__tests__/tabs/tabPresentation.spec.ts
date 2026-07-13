@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { queryResultBaseSql, queryResultExecutionSql, tabularResultItems } from "@/lib/tabs/tabPresentation";
+import { middleEllipsis, queryResultBaseSql, queryResultExecutionSql, resultSourceRange, tabularResultItems } from "@/lib/tabs/tabPresentation";
 import type { QueryTab } from "@/types/database";
 
 function queryTab(overrides: Partial<QueryTab>): QueryTab {
@@ -53,7 +53,13 @@ describe("query result SQL selection", () => {
 });
 
 describe("query result labels", () => {
-  it("uses source labels while keeping the full statement as the title", () => {
+  it("preserves both ends when shortening long source labels", () => {
+    expect(middleEllipsis("easy_manager_tool.tool_monitor_data_index_item")).toBe("easy_manage...index_item");
+    expect(middleEllipsis("aaa.apis")).toBe("aaa.apis");
+    expect(middleEllipsis("abcdef", 4)).toBe("a...");
+  });
+
+  it("uses the full source label as the result tab tooltip", () => {
     const [item] = tabularResultItems([
       {
         columns: ["id"],
@@ -66,7 +72,26 @@ describe("query result labels", () => {
     ]);
 
     expect(item?.label).toBe("app.users");
-    expect(item?.title).toBe("SELECT * FROM users");
+    expect(item?.displayLabel).toBe("app.users");
+    expect(item?.labelTruncated).toBe(false);
+    expect(item?.title).toBe("app.users");
+  });
+
+  it("exposes a middle-shortened display label while retaining the full tooltip", () => {
+    const [item] = tabularResultItems([
+      {
+        columns: ["id"],
+        rows: [[1]],
+        affected_rows: 0,
+        execution_time_ms: 1,
+        sourceLabel: "easy_manager_tool.tool_monitor_data_index_item",
+        sourceStatement: "SELECT * FROM tool_monitor_data_index_item",
+      },
+    ]);
+
+    expect(item?.displayLabel).toBe("easy_manage...index_item");
+    expect(item?.labelTruncated).toBe(true);
+    expect(item?.title).toBe("easy_manager_tool.tool_monitor_data_index_item");
   });
 
   it("does not expose SQL text as a visible fallback label", () => {
@@ -82,5 +107,47 @@ describe("query result labels", () => {
 
     expect(item?.label).toBeUndefined();
     expect(item?.title).toBe("SELECT 1");
+  });
+});
+
+describe("query result source ranges", () => {
+  it("uses the result index to distinguish repeated statements", () => {
+    const sql = "SELECT * FROM users;\nSELECT * FROM users;";
+    const range = resultSourceRange(sql, { sourceStatement: "SELECT * FROM users" }, 1, "mysql");
+
+    expect(range).toEqual({
+      from: sql.lastIndexOf("SELECT"),
+      to: sql.length - 1,
+      sql: "SELECT * FROM users",
+    });
+  });
+
+  it("resolves newline-separated MongoDB commands with the Mongo shell parser", () => {
+    const sql = "db.model_field_group.find({})\n\ndb.model_info.find({})";
+    const sourceStatement = "db.model_info.find({})";
+    const range = resultSourceRange(sql, { sourceStatement }, 1, "mongodb");
+
+    expect(range).toEqual({
+      from: sql.indexOf(sourceStatement),
+      to: sql.length,
+      sql: sourceStatement,
+    });
+  });
+
+  it("resolves newline-separated Redis commands with the Redis parser", () => {
+    const sql = "GET first\n\nGET second";
+    const sourceStatement = "GET second";
+    const range = resultSourceRange(sql, { sourceStatement }, 1, "redis");
+
+    expect(range).toEqual({
+      from: sql.indexOf(sourceStatement),
+      to: sql.length,
+      sql: sourceStatement,
+    });
+  });
+
+  it("does not highlight a stale or ambiguous statement", () => {
+    expect(resultSourceRange("SELECT * FROM users;", { sourceStatement: "SELECT * FROM orders" }, 0, "mysql")).toBeUndefined();
+    expect(resultSourceRange("SELECT * FROM users; SELECT * FROM users;", { sourceStatement: "SELECT * FROM users" }, undefined, "mysql")).toBeUndefined();
   });
 });
