@@ -24,7 +24,7 @@ const structuredFilterStateCache = new Map<string, StructuredFilterCacheState>()
 </script>
 
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, onActivated, onDeactivated, ref, shallowRef, useSlots, watch, defineAsyncComponent, type Component, type CSSProperties } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, onActivated, onDeactivated, ref, shallowRef, toRaw, useSlots, watch, defineAsyncComponent, type Component, type CSSProperties } from "vue";
 import { useI18n } from "vue-i18n";
 import {
   ArrowUp,
@@ -1938,7 +1938,8 @@ function persistStructuredFilterState() {
     manualWhereInput: whereFilterInput.value,
     rules: cloneStructuredFilterRules(structuredFilterRules.value),
     appliedWhereInput: appliedStructuredWhereInput.value,
-    serverColumnFilters: structuredClone(serverColumnFilters.value),
+    // Vue wraps ref-held objects in proxies; structuredClone cannot clone those proxies.
+    serverColumnFilters: structuredClone(toRaw(serverColumnFilters.value)),
   });
 }
 
