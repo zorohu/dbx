@@ -1254,6 +1254,7 @@ export default withEnglishFallback({
     newChat: "Nuova Chat",
     thinking: "Riflessione...",
     reasoningProcess: "Processo di riflessione",
+    chars: "car.",
     stopGenerating: "Interrompi generazione",
     scrollToBottom: "Torna in fondo",
     tableMentionEmpty: "Nessuna tabella o file SQL corrispondente",

@@ -1314,6 +1314,7 @@ export default withEnglishFallback({
     newChat: "新对话",
     thinking: "思考中...",
     reasoningProcess: "思考过程",
+    chars: "字",
     stopGenerating: "停止生成",
     scrollToBottom: "回到底部",
     tableMentionEmpty: "没有匹配的表或 SQL 文件",

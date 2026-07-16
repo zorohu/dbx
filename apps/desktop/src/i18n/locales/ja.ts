@@ -1277,6 +1277,7 @@ export default withEnglishFallback({
     newChat: "新しいチャット",
     thinking: "思考中...",
     reasoningProcess: "思考プロセス",
+    chars: "文字",
     stopGenerating: "生成を停止",
     scrollToBottom: "一番下へ戻る",
     tableMentionEmpty: "一致するテーブルまたは SQL ファイルがありません",

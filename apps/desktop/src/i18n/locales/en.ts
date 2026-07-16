@@ -1314,6 +1314,7 @@ export default {
     newChat: "New Chat",
     thinking: "Thinking...",
     reasoningProcess: "Thinking process",
+    chars: "chars",
     stopGenerating: "Stop generating",
     scrollToBottom: "Back to bottom",
     tableMentionEmpty: "No matching tables or SQL files",

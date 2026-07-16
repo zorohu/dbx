@@ -1256,6 +1256,7 @@ export default withEnglishFallback({
     newChat: "新對話",
     thinking: "思考中……",
     reasoningProcess: "思考過程",
+    chars: "字",
     stopGenerating: "停止產生",
     scrollToBottom: "回到底部",
     tableMentionEmpty: "沒有相符的資料表或 SQL 檔案",

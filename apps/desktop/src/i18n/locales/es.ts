@@ -1273,6 +1273,7 @@ export default withEnglishFallback({
     newChat: "Nuevo chat",
     thinking: "Procesando...",
     reasoningProcess: "Proceso de razonamiento",
+    chars: "car.",
     stopGenerating: "Detener generación",
     scrollToBottom: "Volver al final",
     tableMentionEmpty: "Sin tablas ni archivos SQL coincidentes",
