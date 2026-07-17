@@ -162,7 +162,7 @@ export const AI_PROVIDER_PRESETS: Record<AiProvider, AiProviderPreset> = {
     model: "",
     apiStyle: "completions",
     authMethod: "bearer",
-    requiresApiKey: true,
+    requiresApiKey: false,
   },
   "claude-code-cli": {
     label: "Claude Code CLI",
@@ -191,7 +191,7 @@ export const AI_PROVIDER_PRESETS: Record<AiProvider, AiProviderPreset> = {
     model: "",
     apiStyle: "completions",
     authMethod: "bearer",
-    requiresApiKey: true,
+    requiresApiKey: false,
   },
 };
 

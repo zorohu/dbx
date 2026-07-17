@@ -801,11 +801,18 @@ fn emit_responses_function_call_item(
 // Validation helper
 // ---------------------------------------------------------------------------
 
+fn provider_requires_api_key(provider: &AiProvider) -> bool {
+    matches!(
+        provider,
+        AiProvider::Claude | AiProvider::Openai | AiProvider::Gemini | AiProvider::Deepseek | AiProvider::Qwen
+    )
+}
+
 fn validate_config(config: &AiConfig) -> Result<(), String> {
     if matches!(config.provider, AiProvider::CodexCli | AiProvider::ClaudeCodeCli) {
         return Ok(());
     }
-    if !matches!(config.provider, AiProvider::Ollama) && config.api_key.trim().is_empty() {
+    if provider_requires_api_key(&config.provider) && config.api_key.trim().is_empty() {
         return Err("API key is required".to_string());
     }
     if config.endpoint.trim().is_empty() {
@@ -821,7 +828,7 @@ fn validate_model_list_config(config: &AiConfig) -> Result<(), String> {
     if matches!(config.provider, AiProvider::CodexCli | AiProvider::ClaudeCodeCli) {
         return Ok(());
     }
-    if !matches!(config.provider, AiProvider::Ollama) && config.api_key.trim().is_empty() {
+    if provider_requires_api_key(&config.provider) && config.api_key.trim().is_empty() {
         return Err("API key is required".to_string());
     }
     resolve_model_list_endpoint(config).map(|_| ())
@@ -842,15 +849,17 @@ pub fn maybe_bearer_headers(config: &AiConfig) -> Result<HeaderMap, String> {
 pub fn claude_headers(config: &AiConfig) -> Result<HeaderMap, String> {
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    match config.auth_method {
-        AiAuthMethod::Bearer => {
-            headers.insert(
-                AUTHORIZATION,
-                HeaderValue::from_str(&format!("Bearer {}", config.api_key)).map_err(|e| e.to_string())?,
-            );
-        }
-        AiAuthMethod::ApiKey => {
-            headers.insert("x-api-key", HeaderValue::from_str(&config.api_key).map_err(|e| e.to_string())?);
+    if !config.api_key.trim().is_empty() {
+        match config.auth_method {
+            AiAuthMethod::Bearer => {
+                headers.insert(
+                    AUTHORIZATION,
+                    HeaderValue::from_str(&format!("Bearer {}", config.api_key)).map_err(|e| e.to_string())?,
+                );
+            }
+            AiAuthMethod::ApiKey => {
+                headers.insert("x-api-key", HeaderValue::from_str(&config.api_key).map_err(|e| e.to_string())?);
+            }
         }
     }
     headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
@@ -2595,12 +2604,13 @@ mod tests {
     use super::{
         apply_chat_completion_thinking_toggle, build_ai_http_client, build_responses_input_with_tools, claude_headers,
         claude_system_prompt, drain_next_stream_line, emit_responses_function_call_item, gemini_text, is_kimi_model,
-        openai_response_text, openai_stream_reasoning, openai_stream_text, parse_model_list_response, resolve_endpoint,
-        resolve_gemini_stream_endpoint, resolve_model_list_endpoint, responses_function_tool,
-        responses_max_output_tokens, responses_stream_text, responses_text, responses_token_usage,
-        set_chat_completion_token_limit, stream_data_payload, uses_anthropic_messages_api, validate_config, AiApiStyle,
-        AiAuthMethod, AiConfig, AiMessage, AiModelInfo, AiProvider, AiReasoningLevel, StreamToolEvent,
-        StreamingToolCallAccumulator, ToolCallRef, AUTHORIZATION, CLAUDE_DEFAULT_SYSTEM, TEST_PROMPT,
+        maybe_bearer_headers, openai_response_text, openai_stream_reasoning, openai_stream_text,
+        parse_model_list_response, resolve_endpoint, resolve_gemini_stream_endpoint, resolve_model_list_endpoint,
+        responses_function_tool, responses_max_output_tokens, responses_stream_text, responses_text,
+        responses_token_usage, set_chat_completion_token_limit, stream_data_payload, uses_anthropic_messages_api,
+        validate_config, validate_model_list_config, AiApiStyle, AiAuthMethod, AiConfig, AiMessage, AiModelInfo,
+        AiProvider, AiReasoningLevel, StreamToolEvent, StreamingToolCallAccumulator, ToolCallRef, AUTHORIZATION,
+        CLAUDE_DEFAULT_SYSTEM, TEST_PROMPT,
     };
 
     /// Reproduce the "Unknown tool:" bug: some OpenAI-compatible providers
@@ -2804,6 +2814,43 @@ mod tests {
     }
 
     #[test]
+    fn allows_empty_api_keys_only_for_self_hosted_providers() {
+        let base = AiConfig {
+            provider: AiProvider::OpenaiCompatible,
+            api_key: String::new(),
+            auth_method: AiAuthMethod::Bearer,
+            endpoint: "http://localhost:8080/v1".to_string(),
+            model: "local-model".to_string(),
+            models: Vec::new(),
+            api_style: AiApiStyle::Completions,
+            proxy_enabled: false,
+            proxy_url: String::new(),
+            enable_thinking: true,
+            reasoning_level: AiReasoningLevel::Default,
+            context_window: None,
+            codex_cli_path: None,
+            codex_cli_env: Default::default(),
+            claude_code_cli_path: None,
+            claude_code_cli_env: Default::default(),
+        };
+
+        for provider in [AiProvider::Ollama, AiProvider::OpenaiCompatible, AiProvider::Custom] {
+            let config = AiConfig { provider, ..base.clone() };
+            assert!(validate_config(&config).is_ok());
+            assert!(validate_model_list_config(&config).is_ok());
+            assert!(maybe_bearer_headers(&config).unwrap().get(AUTHORIZATION).is_none());
+        }
+
+        for provider in
+            [AiProvider::Claude, AiProvider::Openai, AiProvider::Gemini, AiProvider::Deepseek, AiProvider::Qwen]
+        {
+            let config = AiConfig { provider, ..base.clone() };
+            assert_eq!(validate_config(&config).unwrap_err(), "API key is required");
+            assert_eq!(validate_model_list_config(&config).unwrap_err(), "API key is required");
+        }
+    }
+
+    #[test]
     fn resolves_model_list_endpoints_from_base_and_completion_urls() {
         let openai = AiConfig {
             provider: AiProvider::Openai,
@@ -2981,6 +3028,13 @@ mod tests {
         let bearer_headers = claude_headers(&config).unwrap();
         assert_eq!(bearer_headers.get(AUTHORIZATION).unwrap(), "Bearer secret");
         assert!(bearer_headers.get("x-api-key").is_none());
+
+        config.provider = AiProvider::Custom;
+        config.api_key.clear();
+        let unauthenticated_headers = claude_headers(&config).unwrap();
+        assert!(unauthenticated_headers.get(AUTHORIZATION).is_none());
+        assert!(unauthenticated_headers.get("x-api-key").is_none());
+        assert_eq!(unauthenticated_headers.get("anthropic-version").unwrap(), "2023-06-01");
     }
 
     #[test]
