@@ -50,6 +50,7 @@ import { executableStatementRanges, splitSqlStatementRanges } from "@/lib/sql/sq
 import { externalSqlFileDisplayTitles, normalizeExternalSqlPath } from "@/lib/sql/sqlFileOpen";
 import { clearDataGridPendingSnapshotsForTab } from "@/composables/useDataGridEditor";
 import { buildTabResultSnapshot, deleteTabResultSnapshot, pruneTabResultSnapshots, readTabResultSnapshot, tabResultCacheKey, writeTabResultSnapshot } from "@/lib/tabs/tabResultCache";
+import { lightweightDetachedTab, restoreDetachedTab, type DetachedTabDescriptor } from "@/lib/tabs/detachedTabTransfer";
 import { estimateQueryResultsBytes, selectInactiveResultEvictions } from "@/lib/tabs/queryResultSize";
 import { queryResultBaseSql, queryResultExecutionSql } from "@/lib/tabs/tabPresentation";
 import { isQueryExecutionErrorResult } from "@/lib/query/queryResultError";
@@ -1378,10 +1379,33 @@ export const useQueryStore = defineStore("query", () => {
     if (committed && takeTabForTransfer(tab.id)) clearDataGridPendingSnapshotsForTab(tab.id);
   }
 
-  function registerDetachedOpenTab(windowLabel: string, tab: QueryTab) {
-    const persisted = serializeOpenTabs([tab])[0];
+  function registerDetachedOpenTab(windowLabel: string, tab: QueryTab | DetachedTabDescriptor) {
+    const persisted = serializeOpenTabs(["isExecuting" in tab ? tab : restoreDetachedTab(tab)])[0];
     if (!persisted) throw new Error("Detached tab persistence payload is missing");
     setDetachedOpenTabOwner(windowLabel, persisted, false, false);
+  }
+
+  async function commitDetachedOpenTab(windowLabel: string): Promise<void> {
+    if (!shouldPersistOpenTabs || storePersistGeneration !== persistGeneration) {
+      throw new Error("Main tab store is no longer authoritative");
+    }
+    const owner = detachedOpenTabsByWindow.get(windowLabel);
+    if (!owner) throw new Error("Detached tab persistence owner is missing");
+    const committedOwner = { ...owner, committed: true };
+    detachedOpenTabsByWindow.set(windowLabel, committedOwner);
+    try {
+      // This write is the transfer commit point. Do not use the generic flush
+      // path because stale stores intentionally turn that path into a no-op.
+      await saveTabs(tabs.value, activeTabId.value, detachedOpenTabsByWindow.entries());
+      if (storePersistGeneration !== persistGeneration) {
+        throw new Error("Main tab store changed while committing detached ownership");
+      }
+    } catch (error) {
+      if (detachedOpenTabsByWindow.get(windowLabel) === committedOwner) {
+        detachedOpenTabsByWindow.set(windowLabel, owner);
+      }
+      throw error;
+    }
   }
 
   function updateDetachedOpenTab(windowLabel: string, tab: SavedOpenTab) {
@@ -2089,6 +2113,67 @@ export const useQueryStore = defineStore("query", () => {
     return transferState;
   }
 
+  function createDetachedTransferTab(tab: QueryTab): DetachedTabDescriptor {
+    return lightweightDetachedTab(tab);
+  }
+
+  function lockTabForTransfer(id: string): boolean {
+    const tab = tabs.value.find((item) => item.id === id);
+    if (!tab || tab.isTransferring) return false;
+    tab.isTransferring = true;
+    return true;
+  }
+
+  function unlockTabForTransfer(id: string): void {
+    const tab = tabs.value.find((item) => item.id === id);
+    if (tab) tab.isTransferring = undefined;
+  }
+
+  async function stopTabActivityForTransfer(id: string, timeoutMs = 5_000): Promise<boolean> {
+    let tab = tabs.value.find((item) => item.id === id);
+    if (!tab) return false;
+    if (tab.isExecuting && !tab.isCancelling) {
+      const accepted = await cancelTabExecution(id);
+      if (!accepted && tabs.value.find((item) => item.id === id)?.isExecuting) return false;
+    }
+    tab = tabs.value.find((item) => item.id === id);
+    if (tab?.isExplaining) await cancelTabExplain(id);
+
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      tab = tabs.value.find((item) => item.id === id);
+      if (!tab) return false;
+      if (!tab.isExecuting && !tab.isCancelling && !tab.isExplaining && !tab.resultTotalRowCountLoading) return true;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    return false;
+  }
+
+  async function releaseTabSessionsForTransfer(id: string): Promise<void> {
+    const tab = tabs.value.find((item) => item.id === id);
+    if (!tab?.isTransferring) throw new Error("Tab transfer lock is missing");
+    if (tab.isExecuting || tab.isCancelling || tab.isExplaining || tab.resultTotalRowCountLoading || tab.txnSessionId) {
+      throw new Error("Tab became busy while preparing the detached window");
+    }
+    // The child reuses the same logical tab ID. Close all source-owned sessions
+    // before publishing the durable owner so the two WebViews never overlap.
+    await closeResultSession(tab, undefined, true);
+    await closeClientConnectionSession(tab, true);
+  }
+
+  async function finalizeTabTransfer(id: string): Promise<boolean> {
+    const transferState = takeTabForTransfer(id);
+    if (!transferState) return false;
+    const tab = transferState.tab;
+    const cacheKeys = new Set([tab.resultCacheKey, tabResultCacheKey(id), ...(tab.resultRuns?.map((run) => run.resultCacheKey) ?? [])].filter((key): key is string => !!key));
+    clearDataGridPendingSnapshotsForTab(id);
+    clearResultPayload(tab, { preserveCacheSnapshot: true });
+    tab.resultRuns = undefined;
+    tab.activeResultRunId = undefined;
+    await Promise.all([...cacheKeys].map((key) => deleteTabResultSnapshot(key).catch((error) => console.warn("[DBX][detached-tab:result-cache:delete:error]", { tabId: id, key, error }))));
+    return true;
+  }
+
   function restoreTabFromTransfer(transferState: NonNullable<ReturnType<typeof takeTabForTransfer>>) {
     if (tabs.value.some((tab) => tab.id === transferState.tab.id)) return;
     const index = Math.min(Math.max(transferState.index, 0), tabs.value.length);
@@ -2523,7 +2608,7 @@ export const useQueryStore = defineStore("query", () => {
 
   function updateSql(id: string, sql: string) {
     const tab = tabs.value.find((t) => t.id === id);
-    if (tab) {
+    if (tab && !tab.isTransferring) {
       tab.sql = sql;
       queueSavedSqlEditorPositionPersist(tab);
     }
@@ -3474,7 +3559,7 @@ export const useQueryStore = defineStore("query", () => {
     },
   ) {
     const tab = tabs.value.find((t) => t.id === id);
-    if (!tab || !sql.trim()) return;
+    if (!tab || tab.isTransferring || !sql.trim()) return;
 
     const openInNewResultTab = tab.mode === "query" && options?.openInNewResultTab === true;
     if (openInNewResultTab && tab.activeResultRunId && !tab.result) {
@@ -4387,7 +4472,7 @@ export const useQueryStore = defineStore("query", () => {
 
   async function explainTabSql(id: string, sql: string, databaseType?: DatabaseType, explainMode?: string) {
     const tab = tabs.value.find((t) => t.id === id);
-    if (!tab) return { ok: false as const, reason: "empty" as const };
+    if (!tab || tab.isTransferring) return { ok: false as const, reason: "empty" as const };
     const conn = useConnectionStore().getConfig(tab.connectionId);
     const queryTimeoutSecs = queryTimeoutSecsForConnection(conn);
     const executionId = uuid();
@@ -5312,6 +5397,12 @@ export const useQueryStore = defineStore("query", () => {
     closeTabAndWait,
     replaceActiveTabForDetachedNavigation,
     takeTabForTransfer,
+    createDetachedTransferTab,
+    lockTabForTransfer,
+    unlockTabForTransfer,
+    stopTabActivityForTransfer,
+    releaseTabSessionsForTransfer,
+    finalizeTabTransfer,
     restoreTabFromTransfer,
     adoptTransferredTab,
     forceClosePendingTab,
@@ -5319,6 +5410,7 @@ export const useQueryStore = defineStore("query", () => {
     cancelClosePendingTab,
     flushPendingPersist,
     registerDetachedOpenTab,
+    commitDetachedOpenTab,
     updateDetachedOpenTab,
     removeDetachedOpenTab,
     suspendOpenTabsPersist,

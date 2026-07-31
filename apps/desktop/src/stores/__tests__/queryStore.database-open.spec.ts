@@ -248,7 +248,7 @@ describe("queryStore database open state", () => {
     expect(store.activeTabId).toBeNull();
     expect(storage.get(OPEN_TABS_STORAGE_KEY)).toBeUndefined();
     expect(storage.get(ACTIVE_TAB_STORAGE_KEY)).toBeUndefined();
-    expect(JSON.parse(storage.get("dbx-app-state:open_tabs") ?? "{}")).toEqual({ tabs: [], activeTabId: null });
+    expect(JSON.parse(storage.get("dbx-app-state:open_tabs") ?? "{}")).toEqual({ tabs: [], activeTabId: null, detachedTabOwners: [] });
   });
 
   it("restores only pinned tabs when launch restore mode is pinned", async () => {

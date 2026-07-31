@@ -466,6 +466,93 @@ describe("queryStore detached tab transfer", () => {
     expect(reloadedMainStore.tabs.map((tab) => tab.id)).toEqual([tabId]);
   });
 
+  it("resolves the ownership commit only after its durable snapshot is written", async () => {
+    let savedPayload: SavedOpenTabsPayload | null = null;
+    let releaseWrite: () => void = () => {};
+    const writeBlocked = new Promise<void>((resolve) => {
+      releaseWrite = resolve;
+    });
+    const saveOpenTabsState = vi.fn(async (payload: SavedOpenTabsPayload) => {
+      savedPayload = structuredClone(payload);
+      await writeBlocked;
+    });
+    vi.doMock("@/lib/backend/api", async (importOriginal) => ({
+      ...(await importOriginal<typeof import("@/lib/backend/api")>()),
+      loadOpenTabsState: vi.fn(async () => structuredClone(savedPayload)),
+      saveOpenTabsState,
+    }));
+
+    const { useQueryStore } = await import("@/stores/queryStore");
+    const store = useQueryStore();
+    const tabId = store.createTab("pg-1", "app", "Durable", "query", undefined, "select 1");
+    const transfer = store.takeTabForTransfer(tabId)!;
+    store.registerDetachedOpenTab("detached-tab-durable", transfer.tab);
+
+    const commit = store.commitDetachedOpenTab("detached-tab-durable");
+    await vi.waitFor(() => expect(saveOpenTabsState).toHaveBeenCalledOnce());
+    expect(savedPayload?.detachedTabOwners).toEqual([{ windowLabel: "detached-tab-durable", tabId }]);
+
+    releaseWrite();
+    await commit;
+  });
+
+  it("recovers the main owner when the durable detached-owner write fails", async () => {
+    let savedPayload: SavedOpenTabsPayload | null = null;
+    let rejectWrites = false;
+    vi.doMock("@/lib/backend/api", async (importOriginal) => ({
+      ...(await importOriginal<typeof import("@/lib/backend/api")>()),
+      loadOpenTabsState: vi.fn(async () => structuredClone(savedPayload)),
+      saveOpenTabsState: vi.fn(async (payload: SavedOpenTabsPayload) => {
+        if (rejectWrites) throw new Error("disk unavailable");
+        savedPayload = structuredClone(payload);
+      }),
+    }));
+
+    const { useQueryStore } = await import("@/stores/queryStore");
+    const sourceStore = useQueryStore();
+    const tabId = sourceStore.createTab("pg-1", "app", "Recoverable", "query", undefined, "select 1");
+    const transfer = sourceStore.takeTabForTransfer(tabId)!;
+    sourceStore.registerDetachedOpenTab("detached-tab-write-failure", transfer.tab);
+    await sourceStore.flushPendingPersist({ force: true });
+    expect(savedPayload?.detachedTabOwners).toEqual([]);
+
+    rejectWrites = true;
+    await expect(sourceStore.commitDetachedOpenTab("detached-tab-write-failure")).rejects.toThrow("disk unavailable");
+
+    setActivePinia(createPinia());
+    const recreatedMainStore = useQueryStore();
+    await recreatedMainStore.initOpenTabs({ detachedWindowLabels: ["detached-tab-write-failure"] });
+
+    expect(recreatedMainStore.tabs.map((tab) => tab.id)).toEqual([tabId]);
+    expect(savedPayload?.detachedTabOwners).toEqual([]);
+  });
+
+  it("rejects an ownership commit from a superseded main store", async () => {
+    let savedPayload: SavedOpenTabsPayload | null = null;
+    const saveOpenTabsState = vi.fn(async (payload: SavedOpenTabsPayload) => {
+      savedPayload = structuredClone(payload);
+    });
+    vi.doMock("@/lib/backend/api", async (importOriginal) => ({
+      ...(await importOriginal<typeof import("@/lib/backend/api")>()),
+      loadOpenTabsState: vi.fn(async () => structuredClone(savedPayload)),
+      saveOpenTabsState,
+    }));
+
+    const { useQueryStore } = await import("@/stores/queryStore");
+    const sourceStore = useQueryStore();
+    const tabId = sourceStore.createTab("pg-1", "app", "Superseded", "query", undefined, "select 1");
+    const transfer = sourceStore.takeTabForTransfer(tabId)!;
+    sourceStore.registerDetachedOpenTab("detached-tab-superseded", transfer.tab);
+    await sourceStore.flushPendingPersist({ force: true });
+
+    setActivePinia(createPinia());
+    useQueryStore();
+    await expect(sourceStore.commitDetachedOpenTab("detached-tab-superseded")).rejects.toThrow("no longer authoritative");
+
+    expect(saveOpenTabsState).toHaveBeenCalledOnce();
+    expect(savedPayload?.detachedTabOwners).toEqual([]);
+  });
+
   it("preserves persisted detached owners when live-window enumeration is unknown", async () => {
     const detachedTab: SavedOpenTab = {
       id: "detached-unknown",
@@ -613,5 +700,36 @@ describe("queryStore detached tab transfer", () => {
     expect(closeClientConnectionSession).not.toHaveBeenCalled();
     expect(store.tabs[0].resultSessionId).toBe("result-session-1");
     expect(store.tabs[0].clientSessionId).toBe("client-session-1");
+  });
+
+  it("locks execution, releases source sessions, and removes the source only at final commit", async () => {
+    const closeQuerySession = vi.fn(async () => {});
+    const closeClientConnectionSession = vi.fn(async () => {});
+    vi.doMock("@/lib/backend/api", async (importOriginal) => ({
+      ...(await importOriginal<typeof import("@/lib/backend/api")>()),
+      closeQuerySession,
+      closeClientConnectionSession,
+      deleteTabResultSnapshot: vi.fn(async () => {}),
+    }));
+
+    const { useQueryStore } = await import("@/stores/queryStore");
+    const store = useQueryStore();
+    const tabId = store.createTab("pg-1", "app", "Query", "query", undefined, "select 1");
+    const tab = store.tabs[0];
+    tab.resultSessionId = "result-session-1";
+    tab.result = { columns: ["value"], rows: [[1]], affected_rows: 0, execution_time_ms: 1 };
+
+    expect(store.lockTabForTransfer(tabId)).toBe(true);
+    store.updateSql(tabId, "select 2");
+    expect(tab.sql).toBe("select 1");
+    expect(store.tabs.some((item) => item.id === tabId)).toBe(true);
+
+    await store.releaseTabSessionsForTransfer(tabId);
+    expect(closeQuerySession).toHaveBeenCalled();
+    expect(closeClientConnectionSession).toHaveBeenCalled();
+
+    await store.finalizeTabTransfer(tabId);
+    expect(store.tabs.some((item) => item.id === tabId)).toBe(false);
+    expect(tab.result).toBeUndefined();
   });
 });

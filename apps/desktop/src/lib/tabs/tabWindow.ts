@@ -1,10 +1,9 @@
 import { emitTo, type UnlistenFn } from "@tauri-apps/api/event";
 import { getAllWebviewWindows, getCurrentWebviewWindow, WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
-import type { DataGridPendingSnapshotTransfer } from "@/composables/useDataGridEditor";
 import { DETACHED_TAB_WINDOW_HEIGHT, DETACHED_TAB_WINDOW_WIDTH, detachedTabWindowLogicalPosition, type TabWindowClientPlacement } from "@/lib/tabs/tabWindowPlacement";
-import { restoreOpenTabsPayload, serializeOpenTabs, type SavedOpenTab } from "@/lib/app/openTabsPersistence";
-import type { QueryTab } from "@/types/database";
+import { restoreOpenTabsPayload, type SavedOpenTab } from "@/lib/app/openTabsPersistence";
+import { assertDetachedTransferPayloadBounded, lightweightDetachedTab, type DetachedTabDescriptor } from "@/lib/tabs/detachedTabTransfer";
 
 const DETACHED_TRANSFER_PARAM = "dbxDetachedTransfer";
 const TRANSFER_TIMEOUT_MS = 15_000;
@@ -23,13 +22,12 @@ interface TransferSignal {
 }
 
 export interface DetachedTabTransferPayload extends TransferSignal {
-  tab: QueryTab;
+  tab: DetachedTabDescriptor;
   activeOutputView: "result" | "summary" | "explain" | "chart";
   selectedSql: string;
   cursorPos: number;
   explainMode: "explain" | "autotrace";
   blockDangerousRedisCommands: boolean;
-  dataGridSnapshots: DataGridPendingSnapshotTransfer[];
 }
 
 interface TransferPrepared extends TransferSignal {
@@ -54,9 +52,7 @@ interface DetachedTabPersistenceAcknowledgement {
   message?: string;
 }
 
-interface DetachedTabRecoveryState extends Omit<DetachedTabTransferPayload, "tab"> {
-  tab: SavedOpenTab;
-}
+type DetachedTabRecoveryState = DetachedTabTransferPayload;
 
 interface DetachedAppCloseCheck {
   requestId: string;
@@ -86,6 +82,7 @@ export interface PreparedTabWindow {
     payload: Omit<DetachedTabTransferPayload, "transferId">,
     options?: {
       onPrepared?: () => Promise<void>;
+      onCommit?: () => Promise<void>;
     },
   ) => Promise<{ commitAcknowledged: boolean }>;
   abort: () => Promise<void>;
@@ -152,16 +149,8 @@ function detachedRecoveryStorageKey(transferId: string): string {
 
 function saveDetachedRecoveryState(payload: DetachedTabTransferPayload): void {
   if (typeof sessionStorage === "undefined") return;
-  const tab = serializeOpenTabs([payload.tab])[0];
-  if (!tab) return;
   try {
-    sessionStorage.setItem(
-      detachedRecoveryStorageKey(payload.transferId),
-      JSON.stringify({
-        ...payload,
-        tab,
-      } satisfies DetachedTabRecoveryState),
-    );
+    sessionStorage.setItem(detachedRecoveryStorageKey(payload.transferId), JSON.stringify(payload satisfies DetachedTabRecoveryState));
   } catch {
     // Recovery is best-effort and must never block ownership transfer.
   }
@@ -178,7 +167,9 @@ function updateDetachedRecoveryTab(transferId: string, tab: SavedOpenTab | null)
     const raw = sessionStorage.getItem(key);
     if (!raw) return;
     const state = JSON.parse(raw) as DetachedTabRecoveryState;
-    sessionStorage.setItem(key, JSON.stringify({ ...state, tab } satisfies DetachedTabRecoveryState));
+    const restored = restoreOpenTabsPayload({ tabs: [tab], activeTabId: tab.id }).tabs[0];
+    if (!restored) return;
+    sessionStorage.setItem(key, JSON.stringify({ ...state, tab: lightweightDetachedTab(restored) } satisfies DetachedTabRecoveryState));
   } catch {
     // Keep runtime persistence independent from optional reload recovery.
   }
@@ -191,16 +182,7 @@ function loadDetachedRecoveryState(transferId: string): DetachedTabTransferPaylo
     if (!raw) return null;
     const state = JSON.parse(raw) as DetachedTabRecoveryState;
     if (state.transferId !== transferId || !state.tab) return null;
-    const restored = restoreOpenTabsPayload({
-      tabs: [state.tab],
-      activeTabId: state.tab.id,
-    });
-    const tab = restored.tabs[0];
-    if (!tab) return null;
-    return {
-      ...state,
-      tab,
-    };
+    return state;
   } catch {
     return null;
   }
@@ -329,13 +311,24 @@ async function prepareTauriTabWindow(tabId: string, title: string, options: Prep
       const preparedWaiter = await createEventWaiter<TransferPrepared>(mainWindow, transferEventName("prepared", transferId), "Detached tab window did not prepare the tab");
       void preparedWaiter.promise.catch(() => {});
       try {
-        await emitTo(label, transferEventName("transfer", transferId), { transferId, ...payload } satisfies DetachedTabTransferPayload);
+        const transferPayload = { transferId, ...payload } satisfies DetachedTabTransferPayload;
+        // Tauri events are JSON messages. Enforce a hard bound before crossing
+        // the WebView IPC boundary so accidental future fields cannot recreate
+        // the previous unbounded result-copy behavior.
+        assertDetachedTransferPayloadBounded(transferPayload);
+        await emitTo(label, transferEventName("transfer", transferId), transferPayload);
         const prepared = await preparedWaiter.promise;
         if (!prepared.ok) throw new Error(prepared.message || "Detached tab window rejected the tab");
-        // Persist a recovery snapshot before publishing the irreversible commit.
-        // The formal detached owner is recorded after the child reports commit.
+        // Persist recovery state first, then durably publish the detached owner
+        // before sending the irreversible commit decision to the child.
         if (transferOptions.onPrepared) {
           await withTimeout(transferOptions.onPrepared(), TRANSFER_TIMEOUT_MS, "Timed out while persisting the detached tab recovery snapshot");
+        }
+        // The source remains authoritative until the detached owner transition
+        // is durable. A failed write aborts the provisional child before either
+        // WebView can publish a committed ownership state.
+        if (transferOptions.onCommit) {
+          await withTimeout(transferOptions.onCommit(), TRANSFER_TIMEOUT_MS, "Timed out while persisting the detached tab owner");
         }
       } catch (error) {
         preparedWaiter.cancel();

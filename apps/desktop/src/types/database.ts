@@ -941,6 +941,8 @@ export interface QueryTab {
   explainTableSql?: string;
   lastExplainedSql?: string;
   isExecuting: boolean;
+  /** Main-WebView transfer lock; never persisted or sent to the child. */
+  isTransferring?: boolean;
   isCancelling?: boolean;
   queryExecutionStartedAt?: number;
   /** Ephemeral per-statement progress for the latest multi-statement execution. */

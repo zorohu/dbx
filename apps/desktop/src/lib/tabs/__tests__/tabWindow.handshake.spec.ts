@@ -108,7 +108,13 @@ describe("detached tab startup handshake", () => {
     mocks.listeners.get(visualEvent)?.({ payload: {} });
     mocks.listeners.get(transferReadyEvent)?.({ payload: {} });
     const preparedWindow = await preparation;
-    const onPrepared = vi.fn(async () => {});
+    const commitOrder: string[] = [];
+    const onPrepared = vi.fn(async () => {
+      commitOrder.push("recovery");
+    });
+    const onCommit = vi.fn(async () => {
+      commitOrder.push("owner");
+    });
     vi.useFakeTimers();
 
     const transfer = preparedWindow.transfer(
@@ -120,16 +126,14 @@ describe("detached tab startup handshake", () => {
           database: "app",
           sql: "select 1",
           mode: "query",
-          isExecuting: false,
         },
         activeOutputView: "result",
         selectedSql: "",
         cursorPos: 0,
         explainMode: "explain",
         blockDangerousRedisCommands: true,
-        dataGridSnapshots: [],
       },
-      { onPrepared },
+      { onPrepared, onCommit },
     );
     await Promise.resolve();
     await Promise.resolve();
@@ -141,10 +145,56 @@ describe("detached tab startup handshake", () => {
 
     await expect(transfer).resolves.toEqual({ commitAcknowledged: false });
     expect(onPrepared).toHaveBeenCalledOnce();
+    expect(onCommit).toHaveBeenCalledOnce();
+    expect(commitOrder).toEqual(["recovery", "owner"]);
     expect(mocks.emitTo).toHaveBeenCalledWith(detached.label, expect.stringContaining("-decision-"), expect.objectContaining({ decision: "commit" }));
 
     await preparedWindow.abort();
     expect(detached.destroy).not.toHaveBeenCalled();
+  });
+
+  it("aborts before publishing commit when the durable owner write fails", async () => {
+    const { prepareTabWindow } = await import("@/lib/tabs/tabWindow");
+    const preparation = prepareTabWindow("query-owner-write-failure", "Query");
+    await vi.waitFor(() => expect(mocks.instances).toHaveLength(1));
+    const detached = mocks.instances[0];
+    const visualEvent = [...mocks.listeners.keys()].find((event) => event.includes("-visual-ready-"))!;
+    const transferReadyEvent = [...mocks.listeners.keys()].find((event) => event.includes("-transfer-ready-"))!;
+    mocks.listeners.get(visualEvent)?.({ payload: {} });
+    mocks.listeners.get(transferReadyEvent)?.({ payload: {} });
+    const preparedWindow = await preparation;
+    const onCommit = vi.fn(async () => {
+      throw new Error("disk unavailable");
+    });
+
+    const transfer = preparedWindow.transfer(
+      {
+        tab: {
+          id: "query-owner-write-failure",
+          title: "Query",
+          connectionId: "connection-1",
+          database: "app",
+          sql: "select 1",
+          mode: "query",
+        },
+        activeOutputView: "result",
+        selectedSql: "",
+        cursorPos: 0,
+        explainMode: "explain",
+        blockDangerousRedisCommands: true,
+      },
+      { onCommit },
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+    const preparedEvent = [...mocks.listeners.keys()].find((event) => event.includes("-prepared-"))!;
+    const transferId = preparedEvent.slice(preparedEvent.lastIndexOf("-") + 1);
+    mocks.listeners.get(preparedEvent)?.({ payload: { transferId, ok: true } });
+
+    await expect(transfer).rejects.toThrow("disk unavailable");
+    expect(onCommit).toHaveBeenCalledOnce();
+    expect(mocks.emitTo).toHaveBeenCalledWith(detached.label, expect.stringContaining("-decision-"), expect.objectContaining({ decision: "abort" }));
+    expect(mocks.emitTo).not.toHaveBeenCalledWith(detached.label, expect.stringContaining("-decision-"), expect.objectContaining({ decision: "commit" }));
   });
 
   it("aborts a provisional child when preparation misses the source timeout", async () => {
@@ -168,14 +218,12 @@ describe("detached tab startup handshake", () => {
           database: "app",
           sql: "select 1",
           mode: "query",
-          isExecuting: false,
         },
         activeOutputView: "result",
         selectedSql: "",
         cursorPos: 0,
         explainMode: "explain",
         blockDangerousRedisCommands: true,
-        dataGridSnapshots: [],
       })
       .catch((error) => error);
     await Promise.resolve();
@@ -215,7 +263,6 @@ describe("detached tab startup handshake", () => {
           connectionId: "connection-1",
           database: "analytics",
           sql: "orders",
-          isExecuting: false,
           isCancelling: false,
           isExplaining: false,
           mode: "mongo",
@@ -225,7 +272,6 @@ describe("detached tab startup handshake", () => {
         cursorPos: 0,
         explainMode: "explain",
         blockDangerousRedisCommands: true,
-        dataGridSnapshots: [],
       },
     });
     await Promise.resolve();
@@ -269,14 +315,12 @@ describe("detached tab startup handshake", () => {
         database: "app",
         sql: "select 42",
         mode: "query" as const,
-        isExecuting: false,
       },
       activeOutputView: "result" as const,
       selectedSql: "",
       cursorPos: 0,
       explainMode: "explain" as const,
       blockDangerousRedisCommands: true,
-      dataGridSnapshots: [],
     };
 
     mocks.listeners.get("dbx-detached-tab-transfer-transfer-reload")?.({ payload });
@@ -303,7 +347,6 @@ describe("detached tab startup handshake", () => {
         tab: expect.objectContaining({
           id: "query-reload",
           sql: "select 42",
-          isExecuting: false,
         }),
       }),
     );
@@ -330,14 +373,12 @@ describe("detached tab startup handshake", () => {
           database: "app",
           sql: "select 1",
           mode: "query",
-          isExecuting: false,
         },
         activeOutputView: "result",
         selectedSql: "",
         cursorPos: 0,
         explainMode: "explain",
         blockDangerousRedisCommands: true,
-        dataGridSnapshots: [],
       },
     });
     await vi.waitFor(() => expect(onReceive).toHaveBeenCalledOnce());
@@ -373,14 +414,12 @@ describe("detached tab startup handshake", () => {
           database: "app",
           sql: "select 1",
           mode: "query",
-          isExecuting: false,
         },
         activeOutputView: "result",
         selectedSql: "",
         cursorPos: 0,
         explainMode: "explain",
         blockDangerousRedisCommands: true,
-        dataGridSnapshots: [],
       },
     });
     await vi.waitFor(() => expect(onReceive).toHaveBeenCalledOnce());

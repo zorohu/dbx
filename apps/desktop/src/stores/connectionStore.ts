@@ -107,6 +107,8 @@ import { appendAgentDriverUpdateHint, hasAgentDriverUpdate, hasInstalledAgentVer
 import { appendConnectionErrorHints } from "@/lib/connection/connectionErrorHints";
 import { appendVisibleDatabaseSelection } from "@/lib/connection/connectionVisibleDatabases";
 import { configuredDatabaseProductName, connectionConfigFingerprint, normalizeDatabaseConnectionInfo } from "@/lib/connection/connectionDatabaseInfo";
+import { applyDetachedConnectionMutation, buildDetachedConnectionMutation, requestMainConnectionMutation, type DetachedConnectionMutation } from "@/lib/connection/connectionWindowSync";
+import { isDetachedTabWindow } from "@/lib/tabs/tabWindow";
 import { createMetadataLoadTrace, logMetadataLoadTrace, MetadataLoadCoordinator, type MetadataLoadTraceLogger } from "@/lib/metadata/metadataLoadCoordinator";
 import type { MetadataScopeInput } from "@/lib/metadata/metadataLoadScope";
 import { MetadataResultCache, type MetadataCacheInvalidation } from "@/lib/metadata/metadataResultCache";
@@ -438,6 +440,7 @@ export const useConnectionStore = defineStore("connection", () => {
   let nextLocalConnectionAttempt = 0;
   let beforeConnectHandler: BeforeConnectHandler | null = null;
   let initFromDiskPromise: Promise<void> | null = null;
+  let connectionMutationQueue: Promise<unknown> = Promise.resolve();
 
   // Loading/stale ownership stays on TreeNodeLoadRegistry (per-node generation), not the
   // coordinator: many specialty loaders bypass runTreeMetadataLoad, and coordinator would
@@ -2227,8 +2230,7 @@ export const useConnectionStore = defineStore("connection", () => {
       const groupId = targetGroupId !== undefined ? targetGroupId : newConnectionGroupId.value;
       sidebarLayout.value = appendConnectionToLayout(sidebarLayout.value, normalized.id, groupId);
     }
-    await persistConnections(nextConnections);
-    connections.value = nextConnections;
+    connections.value = await persistConnections(nextConnections);
     rebuildTreeNodes();
     persistSidebarLayoutDebounced();
     stopCreatingConnectionInGroup();
@@ -2326,8 +2328,7 @@ export const useConnectionStore = defineStore("connection", () => {
 
     const removedIds = new Set(connectionIds);
     const nextConnections = connections.value.filter((c) => !removedIds.has(c.id));
-    await persistConnections(nextConnections);
-    connections.value = nextConnections;
+    connections.value = await persistConnections(nextConnections);
     let nextPinnedOrder = pinnedTreeNodeOrder.value;
     for (const id of removedIds) {
       const prefix = `${id}:`;
@@ -2355,7 +2356,7 @@ export const useConnectionStore = defineStore("connection", () => {
     for (const id of removedIds) {
       invalidateCompletionCache(id);
       clearLoadedChildrenCache(id);
-      void deleteTabResultSnapshotsForOwner(id);
+      void deleteTabResultSnapshotsForOwner(id).catch((error) => console.warn("[DBX][connection-result-cache:delete-owner:error]", { connectionId: id, error }));
     }
   }
 
@@ -2370,8 +2371,7 @@ export const useConnectionStore = defineStore("connection", () => {
     const runtimeConfigChanged = connectionConfigFingerprint(connections.value[idx]) !== connectionConfigFingerprint(config);
     const nextConnections = [...connections.value];
     nextConnections[idx] = config;
-    await persistConnections(nextConnections);
-    connections.value = nextConnections;
+    connections.value = await persistConnections(nextConnections);
     rebuildTreeNodes();
     if (!runtimeConfigChanged) return;
     connectedIds.value.delete(config.id);
@@ -2490,8 +2490,7 @@ export const useConnectionStore = defineStore("connection", () => {
       ...config,
       redis_database_aliases: redisDatabaseAliases,
     };
-    await persistConnections(nextConnections);
-    connections.value = nextConnections;
+    connections.value = await persistConnections(nextConnections);
 
     const node = findNode(treeNodes.value, `${connectionId}:db${key}`);
     if (node?.type === "redis-db") {
@@ -2529,8 +2528,7 @@ export const useConnectionStore = defineStore("connection", () => {
       ...nextConnections[idx],
       visible_databases: visibleDatabases,
     };
-    await persistConnections(nextConnections);
-    connections.value = nextConnections;
+    connections.value = await persistConnections(nextConnections);
     invalidateCompletionCache(connectionId);
     rebuildTreeNodes();
   }
@@ -2568,8 +2566,7 @@ export const useConnectionStore = defineStore("connection", () => {
       ...nextConnections[idx],
       visible_schemas: nextSchemas,
     };
-    await persistConnections(nextConnections);
-    connections.value = nextConnections;
+    connections.value = await persistConnections(nextConnections);
     rebuildTreeNodes();
   }
 
@@ -6065,11 +6062,101 @@ export const useConnectionStore = defineStore("connection", () => {
     return null;
   }
 
-  async function persistConnections(nextConnections: ConnectionConfig[] = connections.value) {
-    await api.saveConnections(nextConnections.filter((connection) => connection.one_time !== true));
+  async function persistConnections(nextConnections: ConnectionConfig[]): Promise<ConnectionConfig[]> {
+    const persistentConnections = nextConnections.filter((connection) => connection.one_time !== true);
+    const mutation = buildDetachedConnectionMutation(connections.value, persistentConnections);
+    if (mutation.upserts.length === 0 && mutation.removals.length === 0 && isDetachedTabWindow()) return nextConnections;
+    const detached = isDetachedTabWindow();
+    const authoritative = detached
+      ? // Detached Pinia stores are read-only replicas. All global connection
+        // writes are reconciled and persisted by the main WebView.
+        await requestMainConnectionMutation(mutation)
+      : await persistAuthoritativeConnectionMutation(mutation);
+    if (detached) {
+      // The acknowledgement may contain main-window additions, removals, or
+      // edits that were absent from the child's stale snapshot.
+      applyAuthoritativeConnectionSnapshot(authoritative);
+    }
+    const transient = nextConnections.filter((connection) => connection.one_time === true);
+    return [...authoritative.map(normalizeConnection), ...transient];
+  }
+
+  function applyAuthoritativeConnectionSnapshot(nextPersistentConnections: ConnectionConfig[]) {
+    const previousPersistentConnections = connections.value.filter((connection) => connection.one_time !== true);
+    const previousById = new Map(previousPersistentConnections.map((connection) => [connection.id, connection]));
+    const nextById = new Map(nextPersistentConnections.map((connection) => [connection.id, connection]));
+    const removedIds = new Set(previousPersistentConnections.filter((connection) => !nextById.has(connection.id)).map((connection) => connection.id));
+    const changedIds = nextPersistentConnections
+      .filter((connection) => {
+        const previous = previousById.get(connection.id);
+        if (!previous) return false;
+        const { redis_database_aliases: _previousAliases, visible_databases: _previousVisibleDatabases, visible_schemas: _previousVisibleSchemas, ...previousRuntimeConfig } = previous;
+        const { redis_database_aliases: _nextAliases, visible_databases: _nextVisibleDatabases, visible_schemas: _nextVisibleSchemas, ...nextRuntimeConfig } = connection;
+        return connectionConfigFingerprint(previousRuntimeConfig as ConnectionConfig) !== connectionConfigFingerprint(nextRuntimeConfig as ConnectionConfig);
+      })
+      .map((connection) => connection.id);
+    const transient = connections.value.filter((connection) => connection.one_time === true && !nextById.has(connection.id));
+    connections.value = [...nextPersistentConnections.map(normalizeConnection), ...transient];
+
+    if (removedIds.size > 0) {
+      let nextPinnedOrder = pinnedTreeNodeOrder.value;
+      for (const id of removedIds) {
+        const prefix = `${id}:`;
+        nextPinnedOrder = nextPinnedOrder.filter((pinId) => pinId !== id && !pinId.startsWith(prefix));
+        clearConnectionError(id);
+        connectionErrorRevisions.delete(id);
+        connectedIds.value.delete(id);
+        clearConnectionIdentifierQuote(id);
+        clearConnectionHealthCheck(id);
+        invalidateCompletionCache(id);
+        clearLoadedChildrenCache(id);
+        void deleteTabResultSnapshotsForOwner(id).catch((error) => console.warn("[DBX][connection-result-cache:delete-owner:error]", { connectionId: id, error }));
+      }
+      setPinnedTreeNodeOrder(nextPinnedOrder);
+      persistPinnedTreeNodeIds();
+      removeSidebarTableNameFiltersForConnections(removedIds);
+      if (activeConnectionId.value && removedIds.has(activeConnectionId.value)) activeConnectionId.value = null;
+      selectedTreeNodeIds.value = selectedTreeNodeIds.value.filter((id) => !removedIds.has(id));
+      if (selectedTreeNodeId.value && removedIds.has(selectedTreeNodeId.value)) selectedTreeNodeId.value = null;
+      if (treeSelectionAnchorId.value && removedIds.has(treeSelectionAnchorId.value)) treeSelectionAnchorId.value = null;
+    }
+
+    for (const id of changedIds) {
+      connectedIds.value.delete(id);
+      clearConnectionIdentifierQuote(id);
+      clearConnectionHealthCheck(id);
+      invalidateCompletionCache(id);
+      clearLoadedChildrenCache(id);
+    }
+    sidebarLayout.value = reconcileLayout(
+      connections.value.map((connection) => connection.id),
+      sidebarLayout.value,
+    );
+    rebuildTreeNodes();
+    persistSidebarLayoutDebounced();
+  }
+
+  function persistAuthoritativeConnectionMutation(mutation: DetachedConnectionMutation, ensureInitialized = false): Promise<ConnectionConfig[]> {
+    const task = connectionMutationQueue
+      .catch(() => undefined)
+      .then(async () => {
+        if (ensureInitialized) await initFromDisk();
+        const currentPersistentConnections = connections.value.filter((connection) => connection.one_time !== true);
+        const nextPersistentConnections = applyDetachedConnectionMutation(currentPersistentConnections, mutation);
+        await api.saveConnections(nextPersistentConnections);
+        applyAuthoritativeConnectionSnapshot(nextPersistentConnections);
+        return nextPersistentConnections;
+      });
+    connectionMutationQueue = task.catch(() => undefined);
+    return task;
+  }
+
+  function applyDetachedConnectionMutationFromChild(mutation: DetachedConnectionMutation): Promise<ConnectionConfig[]> {
+    return persistAuthoritativeConnectionMutation(mutation, true);
   }
 
   function persistSidebarLayoutDebounced() {
+    if (isDetachedTabWindow()) return;
     if (layoutPersistTimer) clearTimeout(layoutPersistTimer);
     layoutPersistTimer = setTimeout(() => {
       api.saveSidebarLayout(sidebarLayout.value).catch(() => {});
@@ -6542,8 +6629,7 @@ export const useConnectionStore = defineStore("connection", () => {
       });
 
       if (filled > 0) {
-        connections.value = updated;
-        await persistConnections();
+        connections.value = await persistConnections(updated);
       }
       return filled;
     } catch (e) {
@@ -6635,6 +6721,7 @@ export const useConnectionStore = defineStore("connection", () => {
     addEphemeralConnection,
     updateConnection,
     updateConnectionDatabaseInfo,
+    applyDetachedConnectionMutationFromChild,
     setDefaultDatabase,
     clearDefaultDatabase,
     isDefaultDatabase,

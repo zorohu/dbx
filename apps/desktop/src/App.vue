@@ -32,7 +32,7 @@ import { useSqlExecution } from "@/composables/useSqlExecution";
 import { useDialogSources } from "@/composables/useDialogSources";
 import { useNavigationTargets } from "@/composables/useNavigationTargets";
 import { useDataGridActions } from "@/composables/useDataGridActions";
-import { captureDataGridPendingSnapshotsForTab, clearDataGridPendingSnapshotsForTab, hasDataGridPendingChangesForTab, restoreDataGridPendingSnapshotsForTab } from "@/composables/useDataGridEditor";
+import { captureDataGridPendingSnapshotsForTab, clearDataGridPendingSnapshotsForTab, hasDataGridPendingChangesForTab, refreshDataGridPendingSnapshotForTab } from "@/composables/useDataGridEditor";
 import { useTauriEvents } from "@/composables/useTauriEvents";
 import { useCloseActionPrompt, type AppCloseAction, type AppCloseRequestOptions } from "@/composables/useCloseActionPrompt";
 import { useVisibilityChange } from "@/composables/useVisibilityChange";
@@ -45,6 +45,7 @@ import { translateBackendError } from "@/i18n/backend-errors";
 import * as api from "@/lib/backend/api";
 import { connectionRedactedNameLabel } from "@/lib/connection/connectionPresentation";
 import { quickConnectionOpenTarget } from "@/lib/connection/connectionOpenTarget";
+import { listenForDetachedConnectionMutations } from "@/lib/connection/connectionWindowSync";
 import { resolveDefaultDatabase } from "@/lib/database/defaultDatabase";
 import { normalizeSqliteNamespace } from "@/lib/database/sqliteNamespace";
 import { findTreeNodeById, resolveNewQueryTarget, resolveNewQueryInitialSql } from "@/lib/sql/newQueryContext";
@@ -85,6 +86,7 @@ import {
   switchToTabIndexFromShortcut,
 } from "@/lib/editor/keyboardShortcuts";
 import { isPreviewTab, tabDisplayTitle } from "@/lib/tabs/tabPresentation";
+import { restoreDetachedTab } from "@/lib/tabs/detachedTabTransfer";
 import {
   checkDetachedWindowsBeforeAppClose,
   destroyDetachedWindowAfterCleanup,
@@ -190,6 +192,7 @@ let unlistenDetachedWindowClose: UnlistenFn | undefined;
 let unlistenDetachedAppCloseCheck: UnlistenFn | undefined;
 let unlistenDetachedMainWindowAction: UnlistenFn | undefined;
 let unlistenDetachedTabPersistence: UnlistenFn | undefined;
+let unlistenDetachedConnectionMutation: UnlistenFn | undefined;
 let detachedWindowClosing = false;
 let detachedAppCloseCheckPending = false;
 let stopDetachedPersistenceWatch: ReturnType<typeof watch> | undefined;
@@ -2267,9 +2270,8 @@ async function startDetachedPersistenceReporter() {
   detachedOwnershipCommitted.value = true;
   stopDetachedPersistenceWatch = watch(() => queryStore.openTabsPersistSnapshot, scheduleDetachedPersistenceReport, { flush: "post" });
   try {
-    // The commit acknowledgement must follow a durable owner update. This also
-    // lets a recreated main store reconcile legacy or provisional ownership
-    // before the child reports transfer completion.
+    // Main has already durably committed the owner before publishing commit.
+    // Refresh its snapshot now; later editor changes are debounced below.
     await flushDetachedPersistenceReport();
   } catch (error) {
     scheduleDetachedPersistenceReport();
@@ -2327,13 +2329,43 @@ async function openTabWindow(tabId: string, placement?: TabWindowClientPlacement
   try {
     const tab = queryStore.tabs.find((item) => item.id === tabId);
     if (!tab) return;
-    const isBusy = (item: QueryTab) => !!(item.isExecuting || item.isCancelling || item.isExplaining || item.resultTotalRowCountLoading);
-    if (isBusy(tab)) {
+    const isExecuting = (item: QueryTab) => !!(item.isExecuting || item.isCancelling);
+    const isBusy = (item: QueryTab) => !!(isExecuting(item) || item.isExplaining || item.resultTotalRowCountLoading);
+    if (isExecuting(tab)) {
+      const { ask } = await import("@tauri-apps/plugin-dialog");
+      const shouldStop = await ask(t("tabs.moveTabWindowStopQueryConfirm"), {
+        title: t("tabs.moveTabWindowStopQueryTitle"),
+        kind: "warning",
+      });
+      if (!shouldStop) return;
+      if (!(await queryStore.stopTabActivityForTransfer(tab.id))) {
+        toast(t("tabs.moveTabWindowStopFailed"), 5000);
+        return;
+      }
+    } else if (isBusy(tab)) {
       toast(t("tabs.moveTabWindowBusy"), 5000);
       return;
     }
 
-    preparedWindow = await prepareTabWindow(tab.id, tabDisplayTitle(tab, t), {
+    const readyTab = queryStore.tabs.find((item) => item.id === tab.id);
+    if (!readyTab) return;
+    refreshDataGridPendingSnapshotForTab(readyTab.id);
+    const activeGridHasChanges = readyTab.id === queryStore.activeTabId && !!contentAreaRef.value?.hasPendingDataGridChanges?.();
+    if (activeGridHasChanges || hasDataGridPendingChangesForTab(readyTab.id)) {
+      toast(t("tabs.moveTabWindowPendingGridChanges"), 5000);
+      return;
+    }
+    if (readyTab.txnSessionId) {
+      toast(t("tabs.moveTabWindowActiveTransaction"), 5000);
+      return;
+    }
+    if (readyTab.mode === "structure" && queryStore.isTabDirty(readyTab)) {
+      toast(t("tabs.moveTabWindowPendingStructureChanges"), 5000);
+      return;
+    }
+    if (!queryStore.lockTabForTransfer(readyTab.id)) return;
+
+    preparedWindow = await prepareTabWindow(readyTab.id, tabDisplayTitle(readyTab, t), {
       placement,
       onWindowShown: releasePreview,
     });
@@ -2343,7 +2375,11 @@ async function openTabWindow(tabId: string, placement?: TabWindowClientPlacement
       if (currentTab) toast(t("tabs.moveTabWindowBusy"), 5000);
       return;
     }
-    const dataGridSnapshots = captureDataGridPendingSnapshotsForTab(currentTab.id);
+    refreshDataGridPendingSnapshotForTab(currentTab.id);
+    if (hasDataGridPendingChangesForTab(currentTab.id) || currentTab.txnSessionId || (currentTab.mode === "structure" && queryStore.isTabDirty(currentTab))) {
+      await preparedWindow.abort();
+      return;
+    }
     const selection = currentTab.editorSelection;
     const selectionFrom = Math.min(selection?.anchor ?? 0, selection?.head ?? 0);
     const selectionTo = Math.max(selection?.anchor ?? 0, selection?.head ?? 0);
@@ -2363,15 +2399,11 @@ async function openTabWindow(tabId: string, placement?: TabWindowClientPlacement
           };
     queryStore.suspendOpenTabsPersist();
     persistSuspended = true;
-    const transferState = queryStore.takeTabForTransfer(currentTab.id);
-    if (!transferState) {
-      await queryStore.resumeOpenTabsPersist({ flush: false });
-      persistSuspended = false;
-      await preparedWindow.abort();
-      return;
-    }
     try {
-      queryStore.registerDetachedOpenTab(preparedWindow.windowLabel, transferState.tab);
+      // Result rows, result-cache identities and pending grid edits never cross
+      // WebView IPC; the child re-executes when it needs a result.
+      const transferTab = queryStore.createDetachedTransferTab(currentTab);
+      queryStore.registerDetachedOpenTab(preparedWindow.windowLabel, transferTab);
       detachedPersistenceRegistered = true;
       // Persist an ownerless recovery snapshot before the provisional child
       // receives the tab. A main reload can reclaim it until commit completes.
@@ -2379,11 +2411,10 @@ async function openTabWindow(tabId: string, placement?: TabWindowClientPlacement
       // Commit ownership only after the child accepts the transfer; otherwise restore it.
       const transferOutcome = await preparedWindow.transfer(
         {
-          tab: transferState.tab,
+          tab: transferTab,
           ...tabRuntimeState,
           explainMode: explainMode.value,
           blockDangerousRedisCommands: blockDangerousRedisCommands.value,
-          dataGridSnapshots,
         },
         {
           onPrepared: async () => {
@@ -2391,26 +2422,36 @@ async function openTabWindow(tabId: string, placement?: TabWindowClientPlacement
             // main-tab persistence remains suspended.
             await queryStore.flushPendingPersist({ force: true });
           },
+          onCommit: async () => {
+            // The child reuses the logical tab ID, so source-owned sessions must
+            // be gone before it becomes interactive.
+            await queryStore.releaseTabSessionsForTransfer(currentTab.id);
+            // Publish the detached owner on disk before the child receives the
+            // irreversible commit decision. A failed write keeps main as owner.
+            await queryStore.commitDetachedOpenTab(preparedWindow!.windowLabel);
+          },
         },
       );
       if (!transferOutcome.commitAcknowledged) {
         console.warn("[DBX][detached-tab:ownership-commit:unacknowledged]", {
-          tabId: transferState.tab.id,
+          tabId: currentTab.id,
           windowLabel: preparedWindow.windowLabel,
         });
       }
+      await queryStore.finalizeTabTransfer(currentTab.id);
     } catch (error) {
       if (detachedPersistenceRegistered && preparedWindow) {
         queryStore.removeDetachedOpenTab(preparedWindow.windowLabel);
         detachedPersistenceRegistered = false;
+        // A decision publish failure can happen after the owner write. Reclaim
+        // it durably before the provisional child is destroyed.
+        await queryStore.flushPendingPersist({ force: true }).catch((persistError) => console.warn("[DBX][detached-tab:ownership-reclaim:error]", { tabId: currentTab.id, persistError }));
       }
-      queryStore.restoreTabFromTransfer(transferState);
       await queryStore.resumeOpenTabsPersist().catch(() => {});
       persistSuspended = false;
       await preparedWindow.abort();
       throw error;
     }
-    clearDataGridPendingSnapshotsForTab(currentTab.id);
     const resumePersist = queryStore.resumeOpenTabsPersist();
     persistSuspended = false;
     let persistError: unknown;
@@ -2436,6 +2477,7 @@ async function openTabWindow(tabId: string, placement?: TabWindowClientPlacement
     if (persistSuspended) await queryStore.resumeOpenTabsPersist().catch(() => {});
     toast(t("tabs.openTabWindowFailed", { message: e?.message || String(e) }), 5000);
   } finally {
+    queryStore.unlockTabForTransfer(tabId);
     detachingTabIds.delete(tabId);
     // Startup errors and early exits must also release the retained drag preview.
     releasePreview?.();
@@ -2602,8 +2644,7 @@ onMounted(async () => {
     const detachedInitialization = initDetachedApp();
     unlistenDetachedTabTransfer = await receiveDetachedTab(
       (payload) => {
-        restoreDataGridPendingSnapshotsForTab(payload.tab.id, payload.dataGridSnapshots);
-        queryStore.adoptTransferredTab(payload.tab);
+        queryStore.adoptTransferredTab(restoreDetachedTab(payload.tab));
         activeOutputView.value = payload.activeOutputView;
         selectedSql.value = payload.selectedSql;
         cursorPos.value = payload.cursorPos;
@@ -2632,6 +2673,7 @@ onMounted(async () => {
     // while another tab transfer temporarily suspends normal main-tab writes.
     await queryStore.flushPendingPersist({ force: true, waitForOpenTabsLoad: true });
   });
+  unlistenDetachedConnectionMutation = await listenForDetachedConnectionMutations((mutation) => connectionStore.applyDetachedConnectionMutationFromChild(mutation));
   window.addEventListener("keydown", handleKeydown);
   window.addEventListener("dbx-open-driver-store", openDriverStoreFromEvent);
   if (isDesktop) {
@@ -2698,6 +2740,7 @@ onUnmounted(() => {
   unlistenDetachedAppCloseCheck?.();
   unlistenDetachedMainWindowAction?.();
   unlistenDetachedTabPersistence?.();
+  unlistenDetachedConnectionMutation?.();
   stopDetachedPersistenceWatch?.();
   if (detachedPersistenceTimer) clearTimeout(detachedPersistenceTimer);
   cleanupTauriListeners();
@@ -2959,6 +3002,7 @@ onUnmounted(() => {
               <div v-if="activeTab" v-show="!driverStoreActive && !settingsStore.settingsPageActive" class="flex flex-col flex-1 min-h-0">
                 <EditorToolbar
                   v-if="activeTab.mode === 'query' && !isPreviewTab(activeTab)"
+                  :class="{ 'pointer-events-none opacity-60': activeTab.isTransferring }"
                   :active-tab="activeTab"
                   :active-connection="activeConnection"
                   :executable-sql="executableSql"
@@ -3000,6 +3044,7 @@ onUnmounted(() => {
                   <ContentArea
                     ref="contentAreaRef"
                     :key="activeTab.id"
+                    :class="{ 'pointer-events-none': activeTab.isTransferring }"
                     :active-tab="activeTab"
                     :active-connection="activeConnection"
                     :executable-sql="executableSql"

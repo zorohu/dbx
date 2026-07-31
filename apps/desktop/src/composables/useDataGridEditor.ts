@@ -230,11 +230,7 @@ export function clearDataGridPendingSnapshotsForTab(tabId: string) {
 }
 
 export function captureDataGridPendingSnapshotsForTab(tabId: string): DataGridPendingSnapshotTransfer[] {
-  if (typeof window !== "undefined") {
-    // The active grid keeps its latest edit/focus state in component refs, so
-    // force a synchronous cache snapshot before serializing the transfer.
-    window.dispatchEvent(new CustomEvent(BEFORE_TAB_SWITCH_EVENT, { detail: { fromTabId: tabId } }));
-  }
+  refreshDataGridPendingSnapshotForTab(tabId);
   const snapshots: DataGridPendingSnapshotTransfer[] = [];
   for (const [key, snapshot] of pendingChangesCache) {
     if (!cacheKeyBelongsToTab(key, tabId)) continue;
@@ -252,6 +248,13 @@ export function captureDataGridPendingSnapshotsForTab(tabId: string): DataGridPe
     });
   }
   return snapshots;
+}
+
+/** Refreshes the active grid's cache without cloning its potentially large edit history. */
+export function refreshDataGridPendingSnapshotForTab(tabId: string): void {
+  if (typeof window !== "undefined") {
+    window.dispatchEvent(new CustomEvent(BEFORE_TAB_SWITCH_EVENT, { detail: { fromTabId: tabId } }));
+  }
 }
 
 function pendingChangesSnapshotHasDataChanges(snapshot: PendingChangesSnapshot): boolean {
