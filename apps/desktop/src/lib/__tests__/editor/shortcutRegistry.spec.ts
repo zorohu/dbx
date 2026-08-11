@@ -21,7 +21,7 @@ describe("shortcutRegistry editor actions", () => {
     "exPasteSqlInCondition",
     "toggleFold",
   ];
-  const sidebarShortcutActionIds: ShortcutActionId[] = ["copySidebarSelection", "pasteSidebarSelection", "editSidebarConnection"];
+  const sidebarShortcutActionIds: ShortcutActionId[] = ["copySidebarSelection", "pasteSidebarSelection", "editSidebarConnection", "viewTableDdl"];
 
   it("registers the new-data-tab mouse modifier as a configurable sidebar shortcut", () => {
     const definition = SHORTCUT_DEFINITIONS.find((item) => item.id === "openDataInNewTab");
@@ -40,6 +40,23 @@ describe("shortcutRegistry editor actions", () => {
     expect(formatShortcut(DEFAULT_SHORTCUT_SETTINGS.executeSqlInNewResultTab, "Win32")).toBe("Ctrl+\\");
     expect(shortcutToCodeMirrorKey(DEFAULT_SHORTCUT_SETTINGS.executeSqlInNewResultTab)).toBe("Mod-\\");
     expect(findShortcutConflict("executeSqlInNewResultTab", DEFAULT_SHORTCUT_SETTINGS.executeSqlInNewResultTab, DEFAULT_SHORTCUT_SETTINGS)).toBeNull();
+  });
+
+  it("registers a conflict-free shortcut for expanding SELECT stars", () => {
+    const definition = SHORTCUT_DEFINITIONS.find((item) => item.id === "expandSelectStar");
+
+    expect(definition).toMatchObject({ scope: "editor", defaultShortcut: "Mod+Shift+X" });
+    expect(shortcutToCodeMirrorKey(DEFAULT_SHORTCUT_SETTINGS.expandSelectStar)).toBe("Mod-Shift-x");
+    expect(findShortcutConflict("expandSelectStar", DEFAULT_SHORTCUT_SETTINGS.expandSelectStar, DEFAULT_SHORTCUT_SETTINGS)).toBeNull();
+  });
+
+  it("uses Shift+Enter for inserting a complete line below", () => {
+    const definition = SHORTCUT_DEFINITIONS.find((item) => item.id === "insertLineBelow");
+
+    expect(definition).toMatchObject({ scope: "editor", defaultShortcut: "Shift+Enter" });
+    expect(DEFAULT_SHORTCUT_SETTINGS.insertLineBelow).toBe("Shift+Enter");
+    expect(shortcutToCodeMirrorKey(DEFAULT_SHORTCUT_SETTINGS.insertLineBelow)).toBe("Shift-Enter");
+    expect(findShortcutConflict("insertLineBelow", DEFAULT_SHORTCUT_SETTINGS.insertLineBelow, DEFAULT_SHORTCUT_SETTINGS)).toBeNull();
   });
 
   it("resolves the close-other-tabs default per platform and heals cross-platform synced defaults", () => {
@@ -98,10 +115,18 @@ describe("shortcutRegistry editor actions", () => {
     expect(shortcuts.undo).toBe("Mod+Z");
     expect(shortcuts.redo).toBe("Shift+Mod+Z");
     expect(shortcuts.selectAll).toBe("Mod+A");
+    expect(shortcuts.extendSelection).toBe("Alt+W");
     expect(shortcuts.uppercaseSelection).toBe("Shift+Alt+U");
     expect(shortcuts.lowercaseSelection).toBe("Shift+Alt+L");
     expect(shortcuts.exPasteSqlInCondition).toBe("");
     expect(shortcuts.toggleFold).toBe("Mod+.");
+  });
+
+  it("registers IntelliJ-style extend selection as a configurable editor shortcut", () => {
+    const definition = SHORTCUT_DEFINITIONS.find((item) => item.id === "extendSelection");
+
+    expect(definition).toMatchObject({ scope: "editor", defaultShortcut: "Alt+W" });
+    expect(DEFAULT_SHORTCUT_SETTINGS.extendSelection).toBe("Alt+W");
   });
 
   it("detects conflicts between formatter editor shortcuts and other editor shortcuts", () => {

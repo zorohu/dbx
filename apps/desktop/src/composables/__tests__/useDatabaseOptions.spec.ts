@@ -17,6 +17,8 @@ const mocks = vi.hoisted(() => ({
   getConfig: vi.fn(),
   listDatabases: vi.fn(),
   listSchemas: vi.fn(),
+  redisListDatabases: vi.fn(),
+  mongoListDatabases: vi.fn(),
   listDorisCatalogs: vi.fn(),
   listDorisCatalogDatabases: vi.fn(),
 }));
@@ -24,6 +26,8 @@ const mocks = vi.hoisted(() => ({
 vi.mock("@/lib/backend/api", () => ({
   listDatabases: mocks.listDatabases,
   listSchemas: mocks.listSchemas,
+  redisListDatabases: mocks.redisListDatabases,
+  mongoListDatabases: mocks.mongoListDatabases,
   listDorisCatalogs: mocks.listDorisCatalogs,
   listDorisCatalogDatabases: mocks.listDorisCatalogDatabases,
 }));
@@ -173,15 +177,46 @@ describe("namespace options", () => {
     expect(namespaceOptionsAreSchemas({ db_type: "postgres" })).toBe(false);
   });
 
-  it("does not expand the global database options composable to Dameng schemas", async () => {
+  it("expands Dameng schemas via listSchemas", async () => {
     mocks.getConfig.mockReturnValue({ db_type: "dameng" });
-    mocks.listDatabases.mockResolvedValue([]);
+    mocks.listSchemas.mockResolvedValue(["APP_USER", "REPORTING", "SYS"]);
 
     const { databaseOptions, loadDatabaseOptions } = useDatabaseOptions();
     await loadDatabaseOptions("connection-1");
 
-    expect(databaseOptions.value["connection-1"]).toEqual([]);
-    expect(mocks.listDatabases).toHaveBeenCalledWith("connection-1");
-    expect(mocks.listSchemas).not.toHaveBeenCalled();
+    // 达梦现在通过 listSchemas 获取 schema 列表，SYS 作为系统 schema 被过滤掉
+    expect(databaseOptions.value["connection-1"]).toEqual(["APP_USER", "REPORTING"]);
+    expect(mocks.listSchemas).toHaveBeenCalledWith("connection-1", "", true);
+    expect(mocks.listDatabases).not.toHaveBeenCalled();
+  });
+});
+
+describe("database options loader", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("uses the Redis database API", async () => {
+    mocks.getConfig.mockReturnValue({ db_type: "redis" });
+    mocks.redisListDatabases.mockResolvedValue([{ db: 0 }, { db: 1 }]);
+    const options = useDatabaseOptions();
+
+    await options.loadDatabaseOptions("connection-1");
+
+    expect(options.databaseOptions.value["connection-1"]).toEqual(["0", "1"]);
+    expect(mocks.redisListDatabases).toHaveBeenCalledWith("connection-1");
+    expect(mocks.listDatabases).not.toHaveBeenCalled();
+  });
+
+  it("uses the MongoDB database API", async () => {
+    mocks.getConfig.mockReturnValue({ db_type: "mongodb" });
+    mocks.mongoListDatabases.mockResolvedValue(["app", "analytics"]);
+    const options = useDatabaseOptions();
+
+    await options.loadDatabaseOptions("connection-1");
+
+    expect(options.databaseOptions.value["connection-1"]).toEqual(["app", "analytics"]);
+    expect(mocks.mongoListDatabases).toHaveBeenCalledWith("connection-1");
+    expect(mocks.listDatabases).not.toHaveBeenCalled();
   });
 });

@@ -4,6 +4,7 @@ import type {
   DatabaseConnectionInfo,
   DatabaseInfo,
   DatabaseStorageInfo,
+  SqlServerCompletionContext,
   SchemaInfo,
   LinkedServerInfo,
   CatalogInfo,
@@ -13,6 +14,7 @@ import type {
   CompletionAssistantRequest,
   CompletionAssistantResponse,
   ObjectStatistics,
+  CustomTypeDetails,
   ObjectSource,
   ObjectSourceKind,
   ColumnInfo,
@@ -44,6 +46,7 @@ import type {
   TunnelProfile,
 } from "@/types/database";
 import { normalizeRustMongoCommand, type MongoCommand } from "@/lib/mongo/mongoShellCommand";
+import { BackendErrorException, type BackendError } from "@/lib/backend/errorUtils";
 import type { CollectionInfo } from "@/types/database";
 import type { SchemaDiffPreparation, SchemaDiffPreparationOptions, TableDiff, FunctionDiff, SequenceDiff, RuleDiff, OwnerDiff } from "@/lib/schema/schemaDiff";
 import type { SidebarObjectKind } from "@/lib/database/databaseObjectCapabilities";
@@ -89,9 +92,16 @@ import type {
   KvDeleteResponse,
   KvHistoryResponse,
   KvStatusResponse,
+  EtcdDefragResponse,
+  EtcdWatchStartRequest,
+  EtcdWatchStartResponse,
+  EtcdWatchPollResponse,
+  EtcdLeaseListResponse,
   DocumentQueryResult,
   MongoDocumentResult,
   MongoCollectionStatsResult,
+  MongoCloneCollectionResult,
+  MongoDropIndexesResult,
   MongoGridFsBucketInfo,
   HistoryEntry,
   HistorySearchRequest,
@@ -175,8 +185,10 @@ import type {
   NacosConnectionInfo,
   NacosRNacosConsoleCaptcha,
   NacosInstanceInfo,
+  NacosInstanceRef,
+  NacosInstanceRegistration,
   NacosInstanceQuery,
-  NacosInstanceUpdate,
+  NacosInstanceUpdateRequest,
   NacosDashboardQuery,
   NacosDashboardSnapshot,
   NacosNamespaceCreate,
@@ -185,11 +197,14 @@ import type {
   NacosRawRequest,
   NacosRawResponse,
   NacosServiceList,
+  NacosServiceDetail,
   NacosServiceQuery,
+  NacosServiceUpsert,
   NacosSearchProgress,
 } from "@/types/nacos";
 import { safeLocalStorageGet, safeLocalStorageSet } from "@/lib/backend/safeStorage";
 import { normalizeConnectionTestResult } from "@/lib/connection/connectionDatabaseInfo";
+import type { AnnotationFile, SchemaSnapshot } from "@/docs/types";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -217,19 +232,19 @@ async function post<T>(url: string, body: unknown): Promise<T> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  if (!res.ok) throw new Error(await res.text());
+  if (!res.ok) throw await backendResponseError(res);
   return res.json();
 }
 
 async function get<T>(url: string): Promise<T> {
   const res = await fetch(apiUrl(url));
-  if (!res.ok) throw new Error(await res.text());
+  if (!res.ok) throw await backendResponseError(res);
   return res.json();
 }
 
 async function del<T>(url: string): Promise<T> {
   const res = await fetch(apiUrl(url), { method: "DELETE" });
-  if (!res.ok) throw new Error(await res.text());
+  if (!res.ok) throw await backendResponseError(res);
   return res.json();
 }
 
@@ -239,8 +254,19 @@ async function put<T>(url: string, body: unknown): Promise<T> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  if (!res.ok) throw new Error(await res.text());
+  if (!res.ok) throw await backendResponseError(res);
   return res.json();
+}
+
+export async function backendResponseError(response: Response): Promise<BackendErrorException> {
+  const text = await response.text();
+  let payload: unknown = text;
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    // Preserve legacy plain-text responses at the same compatibility boundary.
+  }
+  return new BackendErrorException(payload);
 }
 
 function qs(params: Record<string, string | number | boolean | undefined>): string {
@@ -268,7 +294,7 @@ export async function testConnectionWithInfo(config: ConnectionConfig): Promise<
   if (response.status === 404) {
     return normalizeConnectionTestResult(await testConnection(config), config);
   }
-  if (!response.ok) throw new Error(await response.text());
+  if (!response.ok) throw await backendResponseError(response);
   return normalizeConnectionTestResult(await response.json(), config);
 }
 
@@ -387,7 +413,7 @@ export async function importJdbcDrivers(pathsOrFiles: (string | File)[]): Promis
     method: "POST",
     body: formData,
   });
-  if (!res.ok) throw new Error(await res.text());
+  if (!res.ok) throw await backendResponseError(res);
   return res.json();
 }
 
@@ -436,7 +462,7 @@ export async function installJdbcPluginLocal(pathOrFile: string | File): Promise
     method: "POST",
     body: formData,
   });
-  if (!uploadRes.ok) throw new Error(await uploadRes.text());
+  if (!uploadRes.ok) throw await backendResponseError(uploadRes);
   return uploadRes.json();
 }
 
@@ -515,7 +541,7 @@ export async function importAgentsFromZip(fileOrPath: string | File, operationId
     method: "POST",
     body: formData,
   });
-  if (!res.ok) throw new Error(await res.text());
+  if (!res.ok) throw await backendResponseError(res);
   const result: { count: number } = await res.json();
   return result.count;
 }
@@ -537,7 +563,7 @@ export async function importAgentDriver(dbType: string, pathOrFile: string | Fil
     method: "POST",
     body: formData,
   });
-  if (!uploadRes.ok) throw new Error(await uploadRes.text());
+  if (!uploadRes.ok) throw await backendResponseError(uploadRes);
 }
 
 export const importAgentJar = importAgentDriver;
@@ -629,6 +655,10 @@ export async function listDatabaseStorage(connectionId: string, databases: strin
   });
 }
 
+export async function getSqlServerCompletionContext(connectionId: string, database: string): Promise<SqlServerCompletionContext> {
+  return get(`/api/schema/sqlserver/completion-context?${qs({ connection_id: connectionId, database })}`);
+}
+
 export async function listDorisCatalogs(connectionId: string): Promise<CatalogInfo[]> {
   return get(`/api/schema/doris/catalogs?${qs({ connection_id: connectionId })}`);
 }
@@ -682,7 +712,7 @@ export async function getTableComment(_connectionId: string, _database: string, 
   throw new Error("Table comment lookup is not available in the web backend");
 }
 
-export async function listObjects(connectionId: string, database: string, schema: string, objectTypes?: SidebarObjectKind[], filter?: string, limit?: number, offset?: number, catalog?: string): Promise<ObjectInfo[]> {
+export async function listObjects(connectionId: string, database: string, schema: string, objectTypes?: (SidebarObjectKind | "EVENT")[], filter?: string, limit?: number, offset?: number, catalog?: string): Promise<ObjectInfo[]> {
   return get(
     `/api/schema/objects?${qs({
       connection_id: connectionId,
@@ -713,12 +743,26 @@ export async function getObjectSource(connectionId: string, database: string, sc
   return get(`/api/schema/object-source?${qs({ connection_id: connectionId, database, schema, table: name, object_type: objectType, signature, relation_name: relationName })}`);
 }
 
+export async function getCustomTypeDetails(connectionId: string, database: string, schema: string, name: string): Promise<CustomTypeDetails> {
+  return get(`/api/schema/custom-type-details?${qs({ connection_id: connectionId, database, schema, table: name })}`);
+}
+
 export async function getColumns(connectionId: string, database: string, schema: string, table: string, catalog?: string, clientSessionId?: string): Promise<ColumnInfo[]> {
   return get(`/api/schema/columns?${qs({ connection_id: connectionId, database, schema, table, catalog, client_session_id: clientSessionId })}`);
 }
 
 export async function getSqlServerColumnMetadata(connectionId: string, database: string, schema: string, table: string): Promise<SqlServerColumnMetadata[]> {
   return get(`/api/schema/sqlserver/column-metadata?${qs({ connection_id: connectionId, database, schema, table })}`);
+}
+
+export interface TableColumnsResult {
+  table_name: string;
+  columns: ColumnInfo[];
+  error?: string;
+}
+
+export async function getAllColumns(connectionId: string, database: string, schema: string): Promise<TableColumnsResult[]> {
+  return get(`/api/schema/all-columns?${qs({ connection_id: connectionId, database, schema })}`);
 }
 
 export async function listDataTypes(connectionId: string, database: string): Promise<string[]> {
@@ -803,6 +847,41 @@ export async function listDialectDataTypes(dialectName: string): Promise<string[
 }
 
 // ---------------------------------------------------------------------------
+// Docs
+// ---------------------------------------------------------------------------
+
+export async function collectDocsSnapshot(connectionId: string, database: string, schemas: string[], tables: string[], projectName?: string): Promise<SchemaSnapshot> {
+  return post("/api/docs/snapshot", { connectionId, database, schemas, tables, projectName });
+}
+
+export async function loadDocsAnnotations(connectionId: string): Promise<AnnotationFile | null> {
+  return post("/api/docs/annotations/load", { connectionId });
+}
+
+export async function applyDocsAnnotations(connectionId: string, snapshot: SchemaSnapshot, annotations: AnnotationFile): Promise<SchemaSnapshot> {
+  return post("/api/docs/annotations/apply", { connectionId, snapshot, annotations });
+}
+
+export async function saveDocsAnnotations(connectionId: string, annotations: AnnotationFile): Promise<void> {
+  return post("/api/docs/annotations/save", { connectionId, annotations });
+}
+
+export async function exportDocsHtml(filePath: string, snapshot: SchemaSnapshot, annotations: AnnotationFile, lang: string): Promise<void> {
+  const result = await post<{ content: string }>("/api/docs/export", { snapshot, annotations, lang });
+  // No `downloadTextFile` here: it prepends a BOM, which the Tauri command's
+  // `std::fs::write(&file_path, html)` does not. The two callers must produce
+  // byte-identical output for the same inputs.
+  const fileName = filePath.split(/[\\/]/).pop() || "docs.html";
+  const blob = new Blob([result.content], { type: "text/html;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = fileName;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+// ---------------------------------------------------------------------------
 // Query
 // ---------------------------------------------------------------------------
 
@@ -820,7 +899,7 @@ export async function executeQuery(
     resultSessionId?: string;
     clientSessionId?: string;
     timeoutSecs?: number;
-    executionMode?: "simple";
+    executionMode?: "simple" | "postgres_read_only_transaction";
   },
 ): Promise<QueryResult> {
   return post("/api/query/execute", {
@@ -870,7 +949,7 @@ export interface ExecuteMultiProgress {
   success: boolean;
   executionTimeMs: number;
   affectedRows: number;
-  error?: string;
+  error?: BackendError;
 }
 
 export async function executeMultiWithProgress(
@@ -908,7 +987,7 @@ export async function executeMultiWithProgress(
       success,
       executionTimeMs: result.execution_time_ms,
       affectedRows: result.affected_rows,
-      error: success ? undefined : String(result.rows[0]?.[0] ?? ""),
+      error: success ? undefined : result.error,
     });
   });
   return results;
@@ -1260,7 +1339,7 @@ export async function aiStream(sessionId: string, request: AiCompletionRequest, 
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ session_id: sessionId, request }),
   });
-  if (!res.ok) throw new Error(await res.text());
+  if (!res.ok) throw await backendResponseError(res);
 
   const reader = res.body!.getReader();
   const decoder = new TextDecoder();
@@ -1326,6 +1405,7 @@ export async function aiAgentStream(
   request: AiCompletionRequest,
   connectionId: string,
   database: string,
+  schema: string | undefined,
   dbType: string,
   onEvent: (event: import("@/lib/backend/tauri").AgentEvent) => void,
   mode?: string,
@@ -1333,6 +1413,7 @@ export async function aiAgentStream(
   confirmedWriteSql?: string,
   confirmedConnectionId?: string,
   confirmedDatabase?: string,
+  confirmedSchema?: string,
   signal?: AbortSignal,
 ): Promise<string> {
   const res = await fetch(apiUrl("/api/ai/agent-stream"), {
@@ -1343,16 +1424,18 @@ export async function aiAgentStream(
       request,
       connectionId,
       database,
+      schema,
       dbType,
       mode: mode || "ask",
       allowWriteSql,
       confirmedWriteSql,
       confirmedConnectionId,
       confirmedDatabase,
+      confirmedSchema,
     }),
     signal,
   });
-  if (!res.ok) throw new Error(await res.text());
+  if (!res.ok) throw await backendResponseError(res);
 
   const reader = res.body!.getReader();
   const decoder = new TextDecoder();
@@ -1455,7 +1538,7 @@ export async function saveMcpGlobalPolicy(policy: Omit<McpGlobalPolicy, "configu
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(policy),
   });
-  if (!res.ok) throw new Error(await res.text());
+  if (!res.ok) throw await backendResponseError(res);
 }
 
 export async function loadMaxAgentTurns(): Promise<number> {
@@ -1468,7 +1551,7 @@ export async function saveMaxAgentTurns(maxAgentTurns: number): Promise<void> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ maxAgentTurns }),
   });
-  if (!res.ok) throw new Error(await res.text());
+  if (!res.ok) throw await backendResponseError(res);
 }
 
 export async function loadMaxRetries(): Promise<number> {
@@ -1481,7 +1564,7 @@ export async function saveMaxRetries(maxRetries: number): Promise<void> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ maxRetries }),
   });
-  if (!res.ok) throw new Error(await res.text());
+  if (!res.ok) throw await backendResponseError(res);
 }
 
 export interface OpenTabsStatePayload {
@@ -1605,6 +1688,12 @@ export interface SnippetSyncConfig {
   provider: SnippetProvider;
   token?: string;
   snippetId?: string;
+  replaceLegacySnippet?: boolean;
+}
+
+export interface SnippetSyncSettings {
+  snippetId?: string;
+  legacyCleanupRequiredId?: string;
 }
 
 export interface SnippetSyncSummary {
@@ -1613,6 +1702,7 @@ export interface SnippetSyncSummary {
   bytes: number;
   exportedAt?: string;
   appVersion?: string;
+  legacyCleanupRequiredId?: string;
 }
 
 export interface SnippetDownloadResult {
@@ -1685,17 +1775,33 @@ export async function forgetSnippetSavedToken(config: SnippetSyncConfig): Promis
   await post("/api/cloud-sync/snippet/forget-token", { config });
 }
 
-export async function snippetSyncUpload(config: SnippetSyncConfig, editorSettings?: unknown, secretsPassphrase?: string): Promise<SnippetSyncSummary> {
+export async function snippetSyncSettings(provider: SnippetProvider): Promise<SnippetSyncSettings> {
+  return post("/api/cloud-sync/snippet/settings", { provider });
+}
+
+export async function saveSnippetSyncId(provider: SnippetProvider, snippetId?: string): Promise<void> {
+  await post("/api/cloud-sync/snippet/save-id", { provider, snippetId });
+}
+
+export async function retrySnippetLegacyCleanup(config: SnippetSyncConfig): Promise<SnippetSyncSettings> {
+  return post("/api/cloud-sync/snippet/retry-legacy-cleanup", { config });
+}
+
+export async function snippetSyncUpload(config: SnippetSyncConfig, editorSettings?: unknown, snippetPassphrase?: string, includeSecrets = false, secretsPassphrase?: string): Promise<SnippetSyncSummary> {
   return post("/api/cloud-sync/snippet/upload", {
     config,
     editorSettings,
+    snippetPassphrase,
+    includeSecrets,
     secretsPassphrase,
   });
 }
 
-export async function snippetSyncDownload(config: SnippetSyncConfig, secretsPassphrase?: string): Promise<SnippetDownloadResult> {
+export async function snippetSyncDownload(config: SnippetSyncConfig, snippetPassphrase?: string, restoreSecrets = false, secretsPassphrase?: string): Promise<SnippetDownloadResult> {
   return post("/api/cloud-sync/snippet/download", {
     config,
+    snippetPassphrase,
+    restoreSecrets,
     secretsPassphrase,
   });
 }
@@ -1762,7 +1868,7 @@ export async function previewSqlFile(fileOrPath: string | File): Promise<SqlFile
     method: "POST",
     body: formData,
   });
-  if (!res.ok) throw new Error(await res.text());
+  if (!res.ok) throw await backendResponseError(res);
   return res.json();
 }
 
@@ -1802,11 +1908,19 @@ export async function readExternalSqlFile(_path: string): Promise<string> {
   throw new Error("Opening external SQL file paths is only available in the desktop app");
 }
 
-export async function writeExternalSqlFile(_path: string, _content: string): Promise<void> {
+export async function readExternalSqlFileSnapshot(_path: string): Promise<import("@/lib/backend/tauri").ExternalSqlFileSnapshot> {
+  throw new Error("Opening external SQL file paths is only available in the desktop app");
+}
+
+export async function inspectExternalSqlFile(_path: string): Promise<import("@/lib/backend/tauri").ExternalSqlFileStatus> {
+  throw new Error("Inspecting external SQL file paths is only available in the desktop app");
+}
+
+export async function writeExternalSqlFile(_path: string, _content: string, _options: { expectedContentHash?: string; expectedMissing?: boolean } = {}): Promise<import("@/lib/backend/tauri").ExternalSqlFileWriteResult> {
   throw new Error("Saving external SQL file paths is only available in the desktop app");
 }
 
-export async function saveExternalSqlFile(_defaultFileName: string, _content: string): Promise<string | null> {
+export async function saveExternalSqlFile(_defaultFileName: string, _content: string): Promise<{ path: string; version: import("@/types/database").ExternalSqlFileVersion } | null> {
   throw new Error("Saving SQL files locally is only available in the desktop app");
 }
 
@@ -1832,7 +1946,7 @@ export async function startTransfer(request: TransferRequest, onProgress: (progr
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ request }),
   });
-  if (!res.ok) throw new Error(await res.text());
+  if (!res.ok) throw await backendResponseError(res);
 
   // 2. SSE to listen for progress
   return new Promise((resolve, reject) => {
@@ -1894,7 +2008,7 @@ export async function previewTableImportFile(fileOrPath: string | File | TableIm
         previewLimit: options.previewLimit,
       }),
     });
-    if (!res.ok) throw new Error(await res.text());
+    if (!res.ok) throw await backendResponseError(res);
     return res.json();
   }
   const formData = new FormData();
@@ -1906,7 +2020,7 @@ export async function previewTableImportFile(fileOrPath: string | File | TableIm
     method: "POST",
     body: formData,
   });
-  if (!res.ok) throw new Error(await res.text());
+  if (!res.ok) throw await backendResponseError(res);
   return res.json();
 }
 
@@ -1917,7 +2031,7 @@ export async function importTableFile(request: TableImportRequest, onProgress: (
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ request }),
   });
-  if (!res.ok) throw new Error(await res.text());
+  if (!res.ok) throw await backendResponseError(res);
 
   // 2. SSE to listen for progress
   return new Promise((resolve, reject) => {
@@ -1971,7 +2085,7 @@ export async function exportDatabaseSql(request: DatabaseExportRequest, onProgre
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ request }),
   });
-  if (!res.ok) throw new Error(await res.text());
+  if (!res.ok) throw await backendResponseError(res);
 
   // 2. SSE to listen for progress
   return new Promise((resolve, reject) => {
@@ -2256,6 +2370,10 @@ export async function redisGetValue(connectionId: string, db: number, keyRaw: st
   return post("/api/redis/get-value", { connectionId, db, keyRaw });
 }
 
+export async function redisGetTtl(connectionId: string, db: number, keyRaw: string): Promise<number> {
+  return post("/api/redis/get-ttl", { connectionId, db, keyRaw });
+}
+
 export async function redisGetStreamEntries(connectionId: string, db: number, keyRaw: string, cursor?: string): Promise<RedisStreamPage> {
   return post("/api/redis/get-stream-entries", { connectionId, db, keyRaw, cursor });
 }
@@ -2313,6 +2431,14 @@ export async function redisHashDel(connectionId: string, db: number, keyRaw: str
   return post("/api/redis/hash-del", { connectionId, db, keyRaw, field });
 }
 
+export async function redisHashFieldSetTtl(connectionId: string, db: number, keyRaw: string, field: string, ttl: number): Promise<void> {
+  return post("/api/redis/hash-field-set-ttl", { connectionId, db, keyRaw, field, ttl });
+}
+
+export async function redisHashFieldSetExpireAt(connectionId: string, db: number, keyRaw: string, field: string, expireAt: number): Promise<void> {
+  return post("/api/redis/hash-field-set-expire-at", { connectionId, db, keyRaw, field, expireAt });
+}
+
 export async function redisListPush(connectionId: string, db: number, keyRaw: string, value: string, ttl?: number): Promise<void> {
   return post("/api/redis/list-push", { connectionId, db, keyRaw, value, ttl });
 }
@@ -2352,6 +2478,10 @@ export async function redisZadd(connectionId: string, db: number, keyRaw: string
 
 export async function redisZrem(connectionId: string, db: number, keyRaw: string, member: string): Promise<void> {
   return post("/api/redis/zrem", { connectionId, db, keyRaw, member });
+}
+
+export async function redisZsetUpdate(connectionId: string, db: number, keyRaw: string, originalMember: string, expectedScore: string, member: string, score: string): Promise<boolean> {
+  return post("/api/redis/zset-update", { connectionId, db, keyRaw, originalMember, expectedScore, member, score });
 }
 
 export async function redisStreamAdd(connectionId: string, db: number, keyRaw: string, entryId: string, fields: [string, string][], ttl?: number): Promise<void> {
@@ -2403,7 +2533,7 @@ export async function redisExecuteCommand(connectionId: string, db: number, comm
   });
 }
 
-export async function redisLoadMore(connectionId: string, db: number, keyRaw: string, keyType: string, cursor: number, count: number, filter?: string): Promise<RedisCollectionPage> {
+export async function redisLoadMore(connectionId: string, db: number, keyRaw: string, keyType: string, cursor: number, count: number, filter?: string, sortDirection?: "asc" | "desc"): Promise<RedisCollectionPage> {
   return post("/api/redis/load-more", {
     connectionId,
     db,
@@ -2412,6 +2542,7 @@ export async function redisLoadMore(connectionId: string, db: number, keyRaw: st
     cursor,
     count,
     filter,
+    sortDirection,
   });
 }
 
@@ -2523,6 +2654,33 @@ export async function etcdHistory(
 export async function etcdStatus(connectionId: string): Promise<KvStatusResponse> {
   return post("/api/etcd/status", { connectionId });
 }
+export async function etcdPreflight(connectionId: string, action: string, params: Record<string, unknown>): Promise<import("./tauri").EtcdPreflightResponse> {
+  return post("/api/etcd/preflight", { connectionId, request: { action, params } });
+}
+export async function etcdCompact(connectionId: string, revision: KvInt64, approval: import("./tauri").EtcdDangerousApproval): Promise<{ revision: KvInt64 }> {
+  return post("/api/etcd/compact", { connectionId, revision, ...approval });
+}
+export async function etcdDefrag(connectionId: string, endpoints: string[], approval: import("./tauri").EtcdDangerousApproval): Promise<EtcdDefragResponse> {
+  return post("/api/etcd/defrag", { connectionId, endpoints, ...approval });
+}
+export async function etcdWatchStart(connectionId: string, request: EtcdWatchStartRequest): Promise<EtcdWatchStartResponse> {
+  return post("/api/etcd/watch/start", { connectionId, request });
+}
+export async function etcdWatchPoll(connectionId: string, watchId: string): Promise<EtcdWatchPollResponse> {
+  return post("/api/etcd/watch/poll", { connectionId, watchId });
+}
+export async function etcdWatchStop(connectionId: string, watchId: string): Promise<{ stopped: boolean }> {
+  return post("/api/etcd/watch/stop", { connectionId, watchId });
+}
+export async function etcdLeaseList(connectionId: string, limit = 100, continuation?: string | null): Promise<EtcdLeaseListResponse> {
+  return post("/api/etcd/lease/list", { connectionId, limit, continuation: continuation ?? null });
+}
+export async function etcdLeaseCall<T = unknown>(connectionId: string, operation: "get" | "grant" | "keepalive" | "revoke", params: Record<string, unknown>, approval?: import("./tauri").EtcdDangerousApproval): Promise<T> {
+  return post("/api/etcd/lease/call", { connectionId, operation, params, ...approval });
+}
+export async function etcdAuthCall<T = unknown>(connectionId: string, operation: string, params: Record<string, unknown>, approval?: import("./tauri").EtcdDangerousApproval): Promise<T> {
+  return post("/api/etcd/auth/call", { connectionId, operation, params, ...approval });
+}
 
 // ---------------------------------------------------------------------------
 // ZooKeeper
@@ -2553,6 +2711,355 @@ export async function zookeeperPut(connectionId: string, key: string, value: KvV
 
 export async function zookeeperDelete(connectionId: string, key: string): Promise<KvDeleteResponse> {
   return post("/api/zookeeper/delete", { connectionId, key });
+}
+
+// ---------------------------------------------------------------------------
+// Consul
+// ---------------------------------------------------------------------------
+
+export async function consulCapabilities(connectionId: string): Promise<import("@/types/consul").ConsulCapabilities> {
+  return post("/api/consul/capabilities", { connectionId });
+}
+
+export async function consulTxn(connectionId: string, request: import("@/types/consul").ConsulTxnRequest): Promise<import("@/types/consul").ConsulTxnResult> {
+  return post("/api/consul/txn", { connectionId, request });
+}
+
+export async function consulRenameKey(connectionId: string, source: string, target: string, expectedModifyIndex: KvInt64, copy = false): Promise<import("@/types/consul").ConsulTxnResult> {
+  return post("/api/consul/rename-key", { connectionId, source, target, expectedModifyIndex, copy });
+}
+
+export async function consulBlockingQuery(connectionId: string, request: import("@/types/consul").ConsulBlockingRequest): Promise<import("@/types/consul").ConsulBlockingResponse> {
+  return post("/api/consul/blocking-query", { connectionId, request });
+}
+
+export function consulDomainWatch(connectionId: string, request: import("@/types/consul").ConsulDomainWatchRequest & { target: { kind: "catalogServices" } }): Promise<import("@/types/consul").ConsulDomainWatchResponse<Record<string, string[]>>>;
+export function consulDomainWatch(connectionId: string, request: import("@/types/consul").ConsulDomainWatchRequest & { target: { kind: "catalogNodes" } }): Promise<import("@/types/consul").ConsulDomainWatchResponse<import("@/types/consul").ConsulCatalogNode[]>>;
+export function consulDomainWatch(connectionId: string, request: import("@/types/consul").ConsulDomainWatchRequest & { target: { kind: "catalogServiceNodes"; service: string } }): Promise<import("@/types/consul").ConsulDomainWatchResponse<import("@/types/consul").ConsulCatalogServiceNode[]>>;
+export function consulDomainWatch(connectionId: string, request: import("@/types/consul").ConsulDomainWatchRequest & { target: { kind: "catalogNodeServices"; node: string } }): Promise<import("@/types/consul").ConsulDomainWatchResponse<import("@/types/consul").ConsulNodeServices>>;
+export function consulDomainWatch(connectionId: string, request: import("@/types/consul").ConsulDomainWatchRequest & { target: { kind: "healthNode"; node: string } }): Promise<import("@/types/consul").ConsulDomainWatchResponse<import("@/types/consul").ConsulHealthCheck[]>>;
+export function consulDomainWatch(connectionId: string, request: import("@/types/consul").ConsulDomainWatchRequest & { target: { kind: "healthServiceChecks"; service: string } }): Promise<import("@/types/consul").ConsulDomainWatchResponse<import("@/types/consul").ConsulHealthCheck[]>>;
+export function consulDomainWatch(
+  connectionId: string,
+  request: import("@/types/consul").ConsulDomainWatchRequest & { target: { kind: "healthServiceInstances"; service: string; passing: boolean | null } },
+): Promise<import("@/types/consul").ConsulDomainWatchResponse<import("@/types/consul").ConsulServiceInstance[]>>;
+export function consulDomainWatch(connectionId: string, request: import("@/types/consul").ConsulDomainWatchRequest & { target: { kind: "healthState"; state: string } }): Promise<import("@/types/consul").ConsulDomainWatchResponse<import("@/types/consul").ConsulHealthCheck[]>>;
+export function consulDomainWatch(connectionId: string, request: import("@/types/consul").ConsulDomainWatchRequest): Promise<import("@/types/consul").ConsulDomainWatchResponse<import("@/types/consul").ConsulDomainWatchItems>>;
+export async function consulDomainWatch(connectionId: string, request: import("@/types/consul").ConsulDomainWatchRequest): Promise<import("@/types/consul").ConsulDomainWatchResponse<import("@/types/consul").ConsulDomainWatchItems>> {
+  return post("/api/consul/domain-watch", { connectionId, request });
+}
+
+export async function consulCancelBlocking(connectionId: string, scope: import("@/types/consul").ConsulScope, generation: number, operationId: string): Promise<boolean> {
+  return post("/api/consul/cancel-blocking", { connectionId, scope, generation, operationId });
+}
+
+export async function consulWatchStart(connectionId: string, request: import("@/types/consul").ConsulBlockingRequest): Promise<string> {
+  await consulBlockingQuery(connectionId, request);
+  return request.operationId;
+}
+
+export async function consulListRecursive(connectionId: string, prefix: string, maxEntries = 10_000, maxValueBytes = 32 * 1024 * 1024): Promise<import("@/types/consul").ConsulRecursiveListResponse> {
+  return post("/api/consul/list-recursive", { connectionId, prefix, maxEntries, maxValueBytes });
+}
+
+export async function consulSearch(connectionId: string, request: import("@/types/consul").ConsulSearchRequest): Promise<import("@/types/consul").ConsulSearchResponse> {
+  return post("/api/consul/search", { connectionId, request });
+}
+
+export async function consulSearchProgress(connectionId: string, requestId: string, scope: import("@/types/consul").ConsulScope, generation: number): Promise<import("@/types/consul").ConsulSearchProgress> {
+  return post("/api/consul/search-progress", { connectionId, requestId, scope, generation });
+}
+
+export async function consulCancelSearch(connectionId: string, requestId: string, scope: import("@/types/consul").ConsulScope, generation: number): Promise<boolean> {
+  return post("/api/consul/cancel-search", { connectionId, requestId, scope, generation });
+}
+
+export async function consulExportBundle(connectionId: string, request: import("@/types/consul").ConsulExportRequest): Promise<import("@/types/consul").ConsulKvBundle> {
+  return post("/api/consul/export-bundle", { connectionId, request });
+}
+
+export async function consulImportPreview(connectionId: string, request: import("@/types/consul").ConsulImportRequest): Promise<import("@/types/consul").ConsulImportPreview> {
+  return post("/api/consul/import-preview", { connectionId, request });
+}
+
+export async function consulImportExecute(connectionId: string, request: import("@/types/consul").ConsulImportRequest): Promise<import("@/types/consul").ConsulImportReport> {
+  return post("/api/consul/import-execute", { connectionId, request });
+}
+
+export async function consulDeletePrefixPreview(connectionId: string, prefix: string): Promise<import("@/types/consul").ConsulDeletePrefixPreview> {
+  return post("/api/consul/delete-prefix-preview", { connectionId, prefix });
+}
+
+export async function consulDeletePrefixExecute(connectionId: string, request: import("@/types/consul").ConsulDeletePrefixRequest): Promise<import("@/types/consul").ConsulDeletePrefixReport> {
+  return post("/api/consul/delete-prefix-execute", { connectionId, request });
+}
+
+export async function consulListPrefix(connectionId: string, prefix: string, limit: number, continuation?: string | null): Promise<KvListPrefixResponse> {
+  return post("/api/consul/list-prefix", { connectionId, prefix, limit, continuation: continuation ?? null });
+}
+
+export async function consulGet(connectionId: string, key: string): Promise<KvGetResponse> {
+  return post("/api/consul/get", { connectionId, key });
+}
+
+export async function consulPut(connectionId: string, key: string, value: KvValue, options?: KvPutOptions | null): Promise<KvPutResponse> {
+  return post("/api/consul/put", { connectionId, key, value, options: options ?? null });
+}
+
+export async function consulDelete(connectionId: string, key: string, options?: KvDeleteOptions | null): Promise<KvDeleteResponse> {
+  return post("/api/consul/delete", { connectionId, key, options: options ?? null });
+}
+
+export async function consulPreparedQueryList(connectionId: string): Promise<import("@/types/consul").ConsulPreparedQuery[]> {
+  return post("/api/consul/prepared-query/list", { connectionId });
+}
+export async function consulPreparedQueryRead(connectionId: string, id: string): Promise<import("@/types/consul").ConsulPreparedQuery> {
+  return post("/api/consul/prepared-query/read", { connectionId, id });
+}
+export async function consulPreparedQueryCreate(connectionId: string, input: import("@/types/consul").ConsulPreparedQueryInput): Promise<string> {
+  return post("/api/consul/prepared-query/create", { connectionId, input });
+}
+export async function consulPreparedQueryUpdate(connectionId: string, id: string, input: import("@/types/consul").ConsulPreparedQueryInput): Promise<void> {
+  await post("/api/consul/prepared-query/update", { connectionId, id, input });
+}
+export async function consulPreparedQueryDelete(connectionId: string, id: string): Promise<void> {
+  await post("/api/consul/prepared-query/delete", { connectionId, id });
+}
+export async function consulPreparedQueryExecute(connectionId: string, request: import("@/types/consul").ConsulPreparedQueryExecuteRequest): Promise<import("@/types/consul").ConsulPreparedQueryExecuteResponse> {
+  return post("/api/consul/prepared-query/execute", { connectionId, request });
+}
+export async function consulPreparedQueryExplain(connectionId: string, query: string): Promise<unknown> {
+  return post("/api/consul/prepared-query/explain", { connectionId, id: query });
+}
+export async function consulEventList(connectionId: string, name?: string | null): Promise<import("@/types/consul").ConsulEvent[]> {
+  return post("/api/consul/event/list", { connectionId, name: name ?? null });
+}
+export async function consulEventFire(connectionId: string, request: import("@/types/consul").ConsulEventFireRequest): Promise<import("@/types/consul").ConsulEvent> {
+  return post("/api/consul/event/fire", { connectionId, request });
+}
+export async function consulCoordinateNodes(connectionId: string): Promise<import("@/types/consul").ConsulCoordinate[]> {
+  return post("/api/consul/coordinate/nodes", { connectionId });
+}
+export async function consulOperatorRead(connectionId: string, kind: import("@/types/consul").ConsulOperatorReadKind): Promise<import("@/types/consul").ConsulOperatorDocument> {
+  return post("/api/consul/operator/read", { connectionId, kind });
+}
+export async function consulSnapshotGenerate(connectionId: string): Promise<import("@/types/consul").ConsulSnapshot> {
+  return post("/api/consul/operator/snapshot/generate", { connectionId });
+}
+export async function consulSnapshotRestore(connectionId: string, request: import("@/types/consul").ConsulSnapshotRestoreRequest): Promise<void> {
+  await post("/api/consul/operator/snapshot/restore", { connectionId, request });
+}
+export async function consulAutopilotUpdate(connectionId: string, update: import("@/types/consul").ConsulAutopilotUpdate, confirmation: string): Promise<void> {
+  await post("/api/consul/operator/autopilot/update", { connectionId, update, confirmation });
+}
+export async function consulRaftTransfer(connectionId: string, request: import("@/types/consul").ConsulRaftWriteRequest): Promise<void> {
+  await post("/api/consul/operator/raft/transfer", { connectionId, request });
+}
+export async function consulRaftRemove(connectionId: string, request: import("@/types/consul").ConsulRaftWriteRequest): Promise<void> {
+  await post("/api/consul/operator/raft/remove", { connectionId, request });
+}
+export async function consulKeyringWrite(connectionId: string, request: import("@/types/consul").ConsulKeyringWriteRequest): Promise<void> {
+  await post("/api/consul/operator/keyring/write", { connectionId, request });
+}
+export async function consulLicenseWrite(connectionId: string, request: import("@/types/consul").ConsulLicenseWriteRequest): Promise<void> {
+  await post("/api/consul/operator/license/write", { connectionId, request });
+}
+
+export async function consulStatusLeader(connectionId: string): Promise<string> {
+  return post("/api/consul/status/leader", { connectionId });
+}
+export async function consulStatusPeers(connectionId: string): Promise<string[]> {
+  return post("/api/consul/status/peers", { connectionId });
+}
+export async function consulAgentSelf(connectionId: string): Promise<import("@/types/consul").ConsulAgentIdentity> {
+  return post("/api/consul/agent/self", { connectionId });
+}
+export async function consulAgentMembers(connectionId: string, wan = false, segment?: string | null): Promise<import("@/types/consul").ConsulAgentMember[]> {
+  return post("/api/consul/agent/members", { connectionId, wan, segment: segment ?? null });
+}
+export async function consulAgentMetrics(connectionId: string): Promise<unknown> {
+  return post("/api/consul/agent/metrics", { connectionId });
+}
+export async function consulCatalogDatacenters(connectionId: string): Promise<string[]> {
+  return post("/api/consul/catalog/datacenters", { connectionId });
+}
+export async function consulCatalogNodes(connectionId: string, options: import("@/types/consul").ConsulReadOptions = {}): Promise<import("@/types/consul").ConsulListResponse<import("@/types/consul").ConsulCatalogNode[]>> {
+  return post("/api/consul/catalog/nodes", { connectionId, options });
+}
+export async function consulCatalogServices(connectionId: string, options: import("@/types/consul").ConsulReadOptions = {}): Promise<import("@/types/consul").ConsulListResponse<Record<string, string[]>>> {
+  return post("/api/consul/catalog/services", { connectionId, options });
+}
+export async function consulCatalogServiceNodes(connectionId: string, service: string, options: import("@/types/consul").ConsulReadOptions = {}): Promise<import("@/types/consul").ConsulListResponse<import("@/types/consul").ConsulCatalogServiceNode[]>> {
+  return post("/api/consul/catalog/service-nodes", { connectionId, name: service, options });
+}
+export async function consulCatalogNodeServices(connectionId: string, node: string, options: import("@/types/consul").ConsulReadOptions = {}): Promise<import("@/types/consul").ConsulListResponse<import("@/types/consul").ConsulNodeServices>> {
+  return post("/api/consul/catalog/node-services", { connectionId, name: node, options });
+}
+export async function consulHealthNode(connectionId: string, node: string, options: import("@/types/consul").ConsulReadOptions = {}): Promise<import("@/types/consul").ConsulListResponse<import("@/types/consul").ConsulHealthCheck[]>> {
+  return post("/api/consul/health/node", { connectionId, name: node, options });
+}
+export async function consulHealthChecks(connectionId: string, service: string, options: import("@/types/consul").ConsulReadOptions = {}): Promise<import("@/types/consul").ConsulListResponse<import("@/types/consul").ConsulHealthCheck[]>> {
+  return post("/api/consul/health/checks", { connectionId, name: service, options });
+}
+export async function consulHealthService(connectionId: string, service: string, passing: boolean | null = null, options: import("@/types/consul").ConsulReadOptions = {}): Promise<import("@/types/consul").ConsulListResponse<import("@/types/consul").ConsulServiceInstance[]>> {
+  return post("/api/consul/health/service", { connectionId, name: service, passing, options });
+}
+export async function consulHealthState(connectionId: string, healthState: string, options: import("@/types/consul").ConsulReadOptions = {}): Promise<import("@/types/consul").ConsulListResponse<import("@/types/consul").ConsulHealthCheck[]>> {
+  return post("/api/consul/health/state", { connectionId, name: healthState, options });
+}
+export async function consulAgentServices(connectionId: string): Promise<Record<string, import("@/types/consul").ConsulAgentService>> {
+  return post("/api/consul/agent/services", { connectionId });
+}
+export async function consulAgentService(connectionId: string, id: string): Promise<import("@/types/consul").ConsulAgentService> {
+  return post("/api/consul/agent/service", { connectionId, id });
+}
+export async function consulAgentChecks(connectionId: string): Promise<Record<string, import("@/types/consul").ConsulHealthCheck>> {
+  return post("/api/consul/agent/checks", { connectionId });
+}
+export async function consulAgentRegisterService(connectionId: string, registration: import("@/types/consul").ConsulAgentServiceRegistration): Promise<import("@/types/consul").ConsulAgentWriteResult> {
+  return post("/api/consul/agent/service/register", { connectionId, registration });
+}
+export async function consulAgentDeregisterService(connectionId: string, id: string): Promise<import("@/types/consul").ConsulAgentWriteResult> {
+  return post("/api/consul/agent/service/deregister", { connectionId, id });
+}
+export async function consulAgentServiceMaintenance(connectionId: string, id: string, enable: boolean, reason?: string | null): Promise<import("@/types/consul").ConsulAgentWriteResult> {
+  return post("/api/consul/agent/service/maintenance", { connectionId, id, enable, reason: reason ?? null });
+}
+export async function consulAgentRegisterCheck(connectionId: string, registration: import("@/types/consul").ConsulAgentCheckRegistration): Promise<import("@/types/consul").ConsulAgentWriteResult> {
+  return post("/api/consul/agent/check/register", { connectionId, registration });
+}
+export async function consulAgentDeregisterCheck(connectionId: string, id: string): Promise<import("@/types/consul").ConsulAgentWriteResult> {
+  return post("/api/consul/agent/check/deregister", { connectionId, id });
+}
+export async function consulAgentUpdateTtl(connectionId: string, id: string, status: import("@/types/consul").ConsulCheckStatus, output?: string | null): Promise<import("@/types/consul").ConsulAgentWriteResult> {
+  return post("/api/consul/agent/check/ttl", { connectionId, id, status, output: output ?? null });
+}
+export async function consulSessions(connectionId: string, options: import("@/types/consul").ConsulReadOptions = {}): Promise<import("@/types/consul").ConsulListResponse<import("@/types/consul").ConsulSession[]>> {
+  return post("/api/consul/sessions", { connectionId, options });
+}
+export async function consulNodeSessions(connectionId: string, node: string, options: import("@/types/consul").ConsulReadOptions = {}): Promise<import("@/types/consul").ConsulListResponse<import("@/types/consul").ConsulSession[]>> {
+  return post("/api/consul/sessions/node", { connectionId, name: node, options });
+}
+export async function consulSession(connectionId: string, id: string): Promise<import("@/types/consul").ConsulSession | null> {
+  return post("/api/consul/session", { connectionId, id });
+}
+export async function consulSessionKeys(connectionId: string, id: string): Promise<import("@/types/consul").ConsulSessionKeysResponse> {
+  return post("/api/consul/session/keys", { connectionId, id });
+}
+export async function consulSessionDestroyImpact(connectionId: string, id: string): Promise<import("@/types/consul").ConsulSessionDestroyImpact> {
+  return post("/api/consul/session/destroy-impact", { connectionId, id });
+}
+export async function consulCreateSession(connectionId: string, request: import("@/types/consul").ConsulSessionCreateRequest): Promise<import("@/types/consul").ConsulSession> {
+  return post("/api/consul/session/create", { connectionId, request });
+}
+export async function consulRenewSession(connectionId: string, id: string): Promise<import("@/types/consul").ConsulSession> {
+  return post("/api/consul/session/renew", { connectionId, id });
+}
+export async function consulDestroySession(connectionId: string, request: import("@/types/consul").ConsulSessionDestroyRequest): Promise<boolean> {
+  return post("/api/consul/session/destroy", { connectionId, request });
+}
+export async function consulAcquireLock(connectionId: string, request: import("@/types/consul").ConsulLockRequest): Promise<import("@/types/consul").ConsulLockResponse> {
+  return post("/api/consul/lock/acquire", { connectionId, request });
+}
+export async function consulReleaseLock(connectionId: string, key: string, session: string): Promise<import("@/types/consul").ConsulLockResponse> {
+  return post("/api/consul/lock/release", { connectionId, key, session });
+}
+
+export async function consulAclList(connectionId: string, kind: import("@/types/consul").ConsulAclKind): Promise<import("@/types/consul").ConsulAclList> {
+  return post("/api/consul/acl/list", { connectionId, kind });
+}
+export async function consulAclTokenSelf(connectionId: string): Promise<import("@/types/consul").ConsulAclToken> {
+  return post("/api/consul/acl/token/self", { connectionId });
+}
+export async function consulAclTokenClone(connectionId: string, accessorId: string, description: string): Promise<import("@/types/consul").ConsulAclToken> {
+  return post("/api/consul/acl/token/clone", { connectionId, id: accessorId, description });
+}
+export async function consulAclGet(connectionId: string, kind: import("@/types/consul").ConsulAclKind, id: string): Promise<import("@/types/consul").ConsulAclItem> {
+  return post("/api/consul/acl/get", { connectionId, kind, id });
+}
+export async function consulAclApply(connectionId: string, id: string | null, value: import("@/types/consul").ConsulAclWrite): Promise<import("@/types/consul").ConsulAclItem> {
+  return post("/api/consul/acl/apply", { connectionId, id, value });
+}
+export async function consulAclReferences(connectionId: string, kind: import("@/types/consul").ConsulAclKind, id: string): Promise<import("@/types/consul").ConsulAclReferences> {
+  return post("/api/consul/acl/references", { connectionId, kind, id });
+}
+export async function consulAclDelete(connectionId: string, kind: import("@/types/consul").ConsulAclKind, id: string): Promise<import("@/types/consul").ConsulAclReferences> {
+  return post("/api/consul/acl/delete", { connectionId, kind, id });
+}
+export async function consulEnterpriseList(connectionId: string, kind: import("@/types/consul").ConsulEnterpriseKind): Promise<import("@/types/consul").ConsulEnterpriseList> {
+  return post("/api/consul/enterprise/list", { connectionId, kind });
+}
+export async function consulEnterpriseGet(connectionId: string, kind: import("@/types/consul").ConsulEnterpriseKind, name: string): Promise<import("@/types/consul").ConsulEnterpriseItem> {
+  return post("/api/consul/enterprise/get", { connectionId, kind, name });
+}
+export async function consulEnterpriseApply(connectionId: string, existingName: string | null, item: import("@/types/consul").ConsulEnterpriseWrite): Promise<import("@/types/consul").ConsulEnterpriseItem> {
+  return post("/api/consul/enterprise/apply", { connectionId, existingName, item });
+}
+export async function consulEnterpriseImpact(connectionId: string, kind: import("@/types/consul").ConsulEnterpriseKind, name: string): Promise<import("@/types/consul").ConsulScopeImpact> {
+  return post("/api/consul/enterprise/impact", { connectionId, kind, name });
+}
+export async function consulEnterpriseDelete(connectionId: string, kind: import("@/types/consul").ConsulEnterpriseKind, name: string): Promise<import("@/types/consul").ConsulScopeImpact> {
+  return post("/api/consul/enterprise/delete", { connectionId, kind, name });
+}
+export async function consulMeshConfigList(connectionId: string, kind: string): Promise<import("@/types/consul").ConsulConfigEntry[]> {
+  return post("/api/consul/mesh/config/list", { connectionId, kind });
+}
+export async function consulMeshConfigGet(connectionId: string, kind: string, name: string): Promise<import("@/types/consul").ConsulConfigEntry> {
+  return post("/api/consul/mesh/config/get", { connectionId, kind, name });
+}
+export async function consulMeshConfigApply(connectionId: string, request: import("@/types/consul").ConsulConfigEntryApply): Promise<import("@/types/consul").ConsulConfigEntry> {
+  return post("/api/consul/mesh/config/apply", { connectionId, request });
+}
+export async function consulMeshConfigDelete(connectionId: string, kind: string, name: string, expectedModifyIndex: number): Promise<boolean> {
+  return post("/api/consul/mesh/config/delete", { connectionId, kind, name, expectedModifyIndex });
+}
+export async function consulMeshIntentionsList(connectionId: string): Promise<import("@/types/consul").ConsulIntention[]> {
+  return post("/api/consul/mesh/intentions/list", { connectionId });
+}
+export async function consulMeshIntentionGet(connectionId: string, id: string): Promise<import("@/types/consul").ConsulIntention> {
+  return post("/api/consul/mesh/intentions/get", { connectionId, id });
+}
+export async function consulMeshIntentionGetExact(connectionId: string, request: import("@/types/consul").ConsulIntentionExactRequest): Promise<import("@/types/consul").ConsulIntention> {
+  return post("/api/consul/mesh/intentions/get-exact", { connectionId, exactRequest: request });
+}
+export async function consulMeshIntentionUpsert(connectionId: string, item: import("@/types/consul").ConsulIntention): Promise<import("@/types/consul").ConsulIntention> {
+  return post("/api/consul/mesh/intentions/upsert", { connectionId, intention: item });
+}
+export async function consulMeshIntentionDelete(connectionId: string, id: string): Promise<boolean> {
+  return post("/api/consul/mesh/intentions/delete", { connectionId, id });
+}
+export async function consulMeshIntentionDeleteExact(connectionId: string, request: import("@/types/consul").ConsulIntentionExactRequest): Promise<boolean> {
+  return post("/api/consul/mesh/intentions/delete-exact", { connectionId, exactRequest: request });
+}
+export async function consulMeshIntentionMatch(connectionId: string, request: import("@/types/consul").ConsulIntentionMatchRequest): Promise<import("@/types/consul").ConsulIntention[]> {
+  return post("/api/consul/mesh/intentions/match", { connectionId, matchRequest: request });
+}
+export async function consulMeshIntentionCheck(connectionId: string, request: import("@/types/consul").ConsulIntentionCheckRequest): Promise<import("@/types/consul").ConsulIntentionCheckResponse> {
+  return post("/api/consul/mesh/intentions/check", { connectionId, checkRequest: request });
+}
+export async function consulMeshDiscoveryChain(connectionId: string, service: string): Promise<import("@/types/consul").ConsulDiscoveryChain> {
+  return post("/api/consul/mesh/discovery-chain", { connectionId, service });
+}
+export async function consulMeshPeeringList(connectionId: string): Promise<import("@/types/consul").ConsulPeering[]> {
+  return post("/api/consul/mesh/peerings/list", { connectionId });
+}
+export async function consulMeshPeeringGet(connectionId: string, name: string): Promise<import("@/types/consul").ConsulPeering> {
+  return post("/api/consul/mesh/peerings/get", { connectionId, name });
+}
+export async function consulMeshPeeringGenerateToken(connectionId: string, request: import("@/types/consul").ConsulPeeringGenerateRequest): Promise<import("@/types/consul").ConsulPeeringToken> {
+  return post("/api/consul/mesh/peerings/generate-token", { connectionId, generateRequest: request });
+}
+export async function consulMeshPeeringEstablish(connectionId: string, request: import("@/types/consul").ConsulPeeringEstablishRequest): Promise<import("@/types/consul").ConsulPeering> {
+  return post("/api/consul/mesh/peerings/establish", { connectionId, establishRequest: request });
+}
+export async function consulMeshPeeringDelete(connectionId: string, name: string): Promise<boolean> {
+  return post("/api/consul/mesh/peerings/delete", { connectionId, name });
+}
+export async function consulMeshExportedServicesList(connectionId: string): Promise<import("@/types/consul").ConsulExportedService[]> {
+  return post("/api/consul/mesh/exported-services/list", { connectionId });
+}
+export async function consulMeshExportedServicesApply(connectionId: string, name: string, expectedModifyIndex: number, raw: Record<string, unknown>): Promise<import("@/types/consul").ConsulConfigEntry> {
+  return post("/api/consul/mesh/exported-services/apply", { connectionId, name, expectedModifyIndex, raw });
 }
 
 // ---------------------------------------------------------------------------
@@ -2597,7 +3104,7 @@ export async function nacosSearchConfigContent(connectionId: string, req: NacosC
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ connectionId, req }),
   });
-  if (!response.ok) throw new Error(await response.text());
+  if (!response.ok) throw await backendResponseError(response);
   if (!response.body) throw new Error("Nacos content search did not return a response stream");
 
   const reader = response.body.getReader();
@@ -2644,7 +3151,7 @@ export async function nacosExportConfigs(connectionId: string, selector: NacosCo
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ connectionId, selector, fileName }),
   });
-  if (!response.ok) throw new Error(await response.text());
+  if (!response.ok) throw await backendResponseError(response);
   const blob = await response.blob();
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
@@ -2664,7 +3171,7 @@ export async function nacosPreviewConfigImport(connectionId: string, targetNames
     method: "POST",
     body: formData,
   });
-  if (!response.ok) throw new Error(await response.text());
+  if (!response.ok) throw await backendResponseError(response);
   return response.json();
 }
 
@@ -2712,12 +3219,36 @@ export async function nacosListServices(connectionId: string, query: NacosServic
   return post("/api/nacos/services/list", { connectionId, query });
 }
 
+export async function nacosGetService(connectionId: string, query: NacosServiceQuery): Promise<NacosServiceDetail> {
+  return post("/api/nacos/services/get", { connectionId, query });
+}
+
+export async function nacosCreateService(connectionId: string, req: NacosServiceUpsert): Promise<void> {
+  return post("/api/nacos/services/create", { connectionId, req });
+}
+
+export async function nacosUpdateService(connectionId: string, req: NacosServiceUpsert): Promise<void> {
+  return post("/api/nacos/services/update", { connectionId, req });
+}
+
+export async function nacosDeleteService(connectionId: string, query: NacosServiceQuery): Promise<void> {
+  return post("/api/nacos/services/delete", { connectionId, query });
+}
+
 export async function nacosListInstances(connectionId: string, query: NacosInstanceQuery): Promise<NacosInstanceInfo[]> {
   return post("/api/nacos/instances/list", { connectionId, query });
 }
 
-export async function nacosUpdateInstance(connectionId: string, req: NacosInstanceUpdate): Promise<void> {
+export async function nacosUpdateInstance(connectionId: string, req: NacosInstanceUpdateRequest): Promise<void> {
   return post("/api/nacos/instances/update", { connectionId, req });
+}
+
+export async function nacosRegisterInstance(connectionId: string, req: NacosInstanceRegistration): Promise<void> {
+  return post("/api/nacos/instances/register", { connectionId, req });
+}
+
+export async function nacosDeregisterInstance(connectionId: string, req: NacosInstanceRef): Promise<void> {
+  return post("/api/nacos/instances/deregister", { connectionId, req });
 }
 
 export async function nacosGetDashboard(connectionId: string, query: NacosDashboardQuery): Promise<NacosDashboardSnapshot> {
@@ -2831,6 +3362,15 @@ export async function mongoRenameCollection(connectionId: string, database: stri
   });
 }
 
+export async function mongoCloneCollection(connectionId: string, database: string, sourceCollection: string, targetCollection: string): Promise<MongoCloneCollectionResult> {
+  return post("/api/mongo/clone-collection", {
+    connectionId,
+    database,
+    sourceCollection,
+    targetCollection,
+  });
+}
+
 export async function elasticsearchListIndices(connectionId: string): Promise<string[]> {
   const collections = await documentListCollections(connectionId, "default");
   return collections.map((c) => c.name);
@@ -2848,8 +3388,8 @@ export async function vectorGetCollectionDetail(connectionId: string, database: 
   });
 }
 
-export async function mongoFindDocuments(connectionId: string, database: string, collection: string, skip: number, limit: number, filter?: string, projection?: string, sort?: string, executionId?: string): Promise<MongoDocumentResult> {
-  return documentFindDocuments(connectionId, database, collection, skip, limit, filter, projection, sort, executionId);
+export async function mongoFindDocuments(connectionId: string, database: string, collection: string, skip: number, limit: number, filter?: string, projection?: string, sort?: string, collation?: string, executionId?: string): Promise<MongoDocumentResult> {
+  return documentFindDocuments(connectionId, database, collection, skip, limit, filter, projection, sort, collation, executionId);
 }
 
 export async function mongoParseShellCommand(source: string): Promise<MongoCommand> {
@@ -2869,7 +3409,7 @@ export async function mongoFindOne(connectionId: string, database: string, colle
   });
 }
 
-export async function documentFindDocuments(connectionId: string, database: string, collection: string, skip: number, limit: number, filter?: string, projection?: string, sort?: string, executionId?: string): Promise<DocumentQueryResult> {
+export async function documentFindDocuments(connectionId: string, database: string, collection: string, skip: number, limit: number, filter?: string, projection?: string, sort?: string, collation?: string, executionId?: string): Promise<DocumentQueryResult> {
   return post("/api/document-store/find-documents", {
     connectionId,
     database,
@@ -2879,6 +3419,7 @@ export async function documentFindDocuments(connectionId: string, database: stri
     filter,
     projection,
     sort,
+    collation,
     executionId,
   });
 }
@@ -2944,7 +3485,7 @@ export async function documentDownloadGridFsFile(connectionId: string, database:
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ connectionId, database, bucket, fileId }),
   });
-  if (!res.ok) throw new Error(await res.text());
+  if (!res.ok) throw await backendResponseError(res);
   const data = (await res.json()) as number[];
   return new Uint8Array(data);
 }
@@ -2963,7 +3504,7 @@ export async function documentUploadGridFsFile(connectionId: string, database: s
     method: "POST",
     body,
   });
-  if (!res.ok) throw new Error(await res.text());
+  if (!res.ok) throw await backendResponseError(res);
   return res.json();
 }
 
@@ -3027,7 +3568,16 @@ export async function mongoCreateIndex(connectionId: string, database: string, c
   });
 }
 
-export async function mongoDropIndexes(connectionId: string, database: string, collection: string, indexesJson?: string, single = false): Promise<{ dropped_names: string[]; affected_rows: number }> {
+export async function mongoCreateUser(connectionId: string, database: string, userJson: string, writeConcernJson?: string): Promise<{ affected_rows: number }> {
+  return post("/api/mongo/create-user", {
+    connectionId,
+    database,
+    userJson,
+    writeConcernJson,
+  });
+}
+
+export async function mongoDropIndexes(connectionId: string, database: string, collection: string, indexesJson?: string, single = false): Promise<MongoDropIndexesResult> {
   return post("/api/mongo/drop-indexes", {
     connectionId,
     database,
@@ -3041,13 +3591,14 @@ export async function mongoInsertDocument(connectionId: string, database: string
   return documentInsertDocument(connectionId, database, collection, docJson, routing);
 }
 
-export async function documentInsertDocument(connectionId: string, database: string, collection: string, docJson: string, routing?: string): Promise<string> {
+export async function documentInsertDocument(connectionId: string, database: string, collection: string, docJson: string, routing?: string, preserveBsonTypes?: boolean): Promise<string> {
   return post("/api/document-store/insert-document", {
     connectionId,
     database,
     collection,
     docJson,
     routing,
+    preserveBsonTypes,
   });
 }
 
@@ -3091,13 +3642,14 @@ export async function mongoDeleteDocument(connectionId: string, database: string
   return documentDeleteDocument(connectionId, database, collection, id, routing);
 }
 
-export async function documentDeleteDocument(connectionId: string, database: string, collection: string, id: string, routing?: string): Promise<number> {
+export async function documentDeleteDocument(connectionId: string, database: string, collection: string, id: string, routing?: string, documentType?: string): Promise<number> {
   return post("/api/document-store/delete-document", {
     connectionId,
     database,
     collection,
     id,
     routing,
+    documentType,
   });
 }
 
@@ -3209,6 +3761,7 @@ export async function checkMcpServerStatus(): Promise<import("@/lib/backend/taur
     bin_path: null,
     native_bin_path: null,
     script_path: null,
+    data_dir: null,
     install_command: "npm install -g @dbx-app/mcp-server@latest --registry=https://registry.npmjs.org",
     update_command: "npm install -g @dbx-app/mcp-server@latest --registry=https://registry.npmjs.org",
     error: "MCP Server status is only available in the desktop app.",
@@ -3226,6 +3779,8 @@ export async function getSystemProxyUrl(): Promise<string | null> {
 export async function downloadUpdate(_source: UpdateDownloadSource, _latestVersion?: string): Promise<void> {
   throw new Error("In-app update downloads are only available in the desktop app.");
 }
+
+export async function cancelUpdateDownload(): Promise<void> {}
 
 export async function installDownloadedUpdate(): Promise<void> {
   throw new Error("In-app update installation is only available in the desktop app.");
@@ -3264,3 +3819,4 @@ export async function refreshConnections(): Promise<void> {
 }
 
 export * from "@/lib/backend/mq-http";
+export * from "@/lib/backend/mqtt-http";

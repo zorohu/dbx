@@ -18,6 +18,7 @@ import {
   Eraser,
   Eye,
   FileCode,
+  Info,
   GripVertical,
   KeyRound,
   LayoutGrid,
@@ -44,6 +45,7 @@ import {
   Trash2,
   WrapText,
   X,
+  Wrench,
 } from "@lucide/vue";
 import { useI18n } from "vue-i18n";
 import i18n from "@/i18n";
@@ -54,6 +56,7 @@ import { SearchableSelect } from "@/components/ui/searchable-select";
 import CustomContextMenu, { type ContextMenuItem } from "@/components/ui/CustomContextMenu.vue";
 import DangerConfirmDialog from "@/components/editor/DangerConfirmDialog.vue";
 import ProcedureExecutionDialog from "@/components/objects/ProcedureExecutionDialog.vue";
+import CustomTypeInfoPanel from "@/components/objects/CustomTypeInfoPanel.vue";
 import XlsxHeaderDialog from "@/components/export/XlsxHeaderDialog.vue";
 import * as api from "@/lib/backend/api";
 import type { ColumnInfo, ConnectionConfig, ForeignKeyInfo, IndexInfo, ObjectBrowserViewMode, ObjectBrowserViewport, ObjectInfo, ObjectSourceKind, ObjectStatistics, TableInfoTab, TreeNode, TriggerInfo } from "@/types/database";
@@ -66,11 +69,10 @@ import { buildTableSelectSql } from "@/lib/table/tableSelectSql";
 import {
   buildDropObjectSql,
   buildDropTableSql,
-  buildDuplicateTableStructureSql,
+  buildDuplicateTableStructurePlan as buildSharedDuplicateTableStructurePlan,
   buildCopyTableDataSql,
   buildEmptyTableSql,
   buildTruncateTableSql,
-  collectDuplicateTableColumnComments,
   supportsDropTableCascade,
   supportsTruncateTableCascade,
   type TableAdminSqlOptions,
@@ -82,7 +84,6 @@ import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { generateDatabaseExportId } from "@/lib/export/databaseExport";
 import { copyToClipboard, eventTargetAllowsAppClipboardShortcut } from "@/lib/common/clipboard";
 import { defaultPasteTableMode, pasteTableModeCopiesData, supportsWholeRowTableDataCopy, tableClipboardMatchesTarget, tableClipboardMenuState, tableClipboardSourceContext, tableDataCopyColumnOptions, type PasteTableMode, type TableClipboardContext } from "@/lib/table/tableClipboard";
-import { formatSqlInsert } from "@/lib/export/exportFormats";
 import { buildSingleDdlExportFileContent } from "@/lib/export/ddlExport";
 import { fetchTableDataForExport } from "@/lib/table/tableDataExport";
 import { useConnectionStore } from "@/stores/connectionStore";
@@ -94,6 +95,7 @@ import QueryEditor from "@/components/editor/QueryEditor.vue";
 import { sqlFormatDialectForDbType, type SqlFormatDialect } from "@/lib/sql/sqlFormatter";
 import { isCancelSearchShortcut } from "@/lib/editor/keyboardShortcuts";
 import { executeWithProductionSqlGuard } from "@/lib/database/productionExecutionGuard";
+import { buildXuguCompileSql } from "@/lib/database/xuguCompileSql";
 import { formatShortcut } from "@/lib/editor/shortcutRegistry";
 import { batchTableEmptyFeedback, buildBatchTableEmptyPlan, runBatchTableEmpty, type BatchTableEmptyPlanItem } from "@/lib/sidebar/batchTableEmpty";
 import { runBatchTableDrop } from "@/lib/table/batchTableDrop";
@@ -118,6 +120,7 @@ import {
   type ObjectBrowserSortKey,
 } from "@/lib/table/objectBrowserRows";
 import { isSourceOnlyObjectBrowserRow, resolveRowClickAction, shouldDeferSingleClick, type ObjectBrowserRowAction } from "@/lib/table/objectBrowserRowAction";
+import { customTypeCapabilities, supportsTypeObjectSource } from "@/lib/database/databaseObjectCapabilities";
 import { filterObjectBrowserTableColumns } from "@/lib/table/objectBrowserTableInfo";
 import { createSidePanelRequestGuard } from "@/lib/table/sidePanelRequestGuard";
 import { runBatchTableTruncate } from "@/lib/table/batchTableTruncate";
@@ -173,7 +176,7 @@ const sourceCanEdit = ref(true);
 // --- Right-side panel state ---
 // Unified panel: either "table-info" (for tables) or "source" (for views/procedures/etc.)
 const sidePanelRow = ref<ObjectBrowserRow | null>(null);
-const sidePanelMode = ref<"table-info" | "source">("source");
+const sidePanelMode = ref<"table-info" | "source" | "type-info">("source");
 // Table info panel state
 const tableInfoTab = ref<TableInfoTab>("ddl");
 const tableColumns = ref<ColumnInfo[]>([]);
@@ -196,8 +199,11 @@ let sidePanelResizeStartX = 0;
 let sidePanelResizeStartWidth = 0;
 const isResizingSidePanel = ref(false);
 const sidePanelGuard = createSidePanelRequestGuard();
+const sidePanelRef = ref<InstanceType<typeof CustomTypeInfoPanel> | null>(null);
 const tableMetadataCapabilities = computed<TableMetadataCapabilities>(() => getTableMetadataCapabilities(effectiveDatabaseType.value));
 const effectiveDatabaseType = computed(() => effectiveDatabaseTypeForConnection(props.connection) ?? props.connection.db_type);
+const isVictoriaMetrics = computed(() => effectiveDatabaseType.value === "victoriametrics");
+const objectRowsLabel = computed(() => t(isVictoriaMetrics.value ? "objects.series" : "objects.rows"));
 const tableStructureDatabaseType = computed(() => tableStructureDatabaseTypeForConnection(props.connection) ?? props.connection.db_type);
 const sourceEditableText = ref("");
 const sourceDraft = ref("");
@@ -241,7 +247,7 @@ const batchEmptyPlan = ref<BatchTableEmptyPlanItem<ObjectBrowserRow>[]>([]);
 // Paste table dialog state
 const showPasteDialog = ref(false);
 const pasteTableMode = ref<PasteTableMode>("structure-and-data");
-const pasteTableEntries = ref<{ sourceName: string; targetName: string; schema?: string }[]>([]);
+const pasteTableEntries = ref<{ sourceName: string; targetName: string; schema?: string; tableComment?: string | null }[]>([]);
 const pasteTableDataCopySupported = computed(() => supportsWholeRowTableDataCopy(effectiveDatabaseType.value));
 const objectColumnWidths = ref<Record<ObjectBrowserColumnKey, number>>({
   select: 34,
@@ -258,7 +264,7 @@ let stopColumnResize: (() => void) | null = null;
 let preserveObjectFilterScrollOnce = false;
 
 // Export via background tracker
-const { addTask: addExportTask } = useExportTracker();
+const { addTask: addExportTask, updateTableExportTask } = useExportTracker();
 
 const needsSchema = computed(() => isSchemaAware(props.connection.db_type) && !connectionUsesDatabaseObjectTreeMode(props.connection));
 const canDropTargetCascade = computed(() => dropTarget.value?.type === "TABLE" && supportsDropTableCascade(effectiveDatabaseType.value));
@@ -438,7 +444,8 @@ function toggleCheckboxColumn() {
 const objectBrowserColumns = computed<ObjectBrowserColumnKey[]>(() => {
   const columns: ObjectBrowserColumnKey[] = [];
   if (showCheckboxColumn.value) columns.push("select");
-  columns.push("name", "type", "estimatedRows", "totalBytes");
+  columns.push("name", "type", "estimatedRows");
+  if (!isVictoriaMetrics.value) columns.push("totalBytes");
   if (hasCreatedAt.value) columns.push("created_at");
   if (hasUpdatedAt.value) columns.push("updated_at");
   columns.push("comment");
@@ -600,7 +607,8 @@ function toggleSort(key: ObjectBrowserSortKey) {
 }
 
 const sortKeyOptions = computed<ObjectBrowserSortKey[]>(() => {
-  const options: ObjectBrowserSortKey[] = ["name", "type", "estimatedRows", "totalBytes"];
+  const options: ObjectBrowserSortKey[] = ["name", "type", "estimatedRows"];
+  if (!isVictoriaMetrics.value) options.push("totalBytes");
   if (hasCreatedAt.value) options.push("created_at");
   if (hasUpdatedAt.value) options.push("updated_at");
   options.push("comment");
@@ -617,7 +625,7 @@ watch(sortKeyOptions, (options) => {
 function sortKeyLabel(key: ObjectBrowserSortKey): string {
   if (key === "name") return t("objects.name");
   if (key === "type") return t("objects.type");
-  if (key === "estimatedRows") return t("objects.rows");
+  if (key === "estimatedRows") return objectRowsLabel.value;
   if (key === "totalBytes") return t("objects.size");
   if (key === "created_at") return t("objects.createdAt");
   if (key === "updated_at") return t("objects.updatedAt");
@@ -818,6 +826,9 @@ function executeRowAction(row: ObjectBrowserRow, action: ObjectBrowserRowAction)
     case "table-info":
       void openTableInfo(row);
       break;
+    case "type-info":
+      void openTypeInfo(row);
+      break;
     case "open-table":
       emit("openTable", { tableName: row.name, schema: row.schema, catalog: props.catalog });
       break;
@@ -829,7 +840,7 @@ function executeRowAction(row: ObjectBrowserRow, action: ObjectBrowserRowAction)
 
 function onRowClick(row: ObjectBrowserRow, event: MouseEvent) {
   const activation = settingsStore.editorSettings.sidebarActivation;
-  const { action, isDouble } = resolveRowClickAction(row, event.detail, activation);
+  const { action, isDouble } = resolveRowClickAction(row, event.detail, activation, effectiveDatabaseType.value);
   // Double click: cancel any pending single-click and fire immediately
   if (isDouble) {
     if (singleClickTimer) {
@@ -927,8 +938,8 @@ async function openTableInfo(row: ObjectBrowserRow, initialTab?: TableInfoTab) {
   tableForeignKeys.value = [];
   tableTriggers.value = [];
   tableInfoSearchQuery.value = "";
-  // Determine initial tab: explicit request > first available > ddl
-  const firstTab = initialTab ?? tableInfoTabs.value[0]?.id ?? "ddl";
+  // Determine initial tab: explicit request > previously activated
+  const firstTab = initialTab ?? tableInfoTab.value;
   await selectTableInfoTab(firstTab);
 }
 
@@ -1034,6 +1045,28 @@ async function fetchTableTriggers() {
   }
 }
 
+async function refreshActiveTableInfo() {
+  if (sidePanelMode.value !== "table-info" || !sidePanelRow.value) return;
+  sidePanelGuard.bump();
+
+  if (tableInfoTab.value === "ddl") {
+    tableDdlContent.value = "";
+    await fetchTableDdl();
+  } else if (tableInfoTab.value === "columns") {
+    tableColumns.value = [];
+    await fetchTableColumns();
+  } else if (tableInfoTab.value === "indexes") {
+    tableIndexes.value = [];
+    await fetchTableIndexes();
+  } else if (tableInfoTab.value === "foreignKeys") {
+    tableForeignKeys.value = [];
+    await fetchTableForeignKeys();
+  } else if (tableInfoTab.value === "triggers") {
+    tableTriggers.value = [];
+    await fetchTableTriggers();
+  }
+}
+
 function copyTableDdl() {
   void copyToClipboard(tableDdlContent.value);
   toast(t("grid.copyDdl"), 2000);
@@ -1079,6 +1112,28 @@ function closeSidePanel() {
   sidePanelRow.value = null;
   sidePanelMode.value = "source";
   sidePanelGuard.bump();
+}
+
+async function openTypeInfo(row: ObjectBrowserRow) {
+  if (sidePanelRow.value?.id === row.id && sidePanelMode.value === "type-info") {
+    closeSidePanel();
+    return;
+  }
+  sidePanelRow.value = row;
+  sidePanelMode.value = "type-info";
+  sidePanelGuard.bump();
+}
+
+function openTypeDdl(row: ObjectBrowserRow) {
+  sidePanelRow.value = row;
+  sidePanelMode.value = "type-info";
+  sidePanelGuard.bump();
+  // DDL tab is selected by the panel once details load; switching the tab is
+  // deferred via a dedicated request so the panel can focus it.
+  nextTick(() => {
+    const panel = sidePanelRef.value;
+    panel?.selectTab("ddl");
+  });
 }
 
 const canOpenTableStructureEditor = computed(() => sidePanelRow.value?.type === "TABLE" && canOpenStructureEditor.value);
@@ -1150,6 +1205,7 @@ async function openNewQuery(row: ObjectBrowserRow) {
     tabId,
     await buildTableSelectSql({
       databaseType: effectiveDatabaseType.value,
+      driverProfile: props.connection.driver_profile,
       identifierQuote: connectionStore.connectionIdentifierQuote?.(props.connection.id),
       catalog: props.catalog,
       database: props.database,
@@ -1726,11 +1782,10 @@ function tableDdlObjectType(type: ObjectBrowserRow["type"]): ObjectSourceKind | 
   return undefined;
 }
 
-async function exportDataLegacy(row: ObjectBrowserRow, format: "json" | "sql") {
+async function exportDataLegacy(row: ObjectBrowserRow, format: "json") {
   try {
     const schema = row.schema || selectedSchema.value;
-    const tableColumns = format === "sql" ? await api.getColumns(props.connection.id, props.database, schema || props.database, row.name, props.catalog) : undefined;
-    const queryColumns = props.connection.db_type === "neo4j" ? (tableColumns ?? (await api.getColumns(props.connection.id, props.database, schema || props.database, row.name, props.catalog))).map((column) => column.name) : undefined;
+    const queryColumns = props.connection.db_type === "neo4j" ? (await api.getColumns(props.connection.id, props.database, schema || props.database, row.name, props.catalog)).map((column) => column.name) : undefined;
     const result = await fetchTableDataForExport({
       databaseType: effectiveDatabaseType.value,
       identifierQuote: connectionStore.connectionIdentifierQuote?.(props.connection.id),
@@ -1753,35 +1808,15 @@ async function exportDataLegacy(row: ObjectBrowserRow, format: "json" | "sql") {
       }
       await api.exportQueryResultJson(outputPath, result.columns, result.rows);
       toast(t("grid.exported"));
-      return;
     }
-
-    const content = await formatSqlInsert({
-      databaseType: effectiveDatabaseType.value,
-      schema,
-      tableName: row.name,
-      columns: result.columns,
-      columnTypes: tableColumns ? columnTypesForResultColumns(result.columns, tableColumns) : undefined,
-      rows: result.rows,
-    });
-    await saveFileContent(content, `${row.name}.sql`, "SQL", "sql");
-    toast(t("grid.exported"));
   } catch (e: any) {
     toast(t("grid.exportFailed", { message: e?.message || String(e) }), 5000);
   }
 }
 
-function columnTypesForResultColumns(columns: string[], tableColumns: Array<{ name: string; data_type: string }>): Array<string | undefined> {
-  const typesByName = new Map(tableColumns.map((column) => [column.name.toLocaleLowerCase(), column.data_type]));
-  return columns.map((column) => typesByName.get(column.toLocaleLowerCase()));
-}
-
 async function exportData(row: ObjectBrowserRow, format: "csv" | "json" | "sql") {
-  if (format === "csv") {
-    await exportTableData(row, "csv");
-    return;
-  }
-  await exportDataLegacy(row, format);
+  if (format === "json") await exportDataLegacy(row, format);
+  else await exportTableData(row, format);
 }
 
 function showObjectBrowserXlsxHeaderDialog(hasComments: boolean): Promise<boolean | null> {
@@ -1827,7 +1862,7 @@ async function exportDataXlsx(row: ObjectBrowserRow) {
   await exportTableData(row, "xlsx", columnInfos, useCommentHeader);
 }
 
-async function exportTableData(row: ObjectBrowserRow, format: "csv" | "xlsx", columnInfos?: ColumnInfo[], useCommentHeader = false) {
+async function exportTableData(row: ObjectBrowserRow, format: "csv" | "xlsx" | "sql", columnInfos?: ColumnInfo[], useCommentHeader = false) {
   const schema = row.schema || selectedSchema.value;
 
   // Save dialog first
@@ -1837,7 +1872,7 @@ async function exportTableData(row: ObjectBrowserRow, format: "csv" | "xlsx", co
   if (isTauriRuntime()) {
     try {
       const { save } = await import("@tauri-apps/plugin-dialog");
-      const filter = format === "csv" ? { name: "CSV", extensions: ["csv"] } : { name: "Excel", extensions: ["xlsx"] };
+      const filter = format === "csv" ? { name: "CSV", extensions: ["csv"] } : format === "xlsx" ? { name: "Excel", extensions: ["xlsx"] } : { name: "SQL", extensions: ["sql"] };
       const path = await save({
         defaultPath: defaultName,
         filters: [filter],
@@ -1855,6 +1890,22 @@ async function exportTableData(row: ObjectBrowserRow, format: "csv" | "xlsx", co
 
   let task: ExportTask | null = null;
   try {
+    if (isVictoriaMetrics.value) {
+      const result = await fetchTableDataForExport({
+        databaseType: effectiveDatabaseType.value,
+        schema,
+        tableName: row.name,
+        executePage: (sql) => api.executeQuery(props.connection.id, props.database, sql),
+      });
+      if (format === "csv") {
+        await api.exportQueryResultCsv(filePath, result.columns, result.rows);
+      } else {
+        const comments = useCommentHeader ? result.columns.map((name) => columnInfos?.find((column) => column.name.toLocaleLowerCase() === name.toLocaleLowerCase())?.comment ?? null) : undefined;
+        await api.exportQueryResultXlsx(filePath, row.name, result.columns, result.column_types ?? result.columns.map(() => ""), comments, result.rows);
+      }
+      toast(t("grid.exported"));
+      return;
+    }
     let columns: string[] | undefined;
     let columnComments: (string | null)[] | undefined;
 
@@ -1876,20 +1927,19 @@ async function exportTableData(row: ObjectBrowserRow, format: "csv" | "xlsx", co
       connectionId: props.connection.id,
       database: props.database,
       schema,
+      identifierQuote: connectionStore.connectionIdentifierQuote(props.connection.id),
       tableName: row.name,
       filePath,
       format,
       columns,
       columnComments: format === "xlsx" ? columnComments : undefined,
       batchSize: settingsStore.editorSettings.exportBatchSize,
+      skipCount: format === "sql",
       rowLimit,
     };
 
     const terminalProgress = await api.startTableExport(request, (progress) => {
-      currentTask.rowsExported = progress.rowsExported;
-      currentTask.totalRows = progress.totalRows;
-      currentTask.status = progress.status;
-      currentTask.errorMessage = progress.errorMessage || null;
+      updateTableExportTask(currentTask.exportId, progress);
     });
     if (terminalProgress.status === "Done") {
       toast(t("grid.exported"));
@@ -1909,24 +1959,18 @@ function requestDuplicateStructure(row: ObjectBrowserRow) {
   showDuplicateDialog.value = true;
 }
 
-async function buildDuplicateStructurePlan(sourceName: string, targetName: string, schema: string | undefined, sourceColumns?: ColumnInfo[]) {
-  let columns = sourceColumns;
-  if (effectiveDatabaseType.value === "dameng" && !columns) {
-    try {
-      columns = await api.getColumns(props.connection.id, props.database, schema || "", sourceName, props.catalog);
-    } catch (error) {
-      console.warn(`Failed to load Dameng column comments for table clone: ${sourceName}`, error);
-    }
-  }
-  const columnComments = effectiveDatabaseType.value === "dameng" ? collectDuplicateTableColumnComments(columns ?? []) : [];
-  const sql = await buildDuplicateTableStructureSql({
+async function buildDuplicateStructurePlan(sourceName: string, targetName: string, schema: string | undefined, tableComment?: string | null, sourceColumns?: ColumnInfo[]) {
+  return buildSharedDuplicateTableStructurePlan({
+    connectionId: props.connection.id,
+    database: props.database,
+    catalog: props.catalog,
     databaseType: effectiveDatabaseType.value,
     schema,
     sourceName,
     targetName,
-    columnComments,
+    tableComment,
+    sourceColumns,
   });
-  return { sql, sourceColumns: columns, executeAsScript: columnComments.length > 0 };
 }
 
 function executeDuplicateStructurePlan(plan: { sql: string; executeAsScript: boolean }, schema: string | undefined) {
@@ -1940,7 +1984,7 @@ async function confirmDuplicateStructure() {
   showDuplicateDialog.value = false;
   try {
     const schema = row.schema || selectedSchema.value;
-    const plan = await buildDuplicateStructurePlan(row.name, newName, schema);
+    const plan = await buildDuplicateStructurePlan(row.name, newName, schema, row.comment);
     const executed = await executeObjectBrowserSqlWithProductionGuard(plan.sql, () => executeDuplicateStructurePlan(plan, schema));
     if (!executed) return;
     toast(t("contextMenu.duplicateStructureSuccess", { name: newName }));
@@ -1961,13 +2005,14 @@ function copySelectedTablesToClipboard() {
       database: props.database,
       schema: normalizeObjectBrowserTableClipboardSchema(row.schema || selectedSchema.value),
       tableName: row.name,
+      tableComment: row.comment,
     })),
   };
   toast(t("contextMenu.pasteTableClipboardUpdated"), 2000);
 }
 
 function canPasteTableClipboard(): boolean {
-  return tableClipboardMatchesTarget(normalizedObjectBrowserTableClipboardEntries(), pasteTableTargetContext());
+  return !isVictoriaMetrics.value && tableClipboardMatchesTarget(normalizedObjectBrowserTableClipboardEntries(), pasteTableTargetContext());
 }
 
 function normalizedObjectBrowserTableClipboardEntries() {
@@ -1980,6 +2025,7 @@ function normalizedObjectBrowserTableClipboardEntries() {
 }
 
 function canTransferTableClipboard(): boolean {
+  if (isVictoriaMetrics.value) return false;
   const entries = normalizedObjectBrowserTableClipboardEntries();
   const target = pasteTableTargetContext();
   if (entries.length === 0 || props.connection.read_only) return false;
@@ -2030,6 +2076,7 @@ function copySingleTableToClipboard(row: ObjectBrowserRow) {
         database: props.database,
         schema: normalizeObjectBrowserTableClipboardSchema(row.schema || selectedSchema.value),
         tableName: row.name,
+        tableComment: row.comment,
       },
     ],
   };
@@ -2051,6 +2098,7 @@ function openPasteTableDialog() {
     sourceName: entry.tableName,
     targetName: `${entry.tableName}_copy`,
     schema: normalizeObjectBrowserTableClipboardSchema(entry.schema, entry.database, entry.connectionId),
+    tableComment: entry.tableComment,
   }));
   showPasteDialog.value = true;
 }
@@ -2089,7 +2137,7 @@ async function confirmPasteTable() {
     try {
       let sourceColumns: ColumnInfo[] | undefined;
       if (mode === "structure-and-data" || mode === "structure-only") {
-        const plan = await buildDuplicateStructurePlan(entry.sourceName, targetName, schema, sourceColumns);
+        const plan = await buildDuplicateStructurePlan(entry.sourceName, targetName, schema, entry.tableComment, sourceColumns);
         sourceColumns = plan.sourceColumns;
         const executed = await executeObjectBrowserSqlWithProductionGuard(plan.sql, () => executeDuplicateStructurePlan(plan, schema));
         if (!executed) {
@@ -2109,6 +2157,7 @@ async function confirmPasteTable() {
           schema,
           sourceName: entry.sourceName,
           targetName,
+          normalizeNewTargetName: mode === "structure-and-data",
           ...dataCopyColumnOptions,
         });
         const executed = await executeObjectBrowserSqlWithProductionGuard(dataSql, () => api.executeQuery(props.connection.id, props.database, dataSql, schema));
@@ -2131,7 +2180,7 @@ async function confirmPasteTable() {
         await connectionStore.refreshObjectListTreeNode(props.connection.id, props.database, selectedSchema.value);
         toast(t("contextMenu.pasteTableCancelledAfterPartial"), 5000);
       } catch (e: any) {
-        toast(t("contextMenu.pasteTableRefreshFailed", { message: translateBackendError(t, e?.message || String(e)) }), 5000);
+        toast(t("contextMenu.pasteTableRefreshFailed", { message: translateBackendError(t, e) }), 5000);
       }
     }
     return;
@@ -2171,6 +2220,21 @@ async function executeObjectBrowserSqlWithProductionGuard<T>(sql: string, execut
     source: t("production.sourceObjectBrowser"),
     execute,
   });
+}
+
+async function compileXuguObject(row: ObjectBrowserRow) {
+  if (effectiveDatabaseType.value !== "xugu") return;
+  const sql = buildXuguCompileSql({ objectType: row.type, schema: row.schema || selectedSchema.value, name: row.name });
+  if (!sql) return;
+  try {
+    const executed = await executeObjectBrowserSqlWithProductionGuard(sql, () => api.executeQuery(props.connection.id, props.database, sql, row.schema || selectedSchema.value));
+    if (!executed) return;
+    toast(t("contextMenu.compileObjectSuccess", { name: row.name }));
+    await reload();
+    await connectionStore.refreshObjectListTreeNode(props.connection.id, props.database, row.schema || selectedSchema.value);
+  } catch (e: any) {
+    toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), 5000);
+  }
 }
 
 async function refreshTruncatePreviewSql(row: ObjectBrowserRow) {
@@ -2398,7 +2462,7 @@ async function loadObjects(options?: { allowCached?: boolean }) {
     void loadObjectStatistics(request, cacheWriteToken, cachedAt);
   } catch (e: any) {
     if (!objectBrowserRowsLoadGuard.isCurrent(request)) return;
-    error.value = e?.message || String(e);
+    error.value = translateBackendError(t, e);
   } finally {
     if (objectBrowserRowsLoadGuard.isCurrent(request)) finishObjectBrowserRowsLoad();
   }
@@ -2447,6 +2511,7 @@ async function reload(options?: { allowCachedObjects?: boolean; contextEpoch?: n
 
 function refresh(): boolean {
   void reload();
+  void refreshActiveTableInfo();
   return true;
 }
 
@@ -2542,15 +2607,16 @@ watch(
 // ---- CustomContextMenu helpers ----
 
 function exportDataSubmenu(item: ObjectBrowserRow): ContextMenuItem {
+  const formats: ContextMenuItem[] = [
+    { label: "CSV", action: () => exportData(item, "csv") },
+    { label: "JSON", action: () => exportData(item, "json") },
+  ];
+  if (!isVictoriaMetrics.value) formats.push({ label: "SQL INSERT", action: () => exportData(item, "sql") });
+  formats.push({ label: "XLSX", action: () => exportDataXlsx(item) });
   return {
     label: t("contextMenu.exportData"),
     icon: Upload,
-    children: [
-      { label: "CSV", action: () => exportData(item, "csv") },
-      { label: "JSON", action: () => exportData(item, "json") },
-      { label: "SQL INSERT", action: () => exportData(item, "sql") },
-      { label: "XLSX", action: () => exportDataXlsx(item) },
-    ],
+    children: formats,
   };
 }
 
@@ -2568,6 +2634,7 @@ function objectBrowserTableClipboardMenuState(item: ObjectBrowserRow) {
 }
 
 function tableClipboardMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
+  if (isVictoriaMetrics.value) return [];
   const copyItem: ContextMenuItem = { label: t("contextMenu.copyTable"), action: () => copySingleTableToClipboard(item), icon: Copy };
   const state = objectBrowserTableClipboardMenuState(item);
   if (state === "copy") return [copyItem];
@@ -2584,6 +2651,16 @@ function selectedBatchTableCountLabel(key: "batchDrop" | "batchTruncate" | "batc
 }
 
 function getTableMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
+  if (isVictoriaMetrics.value) {
+    return [
+      { label: t("contextMenu.viewData"), action: () => openViewData(item), icon: Table2 },
+      { label: t("contextMenu.newQuery"), action: () => openNewQuery(item), icon: TerminalSquare },
+      { label: "", separator: true },
+      exportDataSubmenu(item),
+      { label: "", separator: true },
+      { label: t("contextMenu.copyName"), action: () => copyName(item), icon: Copy },
+    ];
+  }
   const useBatchActions = isSelectedBatchTableContext(item);
   return [
     { label: t("contextMenu.viewData"), action: () => openViewData(item), icon: Table2 },
@@ -2665,6 +2742,7 @@ function getViewMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
 function getProcFuncMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
   return [
     ...(item.type === "PROCEDURE" ? [{ label: t("contextMenu.executeProcedure"), action: () => openProcedureExecution(item), icon: Play }] : []),
+    ...(effectiveDatabaseType.value === "xugu" && buildXuguCompileSql({ objectType: item.type, schema: item.schema || selectedSchema.value, name: item.name }) ? [{ label: t("contextMenu.compileObject"), action: () => compileXuguObject(item), icon: Wrench }] : []),
     { label: t("contextMenu.viewSource"), action: () => openSource(item), icon: Code2 },
     ...(canRename(item) ? [{ label: t("contextMenu.renameObject"), action: () => requestRename(item), icon: Pencil }] : []),
     { label: "", separator: true },
@@ -2681,15 +2759,39 @@ function getProcFuncMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
 
 function getPackageMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
   return [
+    ...(effectiveDatabaseType.value === "xugu" && buildXuguCompileSql({ objectType: item.type, schema: item.schema || selectedSchema.value, name: item.name }) ? [{ label: t("contextMenu.compileObject"), action: () => compileXuguObject(item), icon: Wrench }] : []),
     { label: t("contextMenu.viewSource"), action: () => openSource(item), icon: Code2 },
     { label: "", separator: true },
     { label: t("contextMenu.copyName"), action: () => copyName(item), icon: Copy },
   ];
 }
 
+function getTypeMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
+  const items: ContextMenuItem[] = [];
+  const capabilities = customTypeCapabilities(effectiveDatabaseType.value);
+  // Verified PG-family types open the read-only details panel; Xugu keeps its
+  // “view source” entry for TYPE/TYPE_BODY rows.
+  if (supportsTypeObjectSource(effectiveDatabaseType.value)) {
+    items.push({ label: t("contextMenu.viewSource"), action: () => openSource(item), icon: Code2 });
+  }
+  if (capabilities.details) {
+    items.push({ label: t("contextMenu.viewDetails"), action: () => void openTypeInfo(item), icon: Info });
+    if (capabilities.ddl) {
+      items.push({ label: t("contextMenu.viewDdl"), action: () => openTypeDdl(item), icon: FileCode });
+    }
+  }
+  // Only separate when an action precedes copy-name.
+  if (items.length > 0) {
+    items.push({ label: "", separator: true });
+  }
+  items.push({ label: t("contextMenu.copyName"), action: () => copyName(item), icon: Copy });
+  return items;
+}
+
 function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
   if (item.type === "TABLE") return getTableMenuItems(item);
   if (item.type === "VIEW" || item.type === "MATERIALIZED_VIEW") return getViewMenuItems(item);
+  if (item.type === "TYPE" || item.type === "TYPE_BODY") return getTypeMenuItems(item);
   if (isSourceOnlyObjectBrowserRow(item)) return getPackageMenuItems(item);
   return getProcFuncMenuItems(item);
 }
@@ -2771,7 +2873,7 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
         <CheckSquare v-if="settingsStore.editorSettings.objectBrowserShowCheckbox" class="h-3.5 w-3.5" />
         <Square v-else class="h-3.5 w-3.5" />
       </Button>
-      <Button variant="ghost" size="icon" class="h-7 w-7" :title="refreshTooltip" :disabled="loadingObjects" @click="reload">
+      <Button variant="ghost" size="icon" class="h-7 w-7" :title="refreshTooltip" :disabled="loadingObjects" @click="refresh">
         <RefreshCw class="h-3.5 w-3.5" :class="{ 'animate-spin': loadingObjects }" />
       </Button>
       <Button v-if="canPasteTableClipboard()" variant="ghost" size="sm" class="h-7 px-2 text-xs" @click="openPasteTableDialog">
@@ -2783,23 +2885,23 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
       <div class="min-w-0 flex-1 truncate text-muted-foreground">
         {{ t("objects.selectedTables", { count: selectedTableCount }) }}
       </div>
-      <Button variant="ghost" size="sm" class="h-7 px-2 text-xs" @click="openBatchDatabaseExport">
+      <Button v-if="!isVictoriaMetrics" variant="ghost" size="sm" class="h-7 px-2 text-xs" @click="openBatchDatabaseExport">
         <Upload class="mr-1.5 h-3.5 w-3.5" />
         {{ t("objects.exportSelected") }}
       </Button>
-      <Button variant="ghost" size="sm" class="h-7 px-2 text-xs" @click="copySelectedTablesToClipboard">
+      <Button v-if="!isVictoriaMetrics" variant="ghost" size="sm" class="h-7 px-2 text-xs" @click="copySelectedTablesToClipboard">
         <Clipboard class="mr-1.5 h-3.5 w-3.5" />
         {{ t("objects.copyTableSelected") }}
       </Button>
-      <Button v-if="supportsTruncateTable" variant="ghost" size="sm" class="h-7 px-2 text-xs text-destructive" @click="requestBatchTruncateTables">
+      <Button v-if="!isVictoriaMetrics && supportsTruncateTable" variant="ghost" size="sm" class="h-7 px-2 text-xs text-destructive" @click="requestBatchTruncateTables">
         <Scissors class="mr-1.5 h-3.5 w-3.5" />
         {{ t("objects.truncateSelected") }}
       </Button>
-      <Button variant="ghost" size="sm" class="h-7 px-2 text-xs text-destructive" @click="requestBatchEmptyTables">
+      <Button v-if="!isVictoriaMetrics" variant="ghost" size="sm" class="h-7 px-2 text-xs text-destructive" @click="requestBatchEmptyTables">
         <Eraser class="mr-1.5 h-3.5 w-3.5" />
         {{ t("contextMenu.batchEmpty", { count: selectedTableCount }) }}
       </Button>
-      <Button variant="ghost" size="sm" class="h-7 px-2 text-xs text-destructive" @click="requestBatchDropTables">
+      <Button v-if="!isVictoriaMetrics" variant="ghost" size="sm" class="h-7 px-2 text-xs text-destructive" @click="requestBatchDropTables">
         <Trash2 class="mr-1.5 h-3.5 w-3.5" />
         {{ t("objects.dropSelected") }}
       </Button>
@@ -2852,7 +2954,7 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
             </div>
             <div class="relative flex min-w-0 items-center">
               <button class="flex min-w-0 items-center gap-1 truncate pr-4 text-left" type="button" :title="t('objects.statisticsHint')" @click="toggleSort('estimatedRows')">
-                <span class="truncate">{{ t("objects.rows") }}</span>
+                <span class="truncate">{{ objectRowsLabel }}</span>
                 <component :is="sortIconFor('estimatedRows')" v-if="sortIconFor('estimatedRows')" class="h-3 w-3 shrink-0" />
               </button>
               <div
@@ -2863,7 +2965,7 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
                 <GripVertical class="h-3 w-3" />
               </div>
             </div>
-            <div class="relative flex min-w-0 items-center">
+            <div v-if="!isVictoriaMetrics" class="relative flex min-w-0 items-center">
               <button class="flex min-w-0 items-center gap-1 truncate pr-4 text-left" type="button" :title="t('objects.statisticsHint')" @click="toggleSort('totalBytes')">
                 <span class="truncate">{{ t("objects.size") }}</span>
                 <component :is="sortIconFor('totalBytes')" v-if="sortIconFor('totalBytes')" class="h-3 w-3 shrink-0" />
@@ -2920,7 +3022,7 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
             <template #default="{ item }">
               <CustomContextMenu :items="() => getObjectBrowserMenuItems(item)" v-slot="{ onContextMenu }">
                 <div
-                  class="grid h-[34px] cursor-pointer items-center gap-3 border-b px-3 hover:bg-accent/50"
+                  class="grid h-[34px] cursor-default items-center gap-3 border-b px-3 hover:bg-accent/50"
                   :class="{
                     'bg-accent/40': sourceRow?.id === item.id,
                     'bg-primary/10': sidePanelRow?.id === item.id && !selectedTableIds.has(item.id),
@@ -2956,7 +3058,7 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
                   <div class="truncate text-xs tabular-nums text-muted-foreground" :title="item.estimatedRows == null ? '' : formatObjectBrowserCount(item.estimatedRows)">
                     {{ formatObjectBrowserCount(item.estimatedRows) }}
                   </div>
-                  <div class="truncate text-xs tabular-nums text-muted-foreground" :title="item.totalBytes == null ? '' : formatObjectBrowserBytes(item.totalBytes)">
+                  <div v-if="!isVictoriaMetrics" class="truncate text-xs tabular-nums text-muted-foreground" :title="item.totalBytes == null ? '' : formatObjectBrowserBytes(item.totalBytes)">
                     {{ formatObjectBrowserBytes(item.totalBytes) }}
                   </div>
                   <div v-if="hasCreatedAt" class="truncate text-xs tabular-nums text-muted-foreground" :title="formatObjectBrowserTimestamp(item.created_at)">
@@ -2979,7 +3081,7 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
               <div class="object-browser-grid-row" :style="{ gridTemplateColumns: `repeat(${gridColumns}, minmax(0, 1fr))`, height: `${objectGridRowHeight - OBJECT_GRID_GAP}px` }">
                 <CustomContextMenu v-for="item in row.cards" :key="item.id" :items="() => getObjectBrowserMenuItems(item)" v-slot="{ onContextMenu }">
                   <div
-                    class="relative flex h-full min-h-0 cursor-pointer flex-col items-center gap-1 rounded-lg border bg-card p-3 text-center transition-all hover:border-primary/40 hover:shadow-sm"
+                    class="relative flex h-full min-h-0 cursor-default flex-col items-center gap-1 rounded-lg border bg-card p-3 text-center transition-all hover:border-primary/40 hover:shadow-sm"
                     :class="{
                       'border-primary bg-primary/5': selectedTableIds.has(item.id),
                       'border-primary/60': sourceRow?.id === item.id && !selectedTableIds.has(item.id),
@@ -3002,7 +3104,9 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
                       <span v-if="item.estimatedRows != null && item.estimatedRows > 0" class="object-browser-stat-badge object-browser-stat-badge-rows rounded-full bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium tabular-nums text-primary">{{
                         formatObjectBrowserCount(item.estimatedRows)
                       }}</span>
-                      <span v-if="item.totalBytes != null && item.totalBytes > 0" class="object-browser-stat-badge object-browser-stat-badge-bytes rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium tabular-nums text-muted-foreground">{{ formatObjectBrowserBytes(item.totalBytes) }}</span>
+                      <span v-if="!isVictoriaMetrics && item.totalBytes != null && item.totalBytes > 0" class="object-browser-stat-badge object-browser-stat-badge-bytes rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium tabular-nums text-muted-foreground">{{
+                        formatObjectBrowserBytes(item.totalBytes)
+                      }}</span>
                     </div>
                     <!-- Always reserve timestamp/comment slots when the dataset has them so every card shares one height. -->
                     <div v-if="hasCreatedAt || hasUpdatedAt" class="flex min-h-[15px] items-center gap-1 text-[10px] leading-[15px] text-muted-foreground/70">
@@ -3028,7 +3132,7 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
           <div class="flex items-center gap-2 px-3 py-1.5 border-b shrink-0 bg-muted/20 h-9">
             <TableProperties class="w-3.5 h-3.5 text-muted-foreground" />
             <span class="text-xs font-medium flex-1 min-w-0 truncate">{{ sidePanelRow?.name }}</span>
-            <div v-if="tableInfoTab === 'ddl'" class="table-info-actions flex min-w-0 shrink-0 items-center gap-1">
+            <div v-if="tableInfoTab === 'ddl' && tableMetadataCapabilities.ddl" class="table-info-actions flex min-w-0 shrink-0 items-center gap-1">
               <Button variant="ghost" size="sm" class="table-info-action-button h-6 px-2 text-xs" :title="t('grid.copyDdl')" :aria-label="t('grid.copyDdl')" @click="copyTableDdl">
                 <Copy class="w-3 h-3" />
                 <span class="table-info-action-label">{{ t("grid.copyDdl") }}</span>
@@ -3180,6 +3284,10 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
           <div v-else class="flex-1 flex items-center justify-center">
             <Loader2 class="w-4 h-4 animate-spin text-muted-foreground" />
           </div>
+        </template>
+        <!-- Type info mode (read-only user-defined type details) -->
+        <template v-else-if="sidePanelMode === 'type-info'">
+          <CustomTypeInfoPanel ref="sidePanelRef" :connection="props.connection" :database="props.database" :schema="sidePanelRow?.schema || selectedSchema || props.database" :name="sidePanelRow?.name || ''" :catalog="props.catalog" @close="closeSidePanel" />
         </template>
         <!-- Source mode (views, procedures, functions, sequences) -->
         <template v-else>

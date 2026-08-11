@@ -5,6 +5,19 @@ const browserSource = readFileSync(new URL("../KvKeyBrowser.vue", import.meta.ur
 const etcdBrowserSource = readFileSync(new URL("../../etcd/EtcdKeyBrowser.vue", import.meta.url), "utf8");
 
 describe("KvKeyBrowser node export", () => {
+  it("keeps directory toggles out of the detail-loading path", () => {
+    expect(browserSource).toContain('if (node.kind === "lazy") return node.hasValue === true;');
+    expect(browserSource).toContain("if (props.enableNodeActions && nodeHasValue(node)) void loadSelectedKey(routeFromNode(node));");
+    expect(browserSource).not.toContain("function nodeMayHaveValue");
+  });
+
+  it("keeps an expanded virtual Consul directory open when its exact Key probe is absent", () => {
+    expect(browserSource).toContain("const lazyNode = lazyTreeState.nodeByKey.get(key);");
+    expect(browserSource).toContain("if (lazyNode?.hasChildren)");
+    expect(browserSource).toContain("lazyNode.hasValue = false;");
+    expect(browserSource).toContain("void refreshLazyParent(parentLazyKvPath(key, props.lazyPathStyle));");
+  });
+
   it("shows export for both value keys and virtual directories", () => {
     expect(browserSource).toContain("if (props.api.exportScope || nodeHasValue(node))");
     expect(browserSource).toContain('kind: nodeIsExpandable(node) ? "prefix" : "key"');
@@ -14,17 +27,15 @@ describe("KvKeyBrowser node export", () => {
   it("delegates etcd directory export to a fixed-revision recursive scan", () => {
     expect(etcdBrowserSource).toContain("exportScope: exportEtcdNodeScope");
     expect(etcdBrowserSource).toContain("const scan = await scanConnection(connectionId, request.path)");
-    expect(etcdBrowserSource).toContain("isKeyInKvExportScope(displayKey(keyValue(entry), entry.key), request)");
+    expect(etcdBrowserSource).toContain("isKeyInKvExportScope(displayKey(keyValue(entry)), request)");
     expect(etcdBrowserSource).toContain("const missingValue = entries.find((entry) => !entry.value)");
   });
 
-  it("keeps mirror deletes inside the exported directory and compares canonical Key bytes", () => {
-    expect(etcdBrowserSource).toContain("if (!isKeyInKvExportScope(shown, mirrorScope)");
-    expect(etcdBrowserSource).toContain("sourceKeys.has(kvValueByteIdentity(bytes))");
+  it("compares canonical Key bytes without exposing mirror-delete operations", () => {
     expect(etcdBrowserSource).toContain("id: `source:${kvValueByteIdentity(source.key)}`");
     expect(etcdBrowserSource).not.toContain("id: source.key.data");
-    expect(etcdBrowserSource).toContain('const mirrorDeleteAvailable = computed(() => transferBundle.value?.scopeKind === "prefix")');
-    expect(etcdBrowserSource).toContain(':disabled="!mirrorDeleteAvailable || transferLoading || transferApplying"');
+    expect(etcdBrowserSource).not.toContain("mirrorDeletes");
+    expect(etcdBrowserSource).not.toContain('operation: "delete"');
   });
 
   it("snapshots the target and invalidates stale transfer previews", () => {

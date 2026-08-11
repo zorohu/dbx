@@ -1,4 +1,5 @@
 import { strict as assert } from "node:assert";
+import { readFileSync } from "node:fs";
 import { test } from "vitest";
 import { elasticsearchJsonResponseForResult } from "../../apps/desktop/src/lib/elasticsearch/elasticsearchJsonResponse.ts";
 import type { QueryResult } from "../../apps/desktop/src/types/database.ts";
@@ -33,6 +34,15 @@ test("classifies Elasticsearch HEAD responses", () => {
   assert.deepEqual(elasticsearchJsonResponseForResult("elasticsearch", "HEAD /products", response), {
     status: 200,
     body: "null",
+  });
+});
+
+test("classifies Easysearch REST responses", () => {
+  const response = jsonResponse({ rows: [[200, '{"status":"green"}']] });
+
+  assert.deepEqual(elasticsearchJsonResponseForResult("easysearch", "GET /_cluster/health", response), {
+    status: 200,
+    body: '{"status":"green"}',
   });
 });
 
@@ -85,4 +95,13 @@ test("uses the supplied result source statement to classify the response", () =>
   });
   assert.equal(elasticsearchJsonResponseForResult("elasticsearch", "SELECT * FROM products", result), undefined);
   assert.equal(elasticsearchJsonResponseForResult("elasticsearch", undefined, result), undefined);
+});
+
+test("routes focused find shortcuts to both Elasticsearch response-panel entry points", () => {
+  const contentArea = readFileSync(new URL("../../apps/desktop/src/components/layout/ContentArea.vue", import.meta.url), "utf8");
+  const focusSearch = contentArea.slice(contentArea.indexOf("function focusSearch()"), contentArea.indexOf("function refreshData()"));
+
+  assert.match(focusSearch, /elasticsearchJsonResponsePanelRef\.value\?\.focusSearch\(\)/);
+  assert.match(contentArea, /<ElasticsearchJsonResponsePanel v-if="activeElasticsearchJsonResponse" ref="elasticsearchJsonResponsePanelRef"/);
+  assert.match(contentArea, /<ElasticsearchJsonResponsePanel v-else-if="showElasticsearchRawJson && activeElasticsearchRawBody" ref="elasticsearchJsonResponsePanelRef"/);
 });

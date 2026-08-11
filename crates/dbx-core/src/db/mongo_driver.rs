@@ -1,6 +1,9 @@
 use mongodb::{
     bson::{doc, oid::ObjectId, Bson, DateTime, Document},
-    options::{ClientOptions, GridFsBucketOptions, IndexOptions, UpdateModifications},
+    options::{
+        ClientOptions, Collation, GridFsBucketOptions, IndexOptions, ReadPreference, SelectionCriteria,
+        UpdateModifications,
+    },
     Client, Cursor, Database, IndexModel,
 };
 use serde::{Deserialize, Serialize};
@@ -16,10 +19,30 @@ pub use super::document_result::DocumentQueryResult;
 /// Backward-compatible name for callers of Mongo-specific APIs.
 pub type MongoDocumentResult = DocumentQueryResult;
 
+const MONGO_COLLATION_FIELDS: &[&str] = &[
+    "locale",
+    "strength",
+    "caseLevel",
+    "caseFirst",
+    "numericOrdering",
+    "alternate",
+    "maxVariable",
+    "normalization",
+    "backwards",
+];
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MongoDropIndexesResult {
     pub dropped_names: Vec<String>,
     pub affected_rows: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failures: Vec<MongoDropIndexFailure>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MongoDropIndexFailure {
+    pub name: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -33,6 +56,13 @@ pub struct MongoCollectionStatsResult {
     #[serde(rename = "totalIndexSize")]
     pub total_index_size: serde_json::Value,
     pub nindexes: serde_json::Value,
+}
+
+/// Result counts returned after cloning a regular MongoDB collection.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MongoCloneCollectionResult {
+    pub documents_copied: u64,
+    pub indexes_copied: u64,
 }
 
 pub async fn connect(url: &str, timeout: Duration, idle_timeout: Duration) -> Result<Client, String> {
@@ -194,7 +224,38 @@ fn collection_stats_field(result: &Document, key: &str) -> serde_json::Value {
 }
 
 pub async fn list_databases(client: &Client) -> Result<Vec<String>, String> {
-    client.list_database_names().await.map_err(|e| e.to_string())
+    match client.list_database_names().await {
+        Ok(databases) => Ok(databases),
+        Err(error) if list_databases_requires_secondary_fallback(&error.to_string()) => {
+            let result = client
+                .database("admin")
+                .run_command(doc! { "listDatabases": 1, "nameOnly": true })
+                .selection_criteria(list_databases_secondary_selection())
+                .await
+                .map_err(|fallback| fallback.to_string())?;
+            let databases = result
+                .get_array("databases")
+                .map_err(|error| format!("MongoDB listDatabases response is invalid: {error}"))?
+                .iter()
+                .filter_map(|database| database.as_document()?.get_str("name").ok().map(str::to_string))
+                .collect();
+            Ok(databases)
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn list_databases_secondary_selection() -> SelectionCriteria {
+    SelectionCriteria::ReadPreference(ReadPreference::SecondaryPreferred { options: None })
+}
+
+fn list_databases_requires_secondary_fallback(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("not master")
+        || error.contains("not primary")
+        || error.contains("notmaster")
+        || error.contains("notwritableprimary")
+        || error.contains("slaveok=false")
 }
 
 /// MongoDB collection kind from `listCollections` (not GridFS buckets).
@@ -219,6 +280,16 @@ impl MongoCollectionKind {
             mongodb::results::CollectionType::View => Self::View,
             mongodb::results::CollectionType::Timeseries => Self::Timeseries,
             // Collection and any future non_exhaustive variants default to a renamable collection.
+            _ => Self::Collection,
+        }
+    }
+
+    /// Convert the Legacy Agent's optional listCollections metadata. Unknown
+    /// values stay compatible with the former name-only response.
+    pub fn from_metadata_kind(kind: Option<&str>) -> Self {
+        match kind.map(str::trim) {
+            Some(kind) if kind.eq_ignore_ascii_case("view") => Self::View,
+            Some(kind) if kind.eq_ignore_ascii_case("timeseries") => Self::Timeseries,
             _ => Self::Collection,
         }
     }
@@ -528,23 +599,24 @@ pub async fn create_database(client: &Client, database: &str) -> Result<(), Stri
 }
 
 pub async fn drop_database(client: &Client, database: &str) -> Result<(), String> {
-    let database = database.trim();
-    if database.is_empty() {
-        return Err("Database name is required".to_string());
-    }
+    let database = validate_mongo_namespace_name(database, "Database")?;
     client.database(database).drop().await.map_err(|e| e.to_string())
 }
 
 pub async fn drop_collection(client: &Client, database: &str, collection: &str) -> Result<(), String> {
-    let database = database.trim();
-    let collection = collection.trim();
-    if database.is_empty() {
-        return Err("Database name is required".to_string());
-    }
-    if collection.is_empty() {
-        return Err("Collection name is required".to_string());
-    }
+    let database = validate_mongo_namespace_name(database, "Database")?;
+    let collection = validate_mongo_namespace_name(collection, "Collection")?;
     client.database(database).collection::<Document>(collection).drop().await.map_err(|e| e.to_string())
+}
+
+/// MongoDB namespace identifiers must reach the server unchanged. In
+/// particular, a collection name may legitimately contain leading or trailing
+/// whitespace, so validation only rejects the empty identifier.
+pub fn validate_mongo_namespace_name<'a>(name: &'a str, kind: &str) -> Result<&'a str, String> {
+    if name.is_empty() {
+        return Err(format!("{kind} name is required"));
+    }
+    Ok(name)
 }
 
 /// Build the admin `renameCollection` command document for a same-database rename.
@@ -577,6 +649,122 @@ pub fn rename_collection_command_document(database: &str, old_name: &str, new_na
 pub async fn rename_collection(client: &Client, database: &str, old_name: &str, new_name: &str) -> Result<(), String> {
     let command = rename_collection_command_document(database, old_name, new_name)?;
     client.database("admin").run_command(command).await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Clone a regular collection within one database without relying on MongoDB's
+/// deprecated clone commands. The individual commands used here have been
+/// available across the MongoDB versions supported by the native driver.
+pub async fn clone_collection(
+    client: &Client,
+    database: &str,
+    source_name: &str,
+    target_name: &str,
+) -> Result<MongoCloneCollectionResult, String> {
+    validate_clone_collection_names(database, source_name, target_name)?;
+
+    let database = client.database(database);
+    let source_spec = find_collection_specification(&database, source_name).await?;
+    if !matches!(source_spec.collection_type, mongodb::results::CollectionType::Collection) {
+        return Err(
+            "Only regular MongoDB collections can be cloned; views and time-series collections are not supported"
+                .to_string(),
+        );
+    }
+
+    // Create explicitly before copying data so an existing target fails rather
+    // than being silently merged with or overwritten by the source documents.
+    database
+        .create_collection(target_name)
+        .with_options(source_spec.options.clone())
+        .await
+        .map_err(|error| error.to_string())?;
+
+    let source = database.collection::<Document>(source_name);
+    let target = database.collection::<Document>(target_name);
+    let needs_validation_bypass = source_spec.options.validator.is_some()
+        || source_spec.options.validation_level.is_some()
+        || source_spec.options.validation_action.is_some();
+    let mut cursor = source.find(doc! {}).await.map_err(|error| error.to_string())?;
+    let mut batch = Vec::with_capacity(1_000);
+    let mut documents_copied = 0_u64;
+
+    while let Some(document) = cursor.try_next().await.map_err(|error| error.to_string())? {
+        batch.push(document);
+        if batch.len() == 1_000 {
+            documents_copied += insert_clone_batch(&target, &mut batch, needs_validation_bypass).await?;
+        }
+    }
+    if !batch.is_empty() {
+        documents_copied += insert_clone_batch(&target, &mut batch, needs_validation_bypass).await?;
+    }
+
+    // The target gets its _id index during createCollection. Recreating every
+    // other source index after the data copy avoids needless index maintenance.
+    let mut index_cursor = source.list_indexes().await.map_err(|error| error.to_string())?;
+    let mut indexes_copied = 0_u64;
+    while let Some(index) = index_cursor.try_next().await.map_err(|error| error.to_string())? {
+        if is_automatic_id_index(&index) {
+            continue;
+        }
+        target.create_index(index).await.map_err(|error| error.to_string())?;
+        indexes_copied += 1;
+    }
+
+    Ok(MongoCloneCollectionResult { documents_copied, indexes_copied })
+}
+
+async fn find_collection_specification(
+    database: &Database,
+    source_name: &str,
+) -> Result<mongodb::results::CollectionSpecification, String> {
+    let mut cursor = database.list_collections().await.map_err(|error| error.to_string())?;
+    while let Some(specification) = cursor.try_next().await.map_err(|error| error.to_string())? {
+        if specification.name == source_name {
+            return Ok(specification);
+        }
+    }
+    Err(format!("MongoDB collection '{source_name}' was not found"))
+}
+
+async fn insert_clone_batch(
+    target: &mongodb::Collection<Document>,
+    batch: &mut Vec<Document>,
+    bypass_document_validation: bool,
+) -> Result<u64, String> {
+    let documents = std::mem::take(batch);
+    let result = if bypass_document_validation {
+        target.insert_many(documents).bypass_document_validation(true).await
+    } else {
+        target.insert_many(documents).await
+    }
+    .map_err(|error| error.to_string())?;
+    Ok(result.inserted_ids.len() as u64)
+}
+
+/// `createCollection` always creates the `_id` index, but it need not be named
+/// `_id_` (for example, on a clustered collection). Compare the key instead
+/// of the name so cloning never attempts to create it a second time.
+fn is_automatic_id_index(index: &IndexModel) -> bool {
+    index.keys.len() == 1
+        && (matches!(index.keys.get("_id"), Some(Bson::Int32(1) | Bson::Int64(1)))
+            || matches!(index.keys.get("_id"), Some(Bson::Double(value)) if *value == 1.0))
+}
+
+pub(crate) fn validate_clone_collection_names(
+    database: &str,
+    source_name: &str,
+    target_name: &str,
+) -> Result<(), String> {
+    validate_mongo_namespace_name(database, "Database")?;
+    validate_mongo_namespace_name(source_name, "Source collection")?;
+    validate_mongo_namespace_name(target_name, "Target collection")?;
+    if source_name == target_name {
+        return Err("Target collection name must differ from the source collection name".to_string());
+    }
+    if source_name.starts_with("system.") || target_name.starts_with("system.") {
+        return Err("System collections cannot be cloned".to_string());
+    }
     Ok(())
 }
 
@@ -617,6 +805,23 @@ fn index_info_from_model(model: IndexModel) -> IndexInfo {
     }
 }
 
+fn parse_find_collation(value: Option<&str>) -> Result<Option<Collation>, String> {
+    let Some(raw) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let json: serde_json::Value =
+        serde_json::from_str(raw).map_err(|error| format!("Invalid collation JSON: {error}"))?;
+    let object = json.as_object().ok_or_else(|| "Invalid collation: expected an options object".to_string())?;
+    if let Some(field) = object.keys().find(|field| !MONGO_COLLATION_FIELDS.contains(&field.as_str())) {
+        return Err(format!("Unsupported collation option: {field}"));
+    }
+    let collation: Collation = serde_json::from_value(json).map_err(|error| format!("Invalid collation: {error}"))?;
+    if collation.locale.trim().is_empty() {
+        return Err("Invalid collation: locale must not be empty".to_string());
+    }
+    Ok(Some(collation))
+}
+
 pub async fn find_documents(
     client: &Client,
     database: &str,
@@ -626,6 +831,106 @@ pub async fn find_documents(
     filter: Option<&str>,
     projection: Option<&str>,
     sort: Option<&str>,
+    collation: Option<&str>,
+) -> Result<MongoDocumentResult, String> {
+    find_documents_with_total(client, database, collection, skip, limit, filter, projection, sort, collation, true)
+        .await
+}
+
+/// Execute a find without the document browser's separate total-count query.
+/// Agent callers only consume returned rows, so counting the full result set adds latency
+/// without providing any useful output.
+pub async fn find_documents_without_total(
+    client: &Client,
+    database: &str,
+    collection: &str,
+    skip: u64,
+    limit: i64,
+    filter: Option<&str>,
+    projection: Option<&str>,
+    sort: Option<&str>,
+    collation: Option<&str>,
+) -> Result<MongoDocumentResult, String> {
+    find_documents_with_total(client, database, collection, skip, limit, filter, projection, sort, collation, false)
+        .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn explain_find(
+    client: &Client,
+    database: &str,
+    collection: &str,
+    skip: u64,
+    limit: i64,
+    filter: Option<&str>,
+    projection: Option<&str>,
+    sort: Option<&str>,
+    collation: Option<&str>,
+    verbosity: &str,
+) -> Result<serde_json::Value, String> {
+    let command = build_find_explain_command(collection, skip, limit, filter, projection, sort, collation, verbosity)?;
+    let result = client.database(database).run_command(command).await.map_err(|error| error.to_string())?;
+    Ok(bson_to_json(&Bson::Document(result)))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_find_explain_command(
+    collection: &str,
+    skip: u64,
+    limit: i64,
+    filter: Option<&str>,
+    projection: Option<&str>,
+    sort: Option<&str>,
+    collation: Option<&str>,
+    verbosity: &str,
+) -> Result<Document, String> {
+    let mut find = doc! {
+        "find": collection,
+        "filter": parse_optional_filter_document(filter)?.unwrap_or_default(),
+    };
+    if let Some(projection) = parse_optional_json_document(projection, "projection")? {
+        find.insert("projection", projection);
+    }
+    if let Some(sort) = parse_optional_json_document(sort, "sort")? {
+        find.insert("sort", sort);
+    }
+    if let Some(collation) = parse_find_collation(collation)? {
+        find.insert(
+            "collation",
+            mongodb::bson::to_document(&collation).map_err(|error| format!("Invalid collation: {error}"))?,
+        );
+    }
+    if skip > 0 {
+        find.insert("skip", i64::try_from(skip).map_err(|_| "MongoDB skip exceeds the supported range")?);
+    }
+    if limit > 0 {
+        find.insert("limit", limit);
+    }
+    Ok(doc! {
+        "explain": find,
+        "verbosity": validate_find_explain_verbosity(verbosity)?,
+    })
+}
+
+fn validate_find_explain_verbosity(verbosity: &str) -> Result<&str, String> {
+    match verbosity {
+        "queryPlanner" | "executionStats" | "allPlansExecution" => Ok(verbosity),
+        _ => Err("MongoDB explain verbosity must be queryPlanner, executionStats, or allPlansExecution.".to_string()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn find_documents_with_total(
+    client: &Client,
+    database: &str,
+    collection: &str,
+    skip: u64,
+    limit: i64,
+    filter: Option<&str>,
+    projection: Option<&str>,
+    sort: Option<&str>,
+    collation: Option<&str>,
+    include_total: bool,
 ) -> Result<MongoDocumentResult, String> {
     let col = client.database(database).collection::<Document>(collection);
 
@@ -637,11 +942,18 @@ pub async fn find_documents(
         _ => doc! {},
     };
 
-    let total_is_exact = !filter_doc.is_empty();
-    let total = if total_is_exact {
-        col.count_documents(filter_doc.clone()).await.map_err(|e| e.to_string())?
+    let collation = parse_find_collation(collation)?;
+    let count_is_exact = !filter_doc.is_empty();
+    let total_result = if !include_total {
+        None
+    } else if count_is_exact {
+        let mut count = col.count_documents(filter_doc.clone());
+        if let Some(collation) = collation.clone() {
+            count = count.collation(collation);
+        }
+        Some(count.await.map_err(|e| e.to_string()))
     } else {
-        col.estimated_document_count().await.map_err(|e| e.to_string())?
+        Some(col.estimated_document_count().await.map_err(|e| e.to_string()))
     };
 
     let mut find = col.find(filter_doc).skip(skip).limit(limit);
@@ -660,6 +972,9 @@ pub async fn find_documents(
             find = find.sort(sort_doc);
         }
     }
+    if let Some(collation) = collation {
+        find = find.collation(collation);
+    }
 
     let mut cursor = find.await.map_err(|e| e.to_string())?;
 
@@ -670,6 +985,10 @@ pub async fn find_documents(
         documents.push(bson_to_json(&Bson::Document(doc.clone())));
         extended_documents.push(Bson::Document(doc).into_canonical_extjson());
     }
+    let (total, total_is_exact) = match total_result {
+        Some(total_result) => resolve_mongo_find_total(total_result, count_is_exact, skip, documents.len()),
+        None => (documents.len() as u64, false),
+    };
 
     Ok(MongoDocumentResult {
         documents,
@@ -771,6 +1090,7 @@ pub async fn find_documents_extended_json(
     filter: Option<&str>,
     projection: Option<&str>,
     sort: Option<&str>,
+    collation: Option<&str>,
 ) -> Result<MongoDocumentResult, String> {
     let col = client.database(database).collection::<Document>(collection);
 
@@ -782,11 +1102,16 @@ pub async fn find_documents_extended_json(
         _ => doc! {},
     };
 
-    let total_is_exact = !filter_doc.is_empty();
-    let total = if total_is_exact {
-        col.count_documents(filter_doc.clone()).await.map_err(|e| e.to_string())?
+    let collation = parse_find_collation(collation)?;
+    let count_is_exact = !filter_doc.is_empty();
+    let total_result = if count_is_exact {
+        let mut count = col.count_documents(filter_doc.clone());
+        if let Some(collation) = collation.clone() {
+            count = count.collation(collation);
+        }
+        count.await.map_err(|e| e.to_string())
     } else {
-        col.estimated_document_count().await.map_err(|e| e.to_string())?
+        col.estimated_document_count().await.map_err(|e| e.to_string())
     };
 
     let mut find = col.find(filter_doc).skip(skip).limit(limit);
@@ -805,6 +1130,9 @@ pub async fn find_documents_extended_json(
             find = find.sort(sort_doc);
         }
     }
+    if let Some(collation) = collation {
+        find = find.collation(collation);
+    }
 
     let mut cursor = find.await.map_err(|e| e.to_string())?;
 
@@ -816,6 +1144,7 @@ pub async fn find_documents_extended_json(
         documents.push(document);
         extended_documents.push(extended_document);
     }
+    let (total, total_is_exact) = resolve_mongo_find_total(total_result, count_is_exact, skip, documents.len());
 
     Ok(MongoDocumentResult {
         extended_documents: Some(extended_documents),
@@ -824,6 +1153,27 @@ pub async fn find_documents_extended_json(
         total,
         total_is_exact,
     })
+}
+
+fn resolve_mongo_find_total(
+    total_result: Result<u64, String>,
+    count_is_exact: bool,
+    skip: u64,
+    document_count: usize,
+) -> (u64, bool) {
+    match total_result {
+        Ok(total) => (total, count_is_exact),
+        Err(error) => {
+            log::debug!(
+                "[mongo][find:count-fallback] count_mode={} skip={} documents={} error={}",
+                if count_is_exact { "exact" } else { "estimated" },
+                skip,
+                document_count,
+                error
+            );
+            (skip.saturating_add(u64::try_from(document_count).unwrap_or(u64::MAX)), false)
+        }
+    }
 }
 
 /// Run `db.collection.aggregate(pipeline, options)`.
@@ -997,9 +1347,86 @@ pub async fn create_index(
     keys_json: &str,
     options_json: Option<&str>,
 ) -> Result<String, String> {
+    let database = validate_mongo_namespace_name(database, "Database")?;
+    let collection = validate_mongo_namespace_name(collection, "Collection")?;
+    let (command, name) = create_indexes_command(collection, keys_json, options_json)?;
+    client.database(database).run_command(command).await.map_err(|e| e.kind.to_string())?;
+    Ok(name)
+}
+
+pub async fn create_user(
+    client: &Client,
+    database: &str,
+    user_json: &str,
+    write_concern_json: Option<&str>,
+) -> Result<(), String> {
+    let database = validate_mongo_namespace_name(database, "Database")?;
+    let command = create_user_command(user_json, write_concern_json)?;
+    client.database(database).run_command(command).await.map_err(|error| error.kind.to_string())?;
+    Ok(())
+}
+
+pub fn validate_create_user_request(user_json: &str, write_concern_json: Option<&str>) -> Result<(), String> {
+    create_user_command(user_json, write_concern_json).map(|_| ())
+}
+
+fn create_user_command(user_json: &str, write_concern_json: Option<&str>) -> Result<Document, String> {
+    let user_value: serde_json::Value =
+        serde_json::from_str(user_json).map_err(|error| format!("Invalid MongoDB user JSON: {error}"))?;
+    let mut user = json_object_to_document_extended_json(&user_value)
+        .map_err(|error| format!("Invalid MongoDB user document: {error}"))?;
+    let username = user
+        .remove("user")
+        .and_then(|value| value.as_str().map(str::to_string))
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("MongoDB createUser requires a non-empty user name")?;
+    if user.contains_key("createUser") || user.contains_key("writeConcern") {
+        return Err("MongoDB createUser user document contains reserved command fields".to_string());
+    }
+
+    let mut command = doc! { "createUser": username };
+    command.extend(user);
+    if let Some(write_concern_json) = write_concern_json.filter(|value| !value.trim().is_empty()) {
+        let write_concern_value: serde_json::Value = serde_json::from_str(write_concern_json)
+            .map_err(|error| format!("Invalid MongoDB write concern JSON: {error}"))?;
+        let write_concern = json_object_to_document_extended_json(&write_concern_value)
+            .map_err(|error| format!("Invalid MongoDB write concern: {error}"))?;
+        command.insert("writeConcern", write_concern);
+    }
+    Ok(command)
+}
+
+/// Validate an index request before it reaches either the native driver or the
+/// Legacy Agent. In particular, `key` belongs to the createIndexes command
+/// itself and must not be smuggled through the options document.
+pub fn validate_create_index_request(keys_json: &str, options_json: Option<&str>) -> Result<(), String> {
+    parse_create_index_spec(keys_json, options_json).map(|_| ())
+}
+
+fn create_indexes_command(
+    collection: &str,
+    keys_json: &str,
+    options_json: Option<&str>,
+) -> Result<(Document, String), String> {
+    let (keys, options, name) = parse_create_index_spec(keys_json, options_json)?;
+    let mut index = doc! { "key": keys };
+    for (option, value) in options {
+        index.insert(option, value);
+    }
+
+    Ok((doc! { "createIndexes": collection, "indexes": [index] }, name))
+}
+
+fn parse_create_index_spec(
+    keys_json: &str,
+    options_json: Option<&str>,
+) -> Result<(Document, Document, String), String> {
     let keys_value: serde_json::Value =
         serde_json::from_str(keys_json).map_err(|e| format!("Invalid index keys JSON: {e}"))?;
-    let keys = json_object_to_document(&keys_value).map_err(|e| format!("Invalid index keys: {e}"))?;
+    // The internal transport uses JSON rather than a Mongo shell expression.
+    // Keep ordinary strings literal while supporting official Extended JSON
+    // wrappers, matching the Legacy Agent's Document.parse behavior.
+    let keys = json_object_to_document_extended_json(&keys_value).map_err(|e| format!("Invalid index keys: {e}"))?;
     if keys.is_empty() {
         return Err("Index keys are required".to_string());
     }
@@ -1008,16 +1435,40 @@ pub async fn create_index(
         Some(json) => {
             let value: serde_json::Value =
                 serde_json::from_str(json).map_err(|e| format!("Invalid index options JSON: {e}"))?;
-            let doc = json_object_to_document(&value).map_err(|e| format!("Invalid index options: {e}"))?;
-            Some(mongodb::bson::from_document::<IndexOptions>(doc).map_err(|e| format!("Invalid index options: {e}"))?)
+            json_object_to_document_extended_json(&value).map_err(|e| format!("Invalid index options: {e}"))?
         }
-        None => None,
+        None => Document::new(),
+    };
+    if options.contains_key("key") {
+        return Err("Index options cannot contain \"key\"; specify index fields in keys JSON".to_string());
+    }
+    let name = match options.get("name") {
+        Some(Bson::String(name)) if !name.trim().is_empty() => name.clone(),
+        Some(_) => return Err("Index option \"name\" must be a non-empty string".to_string()),
+        None => default_index_name(&keys),
     };
 
-    let col = client.database(database).collection::<Document>(collection);
-    let result =
-        col.create_index(IndexModel::builder().keys(keys).options(options).build()).await.map_err(|e| e.to_string())?;
-    Ok(result.index_name)
+    // Use the raw server command instead of deserializing into the driver's
+    // fixed IndexOptions struct. This keeps native and Legacy Agent requests
+    // equivalent and lets the connected MongoDB version validate new options.
+    let mut options = options;
+    if !options.contains_key("name") {
+        options.insert("name", name.clone());
+    }
+    Ok((keys, options, name))
+}
+
+fn default_index_name(keys: &Document) -> String {
+    keys.iter()
+        .map(|(field, value)| {
+            let value = match value {
+                Bson::String(value) => value.clone(),
+                value => value.to_string(),
+            };
+            format!("{field}_{value}")
+        })
+        .collect::<Vec<_>>()
+        .join("_")
 }
 
 pub async fn drop_indexes(
@@ -1027,14 +1478,8 @@ pub async fn drop_indexes(
     indexes_json: Option<&str>,
     single: bool,
 ) -> Result<MongoDropIndexesResult, String> {
-    let database = database.trim();
-    let collection = collection.trim();
-    if database.is_empty() {
-        return Err("Database name is required".to_string());
-    }
-    if collection.is_empty() {
-        return Err("Collection name is required".to_string());
-    }
+    let database = validate_mongo_namespace_name(database, "Database")?;
+    let collection = validate_mongo_namespace_name(collection, "Collection")?;
 
     let index = parse_drop_indexes_value(indexes_json, single)?;
     let before = list_indexes(client, database, collection).await?;
@@ -1045,7 +1490,57 @@ pub async fn drop_indexes(
         .map_err(|e| e.to_string())?;
     let after = list_indexes(client, database, collection).await?;
     let dropped_names = diff_dropped_index_names(&before, &after);
-    Ok(MongoDropIndexesResult { affected_rows: dropped_names.len() as u64, dropped_names })
+    Ok(MongoDropIndexesResult { affected_rows: dropped_names.len() as u64, dropped_names, failures: Vec::new() })
+}
+
+/// Validate a drop-index request before it is sent to either MongoDB driver.
+/// The Legacy Agent receives the original JSON, so keeping this validation
+/// public gives both paths the same protection for MongoDB's default index.
+pub fn validate_drop_indexes_request(indexes_json: Option<&str>, single: bool) -> Result<(), String> {
+    parse_drop_indexes_value(indexes_json, single).map(|_| ())
+}
+
+/// MongoDB added array-form `dropIndexes.index` in 4.2. Unknown version
+/// strings preserve the modern single-command semantics instead of risking a
+/// partially applied serial fallback.
+pub fn mongo_server_requires_serial_drop_indexes(version: &str) -> bool {
+    let Some(start) = version.find(|character: char| character.is_ascii_digit()) else {
+        return false;
+    };
+    let mut components = version[start..].split('.');
+    let Some(major) = components.next().and_then(parse_version_component) else {
+        return false;
+    };
+    let Some(minor) = components.next().and_then(parse_version_component) else {
+        return false;
+    };
+    (major, minor) < (4, 2)
+}
+
+fn parse_version_component(component: &str) -> Option<u32> {
+    let digits = component.chars().take_while(|character| character.is_ascii_digit()).collect::<String>();
+    (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
+}
+
+/// Return names that must be issued as individual dropIndex commands for
+/// MongoDB 3.4 compatibility. The original request is fully parsed first, so
+/// an invalid name (including `_id_`) cannot cause a partial batch mutation.
+pub fn serial_drop_index_names(indexes_json: Option<&str>, single: bool) -> Result<Option<Vec<String>>, String> {
+    let Bson::Array(indexes) = parse_drop_indexes_value(indexes_json, single)? else {
+        return Ok(None);
+    };
+
+    let mut seen = HashSet::new();
+    let mut names = Vec::new();
+    for index in indexes {
+        let Bson::String(name) = index else {
+            return Err("dropIndexes only accepts arrays of string index names".to_string());
+        };
+        if seen.insert(name.clone()) {
+            names.push(name);
+        }
+    }
+    Ok(Some(names))
 }
 
 fn diff_dropped_index_names(before: &[IndexInfo], after: &[IndexInfo]) -> Vec<String> {
@@ -1063,56 +1558,83 @@ fn parse_drop_indexes_value(indexes_json: Option<&str>, single: bool) -> Result<
 
 fn parse_drop_indexes_json(json: &str, single: bool) -> Result<Bson, String> {
     let value: serde_json::Value = serde_json::from_str(json).map_err(|e| format!("Invalid index JSON: {e}"))?;
+    let bson = json_value_to_bson(&value);
     if single {
-        validate_single_drop_index_value(&value)?;
+        validate_single_drop_index_value(&bson)?;
     } else {
-        validate_multi_drop_indexes_value(&value)?;
+        validate_multi_drop_indexes_value(&bson)?;
     }
-    Ok(json_value_to_bson(&value))
+    Ok(bson)
 }
 
-fn validate_single_drop_index_value(value: &serde_json::Value) -> Result<(), String> {
+fn validate_single_drop_index_value(value: &Bson) -> Result<(), String> {
     match value {
-        serde_json::Value::String(name) => {
+        Bson::String(name) => {
             if name.trim().is_empty() {
                 Err("Index name is required".to_string())
             } else if name == "*" {
                 Err(r#"dropIndex does not accept "*"; use dropIndexes() or dropIndexes("*") instead"#.to_string())
+            } else if name == "_id_" {
+                Err("The default MongoDB _id_ index cannot be dropped".to_string())
             } else {
                 Ok(())
             }
         }
-        serde_json::Value::Object(doc) if doc.is_empty() => Err("Index specification is required".to_string()),
-        serde_json::Value::Object(_) => Ok(()),
-        serde_json::Value::Array(_) => {
+        Bson::Document(doc) if doc.is_empty() => Err("Index specification is required".to_string()),
+        Bson::Document(doc) if is_default_id_index_specification(doc) => {
+            Err("The default MongoDB _id_ index cannot be dropped".to_string())
+        }
+        Bson::Document(_) => Ok(()),
+        Bson::Array(_) => {
             Err("dropIndex only accepts a string index name or JSON document; arrays are not supported".to_string())
         }
         _ => Err("dropIndex only accepts a string index name or JSON document".to_string()),
     }
 }
 
-fn validate_multi_drop_indexes_value(value: &serde_json::Value) -> Result<(), String> {
+fn validate_multi_drop_indexes_value(value: &Bson) -> Result<(), String> {
     match value {
-        serde_json::Value::String(name) => {
+        Bson::String(name) => {
             if name.trim().is_empty() {
                 Err("Index name is required".to_string())
+            } else if name == "_id_" {
+                Err("The default MongoDB _id_ index cannot be dropped".to_string())
             } else {
                 Ok(())
             }
         }
-        serde_json::Value::Object(doc) if doc.is_empty() => Err("Index specification is required".to_string()),
-        serde_json::Value::Object(_) => Ok(()),
-        serde_json::Value::Array(items) if items.is_empty() => {
-            Err("dropIndexes only accepts non-empty string arrays".to_string())
+        Bson::Document(doc) if doc.is_empty() => Err("Index specification is required".to_string()),
+        Bson::Document(doc) if is_default_id_index_specification(doc) => {
+            Err("The default MongoDB _id_ index cannot be dropped".to_string())
         }
-        serde_json::Value::Array(items) => {
-            if items.iter().all(|item| matches!(item, serde_json::Value::String(name) if !name.trim().is_empty())) {
-                Ok(())
+        Bson::Document(_) => Ok(()),
+        Bson::Array(items) if items.is_empty() => Err("dropIndexes only accepts non-empty string arrays".to_string()),
+        Bson::Array(items) => {
+            if items.iter().all(|item| matches!(item, Bson::String(name) if !name.trim().is_empty())) {
+                if items.iter().any(|item| matches!(item, Bson::String(name) if name == "_id_")) {
+                    Err("The default MongoDB _id_ index cannot be dropped".to_string())
+                } else {
+                    Ok(())
+                }
             } else {
                 Err("dropIndexes only accepts arrays of string index names".to_string())
             }
         }
         _ => Err("dropIndexes only accepts a string index name, JSON document, or string array".to_string()),
+    }
+}
+
+fn is_default_id_index_specification(specification: &Document) -> bool {
+    specification.len() == 1 && specification.get("_id").is_some_and(is_bson_numeric_one)
+}
+
+fn is_bson_numeric_one(value: &Bson) -> bool {
+    match value {
+        Bson::Int32(value) => *value == 1,
+        Bson::Int64(value) => *value == 1,
+        Bson::Double(value) => *value == 1.0,
+        Bson::Decimal128(value) => value.to_string().parse::<f64>().is_ok_and(|value| value == 1.0),
+        _ => false,
     }
 }
 
@@ -1124,6 +1646,21 @@ pub async fn insert_document(
 ) -> Result<String, String> {
     let value: serde_json::Value = serde_json::from_str(doc_json).map_err(|e| format!("Invalid JSON: {e}"))?;
     let doc = json_object_to_document(&value).map_err(|e| format!("Invalid document: {e}"))?;
+    let col = client.database(database).collection::<Document>(collection);
+    let result = col.insert_one(doc).await.map_err(|e| e.to_string())?;
+    Ok(format!("{}", result.inserted_id))
+}
+
+/// Inserts a document from canonical Extended JSON without interpreting
+/// Mongo shell-like strings such as `ISODate(...)`.
+pub async fn insert_document_extended_json(
+    client: &Client,
+    database: &str,
+    collection: &str,
+    doc_json: &str,
+) -> Result<String, String> {
+    let value: serde_json::Value = serde_json::from_str(doc_json).map_err(|e| format!("Invalid JSON: {e}"))?;
+    let doc = json_object_to_document_extended_json(&value).map_err(|e| format!("Invalid document: {e}"))?;
     let col = client.database(database).collection::<Document>(collection);
     let result = col.insert_one(doc).await.map_err(|e| e.to_string())?;
     Ok(format!("{}", result.inserted_id))
@@ -1230,16 +1767,22 @@ pub async fn update_documents(
         serde_json::from_str(update_json).map_err(|e| format!("Invalid update JSON: {e}"))?;
     let filter = json_filter_to_document(&filter_value).map_err(|e| format!("Invalid filter: {e}"))?;
     let update = json_update_to_modifications(&update_value).map_err(|e| format!("Invalid update: {e}"))?;
-    let array_filters = parse_update_array_filters(options_json)?;
+    let ParsedMongoUpdateOptions { upsert, array_filters } = parse_update_options(options_json)?;
     let col = client.database(database).collection::<Document>(collection);
     let result = if many {
         let mut action = col.update_many(filter, update);
+        if let Some(upsert) = upsert {
+            action = action.upsert(upsert);
+        }
         if let Some(filters) = array_filters {
             action = action.array_filters(filters);
         }
         action.await.map_err(|e| e.to_string())?
     } else {
         let mut action = col.update_one(filter, update);
+        if let Some(upsert) = upsert {
+            action = action.upsert(upsert);
+        }
         if let Some(filters) = array_filters {
             action = action.array_filters(filters);
         }
@@ -1249,17 +1792,24 @@ pub async fn update_documents(
 }
 
 #[derive(Default, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 struct MongoUpdateOptions {
+    upsert: Option<bool>,
     array_filters: Option<Vec<serde_json::Value>>,
 }
 
-fn parse_update_array_filters(options_json: Option<&str>) -> Result<Option<Vec<Document>>, String> {
+#[derive(Debug, Default)]
+struct ParsedMongoUpdateOptions {
+    upsert: Option<bool>,
+    array_filters: Option<Vec<Document>>,
+}
+
+fn parse_update_options(options_json: Option<&str>) -> Result<ParsedMongoUpdateOptions, String> {
     let Some(raw) = options_json.filter(|value| !value.trim().is_empty()) else {
-        return Ok(None);
+        return Ok(ParsedMongoUpdateOptions::default());
     };
     let options: MongoUpdateOptions = serde_json::from_str(raw).map_err(|e| format!("Invalid update options: {e}"))?;
-    options
+    let array_filters = options
         .array_filters
         .map(|filters| {
             filters
@@ -1268,7 +1818,8 @@ fn parse_update_array_filters(options_json: Option<&str>) -> Result<Option<Vec<D
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| format!("Invalid arrayFilters: {e}"))
         })
-        .transpose()
+        .transpose()?;
+    Ok(ParsedMongoUpdateOptions { upsert: options.upsert, array_filters })
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1903,6 +2454,96 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parses_find_collation_options() {
+        let collation = parse_find_collation(Some(
+            r#"{"locale":"en","strength":1,"caseLevel":true,"caseFirst":"upper","numericOrdering":true,"alternate":"shifted","maxVariable":"space","normalization":true,"backwards":false}"#,
+        ))
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(collation.locale, "en");
+        assert!(matches!(collation.strength, Some(mongodb::options::CollationStrength::Primary)));
+        assert_eq!(collation.case_level, Some(true));
+        assert!(matches!(collation.case_first, Some(mongodb::options::CollationCaseFirst::Upper)));
+        assert_eq!(collation.numeric_ordering, Some(true));
+        assert!(matches!(collation.alternate, Some(mongodb::options::CollationAlternate::Shifted)));
+        assert!(matches!(collation.max_variable, Some(mongodb::options::CollationMaxVariable::Space)));
+        assert_eq!(collation.normalization, Some(true));
+        assert_eq!(collation.backwards, Some(false));
+    }
+
+    #[test]
+    fn rejects_invalid_find_collation_options() {
+        assert!(parse_find_collation(Some(r#"{"strength":1}"#)).unwrap_err().contains("locale"));
+        assert!(parse_find_collation(Some(r#"{"locale":""}"#)).unwrap_err().contains("locale"));
+        assert!(parse_find_collation(Some(r#"{"locale":"en","unknown":true}"#))
+            .unwrap_err()
+            .contains("Unsupported collation option"));
+        assert!(parse_find_collation(Some(r#"{"locale":"en","strength":"primary"}"#))
+            .unwrap_err()
+            .contains("Invalid collation"));
+    }
+
+    #[test]
+    fn builds_find_explain_command_with_all_find_options() {
+        let command = build_find_explain_command(
+            "im_msg",
+            2,
+            5,
+            Some(r#"{"active":true}"#),
+            Some(r#"{"email":1}"#),
+            Some(r#"{"email":1}"#),
+            Some(r#"{"locale":"en","strength":1}"#),
+            "executionStats",
+        )
+        .unwrap();
+
+        let find = command.get_document("explain").unwrap();
+        assert_eq!(find.get_str("find").unwrap(), "im_msg");
+        assert!(find.get_document("filter").unwrap().get_bool("active").unwrap());
+        assert_eq!(find.get_document("projection").unwrap().get_i64("email").unwrap(), 1);
+        assert_eq!(find.get_document("sort").unwrap().get_i64("email").unwrap(), 1);
+        assert_eq!(find.get_i64("skip").unwrap(), 2);
+        assert_eq!(find.get_i64("limit").unwrap(), 5);
+        assert_eq!(find.get_document("collation").unwrap().get_str("locale").unwrap(), "en");
+        assert_eq!(command.get_str("verbosity").unwrap(), "executionStats");
+    }
+
+    #[test]
+    fn rejects_invalid_find_explain_verbosity() {
+        let error = build_find_explain_command("items", 0, 0, None, None, None, None, "invalid").unwrap_err();
+        assert!(error.contains("queryPlanner, executionStats, or allPlansExecution"));
+    }
+
+    #[test]
+    fn mongo_find_count_failure_returns_loaded_lower_bound() {
+        let error = "invalid type: floating point `2053278871.0`, expected u64".to_string();
+
+        assert_eq!(resolve_mongo_find_total(Err(error), false, 100, 25), (125, false));
+    }
+
+    #[test]
+    fn mongo_find_count_success_preserves_count_semantics() {
+        assert_eq!(resolve_mongo_find_total(Ok(250), true, 100, 25), (250, true));
+        assert_eq!(resolve_mongo_find_total(Ok(250), false, 100, 25), (250, false));
+    }
+
+    #[test]
+    fn detects_mongo_secondary_only_list_databases_errors() {
+        assert!(list_databases_requires_secondary_fallback("NotWritablePrimary: not master"));
+        assert!(list_databases_requires_secondary_fallback("not master and slaveOk=false"));
+        assert!(!list_databases_requires_secondary_fallback("Unauthorized: listDatabases"));
+    }
+
+    #[test]
+    fn list_databases_fallback_selects_secondary_preferred() {
+        assert!(matches!(
+            list_databases_secondary_selection(),
+            SelectionCriteria::ReadPreference(ReadPreference::SecondaryPreferred { .. })
+        ));
+    }
+
+    #[test]
     fn parse_aggregate_options_document_keeps_official_fields() {
         let doc = parse_aggregate_options_document(Some(
             r#"{
@@ -2021,20 +2662,13 @@ mod tests {
     }
 
     #[test]
-    fn update_options_parse_array_filters() {
-        let filters = parse_update_array_filters(Some(r#"{"arrayFilters":[{"item.id":322678},{"item.active":true}]}"#))
-            .unwrap()
-            .unwrap();
+    fn update_options_parse_upsert_and_array_filters() {
+        let options =
+            parse_update_options(Some(r#"{"upsert":true,"arrayFilters":[{"item.id":322678},{"item.active":true}]}"#))
+                .unwrap();
 
-        assert_eq!(filters, vec![doc! { "item.id": 322678_i64 }, doc! { "item.active": true }]);
-    }
-
-    #[test]
-    fn update_options_reject_unsupported_fields() {
-        let error = parse_update_array_filters(Some(r#"{"upsert":true}"#)).unwrap_err();
-
-        assert!(error.starts_with("Invalid update options:"));
-        assert!(error.contains("unknown field `upsert`"));
+        assert_eq!(options.upsert, Some(true));
+        assert_eq!(options.array_filters.unwrap(), vec![doc! { "item.id": 322678_i64 }, doc! { "item.active": true }]);
     }
 
     #[test]
@@ -2070,6 +2704,33 @@ mod tests {
         // Existing target names must fail at the server instead of being overwritten.
         let command = rename_collection_command_document("app", "users", "accounts").unwrap();
         assert!(!command.contains_key("dropTarget"));
+    }
+
+    #[test]
+    fn clone_collection_validation_preserves_identifiers_and_rejects_unsafe_targets() {
+        validate_clone_collection_names("app", " users ", " users_backup ").unwrap();
+        assert!(validate_clone_collection_names("app", "users", "users").unwrap_err().contains("differ"));
+        assert!(validate_clone_collection_names("app", "system.users", "users_backup")
+            .unwrap_err()
+            .contains("System collections"));
+        assert!(validate_clone_collection_names("app", "users", "system.users_backup")
+            .unwrap_err()
+            .contains("System collections"));
+    }
+
+    #[test]
+    fn clone_collection_skips_the_automatic_id_index_by_key_not_name() {
+        let automatic_id = IndexModel::builder()
+            .keys(doc! { "_id": 1 })
+            .options(IndexOptions::builder().name("custom_id_name".to_string()).build())
+            .build();
+        let ordinary_index = IndexModel::builder()
+            .keys(doc! { "external_id": 1 })
+            .options(IndexOptions::builder().name("external_id_1".to_string()).build())
+            .build();
+
+        assert!(is_automatic_id_index(&automatic_id));
+        assert!(!is_automatic_id_index(&ordinary_index));
     }
 
     #[test]
@@ -2550,6 +3211,131 @@ mod tests {
     }
 
     #[test]
+    fn mongo_namespace_validation_preserves_whitespace_and_rejects_only_empty_names() {
+        assert_eq!(validate_mongo_namespace_name("  app  ", "Database").unwrap(), "  app  ");
+        assert_eq!(validate_mongo_namespace_name(" users ", "Collection").unwrap(), " users ");
+        assert_eq!(validate_mongo_namespace_name("   ", "Collection").unwrap(), "   ");
+
+        let error = validate_mongo_namespace_name("", "Collection").unwrap_err();
+        assert_eq!(error, "Collection name is required");
+    }
+
+    #[test]
+    fn create_user_command_preserves_roles_and_write_concern() {
+        let command = create_user_command(
+            r#"{"user":"test-db","pwd":"test-password","roles":[{"role":"readWrite","db":"db1"}]}"#,
+            Some(r#"{"w":"majority","wtimeout":5000}"#),
+        )
+        .unwrap();
+
+        assert_eq!(command.keys().next().map(String::as_str), Some("createUser"));
+        assert_eq!(command.get_str("createUser").unwrap(), "test-db");
+        assert_eq!(command.get_str("pwd").unwrap(), "test-password");
+        let roles = command.get_array("roles").unwrap();
+        assert_eq!(roles[0].as_document().unwrap(), &doc! { "role": "readWrite", "db": "db1" });
+        assert_eq!(command.get_document("writeConcern").unwrap(), &doc! { "w": "majority", "wtimeout": 5000_i32 });
+    }
+
+    #[test]
+    fn create_user_command_rejects_missing_names_and_reserved_fields() {
+        for user in [
+            r#"{"pwd":"secret","roles":[]}"#,
+            r#"{"user":"","pwd":"secret","roles":[]}"#,
+            r#"{"user":"app","createUser":"other","pwd":"secret","roles":[]}"#,
+            r#"{"user":"app","writeConcern":{"w":1},"pwd":"secret","roles":[]}"#,
+        ] {
+            assert!(create_user_command(user, None).is_err(), "{user}");
+        }
+        assert!(create_user_command(r#"{"user":"app","pwd":"secret","roles":[]}"#, Some("true")).is_err());
+    }
+
+    #[test]
+    fn create_indexes_command_keeps_raw_options_and_generates_a_name() {
+        let (command, name) = create_indexes_command(
+            "users",
+            r#"{"email":1,"createdAt":-1,"content":"text"}"#,
+            Some(
+                r#"{"unique":true,"partialFilterExpression":{"verified":true},"customServerOption":{"enabled":true}}"#,
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(name, "email_1_createdAt_-1_content_text");
+        assert_eq!(command.get_str("createIndexes").unwrap(), "users");
+        let index = command.get_array("indexes").unwrap()[0].as_document().unwrap();
+        assert_eq!(
+            index.get_document("key").unwrap().keys().collect::<Vec<_>>(),
+            vec!["email", "createdAt", "content"],
+            "compound-index key order is part of MongoDB index semantics"
+        );
+        assert_eq!(
+            index.get_document("key").unwrap(),
+            &doc! { "email": 1_i32, "createdAt": -1_i32, "content": "text" }
+        );
+        assert!(index.get_bool("unique").unwrap());
+        assert_eq!(index.get_str("name").unwrap(), "email_1_createdAt_-1_content_text");
+        assert_eq!(index.get_document("customServerOption").unwrap(), &doc! { "enabled": true });
+    }
+
+    #[test]
+    fn create_indexes_command_canonicalizes_a_whole_double_in_the_default_name() {
+        let (command, name) = create_indexes_command("users", r#"{"email":1.0}"#, None).unwrap();
+
+        assert_eq!(name, "email_1");
+        let index = command.get_array("indexes").unwrap()[0].as_document().unwrap();
+        assert_eq!(index.get_str("name").unwrap(), "email_1");
+        assert!(
+            matches!(index.get("key"), Some(Bson::Document(keys)) if matches!(keys.get("email"), Some(Bson::Double(value)) if *value == 1.0))
+        );
+    }
+
+    #[test]
+    fn create_indexes_command_preserves_extended_json_options() {
+        let (command, name) = create_indexes_command(
+            "events",
+            r#"{"expiresAt":1}"#,
+            Some(r#"{"name":"expires_ttl","partialFilterExpression":{"createdAt":{"$date":"2026-06-10T13:59:31.287Z"}}}"#),
+        )
+        .unwrap();
+
+        assert_eq!(name, "expires_ttl");
+        let index = command.get_array("indexes").unwrap()[0].as_document().unwrap();
+        let filter = index.get_document("partialFilterExpression").unwrap();
+        assert!(matches!(filter.get("createdAt"), Some(Bson::DateTime(_))));
+    }
+
+    #[test]
+    fn create_indexes_command_keeps_plain_json_strings_literal() {
+        let (command, _) = create_indexes_command(
+            "events",
+            r#"{"expiresAt":1}"#,
+            Some(r#"{"partialFilterExpression":{"source":"ISODate(\"2026-06-10T13:59:31.287Z\")"}}"#),
+        )
+        .unwrap();
+
+        let index = command.get_array("indexes").unwrap()[0].as_document().unwrap();
+        let filter = index.get_document("partialFilterExpression").unwrap();
+        assert!(
+            matches!(filter.get("source"), Some(Bson::String(value)) if value == "ISODate(\"2026-06-10T13:59:31.287Z\")")
+        );
+    }
+
+    #[test]
+    fn create_indexes_command_rejects_key_inside_options() {
+        let error = create_indexes_command("users", r#"{"email":1}"#, Some(r#"{"key":{"other":1}}"#)).unwrap_err();
+
+        assert!(error.contains("cannot contain \"key\""), "{error}");
+    }
+
+    #[test]
+    fn create_indexes_command_rejects_empty_or_non_string_names() {
+        for options in [r#"{"name":""}"#, r#"{"name":"   "}"#, r#"{"name":null}"#, r#"{"name":1}"#] {
+            let error = create_indexes_command("users", r#"{"email":1}"#, Some(options)).unwrap_err();
+            assert!(error.contains("non-empty string"), "{error}");
+        }
+    }
+
+    #[test]
     fn parse_drop_indexes_value_validates_drop_index_arguments() {
         assert!(matches!(
             parse_drop_indexes_value(Some(r#""users_email_unique""#), true),
@@ -2597,6 +3383,50 @@ mod tests {
 
         let invalid_array = parse_drop_indexes_value(Some(r#"[{"a":1}]"#), false).unwrap_err();
         assert!(invalid_array.contains("arrays of string index names"));
+    }
+
+    #[test]
+    fn drop_indexes_validation_rejects_the_default_id_index() {
+        for (indexes_json, single) in [
+            (Some(r#""_id_""#), true),
+            (Some(r#""_id_""#), false),
+            (Some(r#"{"_id":1}"#), true),
+            (Some(r#"{"_id":1}"#), false),
+            (Some(r#"{"_id":1.0}"#), true),
+            (Some(r#"{"_id":{"$numberInt":"1"}}"#), true),
+            (Some(r#"{"_id":{"$numberLong":"1"}}"#), false),
+            (Some(r#"{"_id":{"$numberDouble":"1.0"}}"#), false),
+            (Some(r#"{"_id":{"$numberDecimal":"1.0"}}"#), true),
+            (Some(r#"["email_1","_id_"]"#), false),
+        ] {
+            let error = validate_drop_indexes_request(indexes_json, single).unwrap_err();
+            assert!(error.contains("_id_"), "{error}");
+        }
+
+        // MongoDB defines dropIndexes("*") to retain the default _id_ index.
+        assert!(matches!(validate_drop_indexes_request(Some(r#""*""#), false), Ok(())));
+    }
+
+    #[test]
+    fn serial_drop_index_names_is_portable_and_prevalidates_all_names() {
+        assert_eq!(
+            serial_drop_index_names(Some(r#"["email_1","email_1","createdAt_-1"]"#), false).unwrap(),
+            Some(vec!["email_1".to_string(), "createdAt_-1".to_string()])
+        );
+        assert_eq!(serial_drop_index_names(Some(r#""*""#), false).unwrap(), None);
+
+        let error = serial_drop_index_names(Some(r#"["email_1","_id_"]"#), false).unwrap_err();
+        assert!(error.contains("_id_"), "{error}");
+    }
+
+    #[test]
+    fn serial_drop_indexes_fallback_is_limited_to_pre_42_servers() {
+        for version in ["3.4.24", "4.0.28", "MongoDB 3.6.23"] {
+            assert!(mongo_server_requires_serial_drop_indexes(version), "{version}");
+        }
+        for version in ["4.2.0", "4.4.29", "5.0.0-rc0", "8.0.1", "unknown", "4"] {
+            assert!(!mongo_server_requires_serial_drop_indexes(version), "{version}");
+        }
     }
 
     #[test]
@@ -2675,6 +3505,21 @@ mod tests {
         assert!(matches!(doc.get("_id"), Some(Bson::ObjectId(oid)) if oid.to_hex() == "507f1f77bcf86cd799439011"));
         assert!(matches!(doc.get("created_at"), Some(Bson::DateTime(_))));
         assert!(matches!(doc.get("count"), Some(Bson::Int64(42))));
+    }
+
+    #[test]
+    fn json_object_to_document_extended_json_keeps_shell_date_strings_literal() {
+        let value = serde_json::json!({
+            "date_text": "ISODate(\"2026-08-10T00:00:00.000Z\")",
+            "actual_date": { "$date": "2026-08-10T00:00:00.000Z" },
+        });
+        let doc = json_object_to_document_extended_json(&value).unwrap();
+
+        assert!(matches!(
+            doc.get("date_text"),
+            Some(Bson::String(value)) if value == "ISODate(\"2026-08-10T00:00:00.000Z\")"
+        ));
+        assert!(matches!(doc.get("actual_date"), Some(Bson::DateTime(_))));
     }
 
     #[test]

@@ -138,6 +138,7 @@ export const syncSavedSqlDirectory = forward("syncSavedSqlDirectory");
 // Schema
 export const listDatabases = forward("listDatabases");
 export const listDatabaseStorage = forward("listDatabaseStorage");
+export const getSqlServerCompletionContext = forward("getSqlServerCompletionContext");
 export const listDorisCatalogs = forward("listDorisCatalogs");
 export const listDorisCatalogDatabases = forward("listDorisCatalogDatabases");
 export const listSqlServerLinkedServers = forward("listSqlServerLinkedServers");
@@ -156,7 +157,9 @@ export const listObjectStatistics = forward("listObjectStatistics");
 export const listCompletionObjects = forward("listCompletionObjects");
 export const completionAssistantSearch = forward("completionAssistantSearch");
 export const getObjectSource = forward("getObjectSource");
+export const getCustomTypeDetails = forward("getCustomTypeDetails");
 export const getColumns = forward("getColumns");
+export const getAllColumns = forward("getAllColumns");
 export const getSqlServerColumnMetadata = forward("getSqlServerColumnMetadata");
 export const listDataTypes = forward("listDataTypes");
 export const listIndexes = forward("listIndexes");
@@ -176,6 +179,13 @@ export const listAvailableExtensions = forward("listAvailableExtensions");
 export const prepareSchemaDiff = forward("prepareSchemaDiff");
 export const generateSchemaSyncSql = forward("generateSchemaSyncSql");
 export const listDialectDataTypes = forward("listDialectDataTypes");
+
+// Docs
+export const collectDocsSnapshot = forward("collectDocsSnapshot");
+export const loadDocsAnnotations = forward("loadDocsAnnotations");
+export const applyDocsAnnotations = forward("applyDocsAnnotations");
+export const saveDocsAnnotations = forward("saveDocsAnnotations");
+export const exportDocsHtml = forward("exportDocsHtml");
 
 // Query
 export const executeQuery = forward("executeQuery");
@@ -301,6 +311,9 @@ export const snippetSyncTest = forward("snippetSyncTest");
 export const snippetTokenStatus = forward("snippetTokenStatus");
 export const saveSnippetSavedToken = forward("saveSnippetSavedToken");
 export const forgetSnippetSavedToken = forward("forgetSnippetSavedToken");
+export const snippetSyncSettings = forward("snippetSyncSettings");
+export const saveSnippetSyncId = forward("saveSnippetSyncId");
+export const retrySnippetLegacyCleanup = forward("retrySnippetLegacyCleanup");
 export const snippetSyncUpload = forward("snippetSyncUpload");
 export const snippetSyncDownload = forward("snippetSyncDownload");
 export const saveAiConversation = forward("saveAiConversation");
@@ -328,6 +341,8 @@ export const pendingOpenSqlFiles = forward("pendingOpenSqlFiles");
 export const pendingOpenDbFiles = forward("pendingOpenDbFiles");
 export const pendingOpenConnectionLinks = forward("pendingOpenConnectionLinks");
 export const readExternalSqlFile = forward("readExternalSqlFile");
+export const readExternalSqlFileSnapshot = forward("readExternalSqlFileSnapshot");
+export const inspectExternalSqlFile = forward("inspectExternalSqlFile");
 export const writeExternalSqlFile = forward("writeExternalSqlFile");
 export const saveExternalSqlFile = forward("saveExternalSqlFile");
 export const listSqlFilesInFolder = forward("listSqlFilesInFolder");
@@ -354,8 +369,14 @@ export const nacosRollbackConfig = forward("nacosRollbackConfig");
 export const nacosGetRNacosConsoleCaptcha = forward("nacosGetRNacosConsoleCaptcha");
 export const nacosLoginRNacosConsole = forward("nacosLoginRNacosConsole");
 export const nacosListServices = forward("nacosListServices");
+export const nacosGetService = forward("nacosGetService");
+export const nacosCreateService = forward("nacosCreateService");
+export const nacosUpdateService = forward("nacosUpdateService");
+export const nacosDeleteService = forward("nacosDeleteService");
 export const nacosListInstances = forward("nacosListInstances");
 export const nacosUpdateInstance = forward("nacosUpdateInstance");
+export const nacosRegisterInstance = forward("nacosRegisterInstance");
+export const nacosDeregisterInstance = forward("nacosDeregisterInstance");
 export const nacosGetDashboard = forward("nacosGetDashboard");
 export const nacosRawRequest = forward("nacosRawRequest");
 
@@ -392,6 +413,7 @@ export const redisScanKeys = forward("redisScanKeys");
 export const redisScanKeysBatch = forward("redisScanKeysBatch");
 export const redisScanValues = forward("redisScanValues");
 export const redisGetValue = forward("redisGetValue");
+export const redisGetTtl = forward("redisGetTtl");
 export const redisGetStreamEntries = forward("redisGetStreamEntries");
 export const redisGetStreamGroups = forward("redisGetStreamGroups");
 export const redisGetStreamConsumers = forward("redisGetStreamConsumers");
@@ -400,6 +422,8 @@ export const redisSetString = forward("redisSetString");
 export const redisDeleteKey = forward("redisDeleteKey");
 export const redisHashSet = forward("redisHashSet");
 export const redisHashDel = forward("redisHashDel");
+export const redisHashFieldSetTtl = forward("redisHashFieldSetTtl");
+export const redisHashFieldSetExpireAt = forward("redisHashFieldSetExpireAt");
 export const redisListPush = forward("redisListPush");
 export const redisListSet = forward("redisListSet");
 export const redisListRemove = forward("redisListRemove");
@@ -407,6 +431,7 @@ export const redisSetAdd = forward("redisSetAdd");
 export const redisSetRemove = forward("redisSetRemove");
 export const redisZadd = forward("redisZadd");
 export const redisZrem = forward("redisZrem");
+export const redisZsetUpdate = forward("redisZsetUpdate");
 export const redisStreamAdd = forward("redisStreamAdd");
 export const redisJsonSet = forward("redisJsonSet");
 export const redisCheckJsonModule = forward("redisCheckJsonModule");
@@ -430,12 +455,126 @@ export const etcdDelete = forward("etcdDelete");
 export const etcdRename = forward("etcdRename");
 export const etcdHistory = forward("etcdHistory");
 export const etcdStatus = forward("etcdStatus");
+export const etcdPreflight = forward("etcdPreflight");
+export const etcdCompact = forward("etcdCompact");
+export const etcdDefrag = forward("etcdDefrag");
+export const etcdWatchStart = forward("etcdWatchStart");
+export const etcdWatchPoll = forward("etcdWatchPoll");
+export const etcdWatchStop = forward("etcdWatchStop");
+export const etcdLeaseList = forward("etcdLeaseList");
+export const etcdLeaseCall = forward("etcdLeaseCall");
+export const etcdAuthCall = forward("etcdAuthCall");
 
 // ZooKeeper
 export const zookeeperListPrefix = forward("zookeeperListPrefix");
 export const zookeeperGet = forward("zookeeperGet");
 export const zookeeperPut = forward("zookeeperPut");
 export const zookeeperDelete = forward("zookeeperDelete");
+
+// Consul KV
+export const consulCapabilities = forward("consulCapabilities");
+export const consulTxn = forward("consulTxn");
+export const consulRenameKey = forward("consulRenameKey");
+export const consulBlockingQuery = forward("consulBlockingQuery");
+export const consulDomainWatch = forward("consulDomainWatch");
+export const consulCancelBlocking = forward("consulCancelBlocking");
+export const consulWatchStart = forward("consulWatchStart");
+export const consulListRecursive = forward("consulListRecursive");
+export const consulSearch = forward("consulSearch");
+export const consulSearchProgress = forward("consulSearchProgress");
+export const consulCancelSearch = forward("consulCancelSearch");
+export const consulExportBundle = forward("consulExportBundle");
+export const consulImportPreview = forward("consulImportPreview");
+export const consulImportExecute = forward("consulImportExecute");
+export const consulDeletePrefixPreview = forward("consulDeletePrefixPreview");
+export const consulDeletePrefixExecute = forward("consulDeletePrefixExecute");
+export const consulListPrefix = forward("consulListPrefix");
+export const consulGet = forward("consulGet");
+export const consulPut = forward("consulPut");
+export const consulDelete = forward("consulDelete");
+export const consulPreparedQueryList = forward("consulPreparedQueryList");
+export const consulPreparedQueryRead = forward("consulPreparedQueryRead");
+export const consulPreparedQueryCreate = forward("consulPreparedQueryCreate");
+export const consulPreparedQueryUpdate = forward("consulPreparedQueryUpdate");
+export const consulPreparedQueryDelete = forward("consulPreparedQueryDelete");
+export const consulPreparedQueryExecute = forward("consulPreparedQueryExecute");
+export const consulPreparedQueryExplain = forward("consulPreparedQueryExplain");
+export const consulEventList = forward("consulEventList");
+export const consulEventFire = forward("consulEventFire");
+export const consulCoordinateNodes = forward("consulCoordinateNodes");
+export const consulOperatorRead = forward("consulOperatorRead");
+export const consulSnapshotGenerate = forward("consulSnapshotGenerate");
+export const consulSnapshotRestore = forward("consulSnapshotRestore");
+export const consulAutopilotUpdate = forward("consulAutopilotUpdate");
+export const consulRaftTransfer = forward("consulRaftTransfer");
+export const consulRaftRemove = forward("consulRaftRemove");
+export const consulKeyringWrite = forward("consulKeyringWrite");
+export const consulLicenseWrite = forward("consulLicenseWrite");
+export const consulStatusLeader = forward("consulStatusLeader");
+export const consulStatusPeers = forward("consulStatusPeers");
+export const consulAgentSelf = forward("consulAgentSelf");
+export const consulAgentMembers = forward("consulAgentMembers");
+export const consulAgentMetrics = forward("consulAgentMetrics");
+export const consulCatalogDatacenters = forward("consulCatalogDatacenters");
+export const consulCatalogNodes = forward("consulCatalogNodes");
+export const consulCatalogServices = forward("consulCatalogServices");
+export const consulCatalogServiceNodes = forward("consulCatalogServiceNodes");
+export const consulCatalogNodeServices = forward("consulCatalogNodeServices");
+export const consulHealthNode = forward("consulHealthNode");
+export const consulHealthChecks = forward("consulHealthChecks");
+export const consulHealthService = forward("consulHealthService");
+export const consulHealthState = forward("consulHealthState");
+export const consulAgentServices = forward("consulAgentServices");
+export const consulAgentService = forward("consulAgentService");
+export const consulAgentChecks = forward("consulAgentChecks");
+export const consulAgentRegisterService = forward("consulAgentRegisterService");
+export const consulAgentDeregisterService = forward("consulAgentDeregisterService");
+export const consulAgentServiceMaintenance = forward("consulAgentServiceMaintenance");
+export const consulAgentRegisterCheck = forward("consulAgentRegisterCheck");
+export const consulAgentDeregisterCheck = forward("consulAgentDeregisterCheck");
+export const consulAgentUpdateTtl = forward("consulAgentUpdateTtl");
+export const consulSessions = forward("consulSessions");
+export const consulNodeSessions = forward("consulNodeSessions");
+export const consulSession = forward("consulSession");
+export const consulSessionKeys = forward("consulSessionKeys");
+export const consulSessionDestroyImpact = forward("consulSessionDestroyImpact");
+export const consulCreateSession = forward("consulCreateSession");
+export const consulRenewSession = forward("consulRenewSession");
+export const consulDestroySession = forward("consulDestroySession");
+export const consulAcquireLock = forward("consulAcquireLock");
+export const consulReleaseLock = forward("consulReleaseLock");
+export const consulAclList = forward("consulAclList");
+export const consulAclTokenSelf = forward("consulAclTokenSelf");
+export const consulAclTokenClone = forward("consulAclTokenClone");
+export const consulAclGet = forward("consulAclGet");
+export const consulAclApply = forward("consulAclApply");
+export const consulAclReferences = forward("consulAclReferences");
+export const consulAclDelete = forward("consulAclDelete");
+export const consulEnterpriseList = forward("consulEnterpriseList");
+export const consulEnterpriseGet = forward("consulEnterpriseGet");
+export const consulEnterpriseApply = forward("consulEnterpriseApply");
+export const consulEnterpriseImpact = forward("consulEnterpriseImpact");
+export const consulEnterpriseDelete = forward("consulEnterpriseDelete");
+export const consulMeshConfigList = forward("consulMeshConfigList");
+export const consulMeshConfigGet = forward("consulMeshConfigGet");
+export const consulMeshConfigApply = forward("consulMeshConfigApply");
+export const consulMeshConfigDelete = forward("consulMeshConfigDelete");
+export const consulMeshIntentionsList = forward("consulMeshIntentionsList");
+export const consulMeshIntentionGet = forward("consulMeshIntentionGet");
+export const consulMeshIntentionGetExact = forward("consulMeshIntentionGetExact");
+export const consulMeshIntentionUpsert = forward("consulMeshIntentionUpsert");
+export const consulMeshIntentionDelete = forward("consulMeshIntentionDelete");
+export const consulMeshIntentionDeleteExact = forward("consulMeshIntentionDeleteExact");
+export const consulMeshIntentionMatch = forward("consulMeshIntentionMatch");
+export const consulMeshIntentionCheck = forward("consulMeshIntentionCheck");
+export const consulMeshDiscoveryChain = forward("consulMeshDiscoveryChain");
+export const consulMeshPeeringList = forward("consulMeshPeeringList");
+export const consulMeshPeeringGet = forward("consulMeshPeeringGet");
+export const consulMeshPeeringGenerateToken = forward("consulMeshPeeringGenerateToken");
+export const consulMeshPeeringEstablish = forward("consulMeshPeeringEstablish");
+export const consulMeshPeeringDelete = forward("consulMeshPeeringDelete");
+export const consulMeshExportedServicesList = forward("consulMeshExportedServicesList");
+export const consulMeshExportedServicesApply = forward("consulMeshExportedServicesApply");
 
 // HBase
 export const hbaseGetTableSchema = forward("hbaseGetTableSchema");
@@ -473,6 +612,7 @@ export const mqListClientConnections = forward("mqListClientConnections");
 export const mqListClientChannels = forward("mqListClientChannels");
 export const mqCloseClientConnection = forward("mqCloseClientConnection");
 export const mqListSubscriptions = forward("mqListSubscriptions");
+export const mqEnrichSubscriptions = forward("mqEnrichSubscriptions");
 export const mqCreateSubscription = forward("mqCreateSubscription");
 export const mqDeleteSubscription = forward("mqDeleteSubscription");
 export const mqSkipMessages = forward("mqSkipMessages");
@@ -536,6 +676,7 @@ export const mongoCreateDatabase = forward("mongoCreateDatabase");
 export const mongoDropDatabase = forward("mongoDropDatabase");
 export const mongoDropCollection = forward("mongoDropCollection");
 export const mongoRenameCollection = forward("mongoRenameCollection");
+export const mongoCloneCollection = forward("mongoCloneCollection");
 export const documentFindDocuments = forward("documentFindDocuments");
 export const elasticsearchCountDocuments = forward("elasticsearchCountDocuments");
 export const mongoFindDocuments = forward("mongoFindDocuments");
@@ -547,6 +688,7 @@ export const mongoAggregateDocuments = forward("mongoAggregateDocuments");
 export const mongoDistinct = forward("mongoDistinct");
 export const mongoCollectionStats = forward("mongoCollectionStats");
 export const mongoCreateIndex = forward("mongoCreateIndex");
+export const mongoCreateUser = forward("mongoCreateUser");
 export const mongoDropIndexes = forward("mongoDropIndexes");
 export const documentInsertDocument = forward("documentInsertDocument");
 export const mongoInsertDocument = forward("mongoInsertDocument");
@@ -582,6 +724,7 @@ export const checkForUpdates = forward("checkForUpdates");
 export const fetchChangelog = forward("fetchChangelog");
 export const getSystemProxyUrl = forward("getSystemProxyUrl");
 export const downloadUpdate = forward("downloadUpdate");
+export const cancelUpdateDownload = forward("cancelUpdateDownload");
 export const installDownloadedUpdate = forward("installDownloadedUpdate");
 export const getAppVersion = forward("getAppVersion");
 export const getAppSupportInfo = forward("getAppSupportInfo");
@@ -624,6 +767,7 @@ export type {
   WebDavDownloadResult,
   SnippetProvider,
   SnippetSyncConfig,
+  SnippetSyncSettings,
   SnippetSyncSummary,
   SnippetDownloadResult,
   SnippetTokenStatus,
@@ -673,6 +817,20 @@ export type {
   KvStatusMember,
   KvPrometheusMetrics,
   KvStatusResponse,
+  EtcdDefragResponse,
+  EtcdDefragMemberResult,
+  EtcdWatchStartRequest,
+  EtcdWatchStartResponse,
+  EtcdWatchPollResponse,
+  EtcdLeaseListResponse,
+  EtcdLeaseDetail,
+  EtcdAuthUserListResponse,
+  EtcdAuthUserDetail,
+  EtcdAuthPermission,
+  EtcdAuthRoleListResponse,
+  EtcdAuthRoleDetail,
+  EtcdPreflightResponse,
+  EtcdDangerousApproval,
   DocumentQueryResult,
   MongoDocumentResult,
   HistoryEntry,
@@ -689,6 +847,9 @@ export type {
   TransferRequest,
   TransferProgress,
   TransferMode,
+  TransferContent,
+  TransferObjectKind,
+  TransferObjectSelection,
   TransferTableNameCase,
   TransferOwnershipPolicy,
   TransferOwnershipPreview,
@@ -714,3 +875,16 @@ export type {
   AgentEvent,
   SqlFileEntry,
 } from "@/lib/backend/tauri";
+
+// MQTT
+export const mqttGetBrokerInfo = forward("mqttGetBrokerInfo");
+export const mqttSubscribe = forward("mqttSubscribe");
+export const mqttSaveTopicConfig = forward("mqttSaveTopicConfig");
+export const mqttDeleteTopicConfig = forward("mqttDeleteTopicConfig");
+export const mqttUnsubscribe = forward("mqttUnsubscribe");
+export const mqttPublish = forward("mqttPublish");
+export const mqttListTopics = forward("mqttListTopics");
+export const mqttListSavedTopicConfigs = forward("mqttListSavedTopicConfigs");
+export const mqttGetTopicTree = forward("mqttGetTopicTree");
+export const mqttGetMessages = forward("mqttGetMessages");
+export const mqttClearMessages = forward("mqttClearMessages");

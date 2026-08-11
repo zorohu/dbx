@@ -33,7 +33,9 @@ function connection(id: string, host: string): ConnectionConfig {
     transport_layers: [],
     show_system_schemas: false,
     connect_timeout_secs: 10,
+    connect_timeout_inherit: false,
     query_timeout_secs: 30,
+    query_timeout_inherit: false,
     idle_timeout_secs: 60,
     keepalive_interval_secs: 30,
   };

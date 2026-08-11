@@ -3,6 +3,8 @@ import "vue-virtual-scroller/dist/vue-virtual-scroller.css";
 import "./styles/globals.css";
 import DetachedWindowShell from "@/components/layout/DetachedWindowShell.vue";
 import { installDebugLogCapture } from "@/lib/backend/debugLog";
+import { clearStartupPreloadRetry, retryStartupAfterPreloadFailure } from "@/lib/startup/startupPreloadRecovery";
+import { applyLegacyWebViewClass } from "@/lib/ui/legacyWebView";
 
 const DETACHED_TRANSFER_PARAM = "dbxDetachedTransfer";
 
@@ -14,6 +16,7 @@ function startupErrorMessage(error: unknown): string {
 }
 
 function renderStartupError(error: unknown) {
+  if (retryStartupAfterPreloadFailure(error)) return;
   const message = startupErrorMessage(error);
   console.error("[STARTUP] bootstrap failed", error);
   const root = document.querySelector<HTMLDivElement>("#root");
@@ -94,6 +97,8 @@ function mountApplication(root: HTMLDivElement, { App, createPinia, i18n, VueVir
   app.use(i18n);
   app.use(VueVirtualScroller);
   app.mount("#root");
+  clearStartupPreloadRetry();
+  window.dispatchEvent(new Event("dbx:startup-ready"));
   console.log("[STARTUP] vue mounted");
 
   installGlobalInputAttrs();
@@ -134,4 +139,5 @@ async function bootstrap() {
 
 installDebugLogCapture();
 installStartupErrorHandlers();
+applyLegacyWebViewClass();
 void bootstrap().catch(renderStartupError);

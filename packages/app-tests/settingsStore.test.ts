@@ -63,18 +63,30 @@ async function withMockLocalStorage(initial: Record<string, string>, run: () => 
 test("normalizes saved query result page size", () => {
   assert.equal(DEFAULT_EDITOR_SETTINGS.pageSize, 100);
   assert.equal(normalizeEditorSettings({ pageSize: 5000 }).pageSize, 5000);
-  assert.equal(normalizeEditorSettings({ pageSize: 200000 }).pageSize, 100000);
+  assert.equal(normalizeEditorSettings({ pageSize: 200000 }).pageSize, 200000);
+  assert.equal(normalizeEditorSettings({ pageSize: 2000000 }).pageSize, 1000000);
   assert.equal(normalizeEditorSettings({ pageSize: 0 }).pageSize, 100);
 });
 
 test("normalizes the dedicated default row limit for table opens", () => {
   assert.equal(DEFAULT_EDITOR_SETTINGS.tableOpenPageSize, 100);
   assert.equal(normalizeEditorSettings({ tableOpenPageSize: 1000 }).tableOpenPageSize, 1000);
-  assert.equal(normalizeEditorSettings({ tableOpenPageSize: 200000 }).tableOpenPageSize, 100000);
+  assert.equal(normalizeEditorSettings({ tableOpenPageSize: 200000 }).tableOpenPageSize, 200000);
+  assert.equal(normalizeEditorSettings({ tableOpenPageSize: 2000000 }).tableOpenPageSize, 1000000);
   assert.equal(normalizeEditorSettings({ tableOpenPageSize: 0 }).tableOpenPageSize, 100);
   assert.equal(tableOpenPageLimit(), 100);
   assert.equal(tableOpenPageLimit(1000), 1000);
   assert.equal(tableOpenPageLimit(0), 100);
+});
+
+test("normalizes the global query result row limit", () => {
+  assert.equal(DEFAULT_EDITOR_SETTINGS.queryResultMaxRowsEnabled, true);
+  assert.equal(DEFAULT_EDITOR_SETTINGS.queryResultMaxRows, 100000);
+  assert.equal(normalizeEditorSettings({}).queryResultMaxRowsEnabled, true);
+  assert.equal(normalizeEditorSettings({}).queryResultMaxRows, 100000);
+  assert.equal(normalizeEditorSettings({ queryResultMaxRowsEnabled: false, queryResultMaxRows: 250000 }).queryResultMaxRowsEnabled, false);
+  assert.equal(normalizeEditorSettings({ queryResultMaxRows: 250000 }).queryResultMaxRows, 250000);
+  assert.equal(normalizeEditorSettings({ queryResultMaxRows: 2147483648 }).queryResultMaxRows, 2147483647);
 });
 
 test("numericColumnRightAlign defaults to true and round-trips through normalizeEditorSettings", () => {
@@ -262,6 +274,21 @@ test("defaults unsaved SQL close confirmation to enabled", () => {
   assert.equal(normalizeEditorSettings({ confirmUnsavedSqlClose: false }).confirmUnsavedSqlClose, false);
 });
 
+test("defaults saved SQL to its saved target and normalizes persisted target modes", () => {
+  assert.equal(DEFAULT_EDITOR_SETTINGS.savedSqlOpenTargetMode, "saved");
+  assert.equal(normalizeEditorSettings({}).savedSqlOpenTargetMode, "saved");
+  assert.equal(normalizeEditorSettings({ savedSqlOpenTargetMode: "current" }).savedSqlOpenTargetMode, "current");
+  assert.equal(normalizeEditorSettings({ savedSqlOpenTargetMode: "invalid" as any }).savedSqlOpenTargetMode, "saved");
+});
+
+test("shows the saved SQL target selector in Editor settings", () => {
+  const source = readFileSync("apps/desktop/src/components/editor/EditorSettingsDialog.vue", "utf8");
+
+  assert.match(source, /id="editor-saved-sql-open-target"/);
+  assert.match(source, /<SelectItem value="saved">/);
+  assert.match(source, /<SelectItem value="current">/);
+});
+
 test("defaults Vim mode to off and preserves saved booleans", () => {
   assert.equal(DEFAULT_EDITOR_SETTINGS.vimModeEnabled, false);
   assert.equal(normalizeEditorSettings({}).vimModeEnabled, false);
@@ -300,6 +327,7 @@ test("defaults shortcut settings", () => {
 
   assert.equal(settings.shortcuts.executeSql, "Mod+Enter");
   assert.equal(settings.shortcuts.saveSql, "Mod+S");
+  assert.equal(settings.shortcuts.extendSelection, "Alt+W");
   assert.equal(settings.shortcuts.copyCurrentRow, "Mod+D");
   assert.equal(settings.shortcuts.deleteCurrentRow, "Delete");
   assert.equal(settings.shortcuts.newQuery, "Mod+T");
@@ -503,6 +531,11 @@ test("AI provider presets include common hosted and local providers", () => {
   assert.equal(AI_PROVIDER_PRESETS.gemini.model, "gemini-1.5-pro");
   assert.equal(AI_PROVIDER_PRESETS.deepseek.endpoint, "https://api.deepseek.com/v1");
   assert.equal(AI_PROVIDER_PRESETS.deepseek.model, "deepseek-v4-flash");
+  assert.equal(AI_PROVIDER_PRESETS.minimax.endpoint, "https://api.minimax.io/v1");
+  assert.equal(AI_PROVIDER_PRESETS.minimax.model, "MiniMax-M3");
+  assert.equal(AI_PROVIDER_PRESETS.minimax.authMethod, "bearer");
+  assert.equal(AI_PROVIDER_PRESETS.minimax.requiresApiKey, true);
+  assert.equal(AI_PROVIDER_PRESETS.minimax.iconSlug, "minimax");
   assert.equal(AI_PROVIDER_PRESETS.qwen.endpoint, "https://dashscope.aliyuncs.com/compatible-mode/v1");
   assert.equal(AI_PROVIDER_PRESETS.ollama.endpoint, "http://localhost:11434/v1");
   assert.equal(AI_PROVIDER_PRESETS.ollama.requiresApiKey, false);
@@ -517,13 +550,43 @@ test("AI provider presets include common hosted and local providers", () => {
   assert.equal(AI_PROVIDER_PRESETS["claude-code-cli"].model, "default");
   assert.equal(AI_PROVIDER_PRESETS["claude-code-cli"].iconSlug, "claudecode");
   assert.equal(AI_PROVIDER_PRESETS["claude-code-cli"].requiresApiKey, false);
+  assert.equal(AI_PROVIDER_PRESETS["opencode-cli"].model, "default");
+  assert.equal(AI_PROVIDER_PRESETS["opencode-cli"].iconSlug, "opencode");
+  assert.equal(AI_PROVIDER_PRESETS["opencode-cli"].requiresApiKey, false);
+  assert.equal(AI_PROVIDER_PRESETS["cursor-cli"].model, "default");
+  assert.equal(AI_PROVIDER_PRESETS["cursor-cli"].iconSlug, "cursor");
+  assert.equal(AI_PROVIDER_PRESETS["cursor-cli"].requiresApiKey, false);
+  assert.equal(AI_PROVIDER_PRESETS["codebuddy-cli"].model, "default");
+  assert.equal(AI_PROVIDER_PRESETS["codebuddy-cli"].iconSlug, "codebuddy");
+  assert.equal(AI_PROVIDER_PRESETS["codebuddy-cli"].requiresApiKey, false);
+  assert.equal(AI_PROVIDER_PRESETS["grok-cli"].model, "default");
+  assert.equal(AI_PROVIDER_PRESETS["grok-cli"].iconSlug, "grok");
+  assert.equal(AI_PROVIDER_PRESETS["grok-cli"].requiresApiKey, false);
   assert.equal(AI_PROVIDER_PRESETS["pi-agent-cli"].model, "default");
   assert.equal(AI_PROVIDER_PRESETS["pi-agent-cli"].iconSlug, "pi");
   assert.equal(AI_PROVIDER_PRESETS["pi-agent-cli"].requiresApiKey, false);
   assert.equal(Object.keys(AI_PROVIDER_PRESETS).indexOf("anthropic-compatible") + 1, Object.keys(AI_PROVIDER_PRESETS).indexOf("openai-compatible"));
+  assert.ok(Object.keys(AI_PROVIDER_PRESETS).indexOf("qwen") < Object.keys(AI_PROVIDER_PRESETS).indexOf("minimax"));
+  assert.ok(Object.keys(AI_PROVIDER_PRESETS).indexOf("minimax") < Object.keys(AI_PROVIDER_PRESETS).indexOf("ollama"));
   assert.ok(Object.keys(AI_PROVIDER_PRESETS).indexOf("claude-code-cli") < Object.keys(AI_PROVIDER_PRESETS).indexOf("codex-cli"));
   assert.ok(Object.keys(AI_PROVIDER_PRESETS).indexOf("claude-code-cli") < Object.keys(AI_PROVIDER_PRESETS).indexOf("pi-agent-cli"));
+  assert.ok(Object.keys(AI_PROVIDER_PRESETS).indexOf("codex-cli") < Object.keys(AI_PROVIDER_PRESETS).indexOf("opencode-cli"));
+  assert.ok(Object.keys(AI_PROVIDER_PRESETS).indexOf("opencode-cli") < Object.keys(AI_PROVIDER_PRESETS).indexOf("pi-agent-cli"));
+  assert.ok(Object.keys(AI_PROVIDER_PRESETS).indexOf("opencode-cli") < Object.keys(AI_PROVIDER_PRESETS).indexOf("cursor-cli"));
+  assert.ok(Object.keys(AI_PROVIDER_PRESETS).indexOf("cursor-cli") < Object.keys(AI_PROVIDER_PRESETS).indexOf("pi-agent-cli"));
+  assert.ok(Object.keys(AI_PROVIDER_PRESETS).indexOf("cursor-cli") < Object.keys(AI_PROVIDER_PRESETS).indexOf("codebuddy-cli"));
+  assert.ok(Object.keys(AI_PROVIDER_PRESETS).indexOf("codebuddy-cli") < Object.keys(AI_PROVIDER_PRESETS).indexOf("grok-cli"));
+  assert.ok(Object.keys(AI_PROVIDER_PRESETS).indexOf("codex-cli") < Object.keys(AI_PROVIDER_PRESETS).indexOf("grok-cli"));
   assert.ok(Object.keys(AI_PROVIDER_PRESETS).indexOf("codex-cli") < Object.keys(AI_PROVIDER_PRESETS).indexOf("pi-agent-cli"));
+});
+
+test("API AI provider settings expose and persist a default model ID", () => {
+  const source = readFileSync("apps/desktop/src/components/editor/EditorSettingsDialog.vue", "utf8");
+  const modelControl = source.indexOf('<Input v-model="aiEditModel"');
+
+  assert.ok(modelControl >= 0);
+  assert.match(source.slice(modelControl - 300, modelControl + 300), /v-if="!aiIsCliProvider"[\s\S]*t\("ai\.defaultModel"\)[\s\S]*t\('ai\.manualModelPlaceholder'\)/);
+  assert.match(source, /model:\s*aiEditModel\.value/);
 });
 
 test("normalizes legacy AI config and fills provider defaults", () => {
@@ -582,6 +645,31 @@ test("normalizes legacy AI config and fills provider defaults", () => {
   assert.equal(piAgent.piAgentCliPath, "/opt/homebrew/bin/pi");
   assert.deepEqual(piAgent.piAgentCliEnv, { HTTPS_PROXY: "http://proxy:9800" });
   assert.equal(piAgent.model, "default");
+
+  const openCode = normalizeAiConfig({
+    provider: "opencode-cli",
+    opencodeCliPath: " /opt/homebrew/bin/opencode ",
+    opencodeCliEnv: { HTTPS_PROXY: "http://proxy:9800" },
+  } as any);
+  assert.equal(openCode.opencodeCliPath, "/opt/homebrew/bin/opencode");
+  assert.deepEqual(openCode.opencodeCliEnv, { HTTPS_PROXY: "http://proxy:9800" });
+  assert.equal(openCode.model, "default");
+  const grokCli = normalizeAiConfig({
+    provider: "grok-cli",
+    grokCliPath: " /Users/me/.grok/bin/grok ",
+    grokCliEnv: { HTTPS_PROXY: "http://proxy:9800" },
+  });
+  assert.equal(grokCli.grokCliPath, "/Users/me/.grok/bin/grok");
+  assert.deepEqual(grokCli.grokCliEnv, { HTTPS_PROXY: "http://proxy:9800" });
+  assert.equal(grokCli.model, "default");
+  const codeBuddy = normalizeAiConfig({
+    provider: "codebuddy-cli",
+    codebuddyCliPath: " /opt/homebrew/bin/codebuddy ",
+    codebuddyCliEnv: { HTTPS_PROXY: "http://proxy:9800" },
+  });
+  assert.equal(codeBuddy.codebuddyCliPath, "/opt/homebrew/bin/codebuddy");
+  assert.deepEqual(codeBuddy.codebuddyCliEnv, { HTTPS_PROXY: "http://proxy:9800" });
+  assert.equal(codeBuddy.model, "default");
 });
 
 test("infers legacy AI provider from saved endpoint and model", () => {
@@ -594,6 +682,15 @@ test("infers legacy AI provider from saved endpoint and model", () => {
   assert.equal(deepseek.provider, "deepseek");
   assert.equal(deepseek.endpoint, "https://api.deepseek.com/anthropic/v1/messages");
   assert.equal(deepseek.model, "deepseek-v4-pro");
+
+  const minimax = normalizeAiConfig({
+    apiKey: "key",
+    endpoint: "https://api.minimax.io/v1",
+    model: "MiniMax-M3",
+  } as any);
+  assert.equal(minimax.provider, "minimax");
+  assert.equal(minimax.endpoint, "https://api.minimax.io/v1");
+  assert.equal(minimax.model, "MiniMax-M3");
 });
 
 test("normalizeEditorSettings falls back to the default UI scale", () => {

@@ -19,7 +19,7 @@ function startTabDrag(tabId: string, drag: ReturnType<typeof useTabDrag>) {
   tab.addEventListener("mousedown", (event) => drag.startDrag(event, tabId));
   document.body.append(tab);
   tab.dispatchEvent(mouse("mousedown", 20, 10));
-  document.dispatchEvent(mouse("mousemove", 30, 30));
+  document.dispatchEvent(mouse("mousemove", 40, 30));
 }
 
 afterEach(() => {
@@ -72,6 +72,6 @@ describe("useTabDrag detached window gesture", () => {
     document.dispatchEvent(mouse("mouseup", 20, 10));
 
     expect(onDetach).not.toHaveBeenCalled();
-    expect(drag.state.wasDragged).toBe(false);
+    expect(drag.state.suppressClick).toBe(false);
   });
 });

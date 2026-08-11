@@ -2,6 +2,7 @@ import { strict as assert } from "node:assert";
 import { test } from "vitest";
 import {
   buildSqlCompletionItems,
+  buildSqlCompletionItemsFromContext,
   getSqlFunctionSignatureHelp,
   getSqlCompletionResultValidFor,
   isSqlCommentContext,
@@ -496,6 +497,40 @@ test("suggests SQL Server tables for unquoted Chinese prefixes", () => {
   assert.equal(shouldAutoOpenSqlCompletion(sql, sql.length), true);
 });
 
+test("suggests SQL Server columns for an aliased unquoted Chinese table", () => {
+  const sql = "SELECT * FROM 大客户报废物资 AS tb2 WHERE ";
+  const options = { databaseType: "sqlserver" as const, dialect: "sqlserver" as const };
+  const legacy = getSqlCompletionContext(sql, sql.length, options);
+  const semantic = buildSqlSemanticModel(sql, sql.length, options);
+  const context = sqlCompletionContextFromSemantic(semantic, legacy);
+  const items = buildSqlCompletionItemsFromContext(context, {
+    ...options,
+    tables: [{ name: "大客户报废物资", schema: "dbo", type: "table" }],
+    columnsByTable: new Map([
+      [
+        "dbo.大客户报废物资",
+        [
+          { name: "物资编号", table: "大客户报废物资", schema: "dbo" },
+          { name: "客户名称", table: "大客户报废物资", schema: "dbo" },
+        ],
+      ],
+    ]),
+  });
+
+  assert.equal(context.referencedTables.length, 1);
+  assert.equal(context.referencedTables[0]?.name, "大客户报废物资");
+  assert.equal(context.referencedTables[0]?.alias, "tb2");
+  assert.equal(context.suggestColumns, true);
+  assert.equal(shouldAutoOpenSqlCompletion(sql, sql.length, options), true);
+  assert.deepEqual(
+    items
+      .filter((item) => item.type === "column")
+      .map((item) => item.label)
+      .sort(),
+    ["客户名称", "物资编号"],
+  );
+});
+
 test("preserves Unicode prefixes through the semantic completion context", () => {
   const sql = "select * from dbo.客户";
   const legacy = getSqlCompletionContext(sql, sql.length);
@@ -812,7 +847,7 @@ test("suggests columns from referenced tables in select list", () => {
     columnsByTable,
   });
 
-  assert.equal(items[0]?.label, "name");
+  assert.equal(items[0]?.label, "u.name");
   assert.equal(items[0]?.type, "column");
 });
 
@@ -1704,6 +1739,67 @@ test("applies keyword case to built-in SQL snippets", () => {
   assert.equal(snippet.apply, "select *\nfrom ${table}\nlimit 100;");
 });
 
+test("applies keyword and function case to built-in function templates", () => {
+  const windowItems = buildSqlCompletionItems("select row_", "select row_".length, {
+    tables,
+    columnsByTable,
+    keywordCase: "lower",
+    functionCase: "lower",
+  });
+  const rowNumber = windowItems.find((item) => item.type === "function" && item.label === "row_number");
+  assert.equal(rowNumber?.apply, "row_number() over (partition by ${col} order by ${col})");
+
+  const castItems = buildSqlCompletionItems("select cas", "select cas".length, {
+    tables,
+    columnsByTable,
+    keywordCase: "lower",
+    functionCase: "lower",
+  });
+  const cast = castItems.find((item) => item.type === "function" && item.label === "cast");
+  assert.equal(cast?.apply, "cast(${expression as type})");
+
+  const mysqlItems = buildSqlCompletionItems("select date_a", "select date_a".length, {
+    tables,
+    columnsByTable,
+    databaseType: "mysql",
+    keywordCase: "lower",
+    functionCase: "lower",
+  });
+  const dateAdd = mysqlItems.find((item) => item.type === "function" && item.label === "date_add");
+  assert.equal(dateAdd?.apply, "date_add(${date}, interval ${expr} ${unit})");
+});
+
+test("preserves the canonical function case when requested", () => {
+  const items = buildSqlCompletionItems("select row_", "select row_".length, {
+    tables,
+    columnsByTable,
+    keywordCase: "lower",
+    functionCase: "preserve",
+  });
+  const rowNumber = items.find((item) => item.type === "function" && item.label === "ROW_NUMBER");
+  assert.equal(rowNumber?.apply, "ROW_NUMBER() over (partition by ${col} order by ${col})");
+});
+
+test("applies keyword case to boolean comparison values", () => {
+  const booleanColumns = new Map<string, SqlCompletionColumn[]>([["public.flags", [{ name: "enabled", table: "flags", schema: "public", dataType: "boolean" }]]]);
+  const sql = "select * from flags where enabled = ";
+  const items = buildSqlCompletionItems(sql, sql.length, {
+    tables: [{ name: "flags", schema: "public", type: "table" }],
+    columnsByTable: booleanColumns,
+    keywordCase: "lower",
+  });
+  assert.ok(items.some((item) => item.type === "keyword" && item.label === "true"));
+  assert.ok(items.some((item) => item.type === "keyword" && item.label === "false"));
+  assert.equal(
+    items.some((item) => item.type === "keyword" && item.label === "TRUE"),
+    false,
+  );
+  assert.equal(
+    items.some((item) => item.type === "keyword" && item.label === "FALSE"),
+    false,
+  );
+});
+
 test("suggests DATE_FORMAT as parameter snippet", () => {
   const sql = "select date_";
   const items = buildSqlCompletionItems(sql, sql.length, {
@@ -1838,6 +1934,29 @@ test("suggests Oracle table-function helpers in table reference context", () => 
   const tableFunction = items.find((item) => item.label === "TABLE" && item.type === "function");
   assert.ok(tableFunction);
   assert.ok(tableFunction.apply?.startsWith("TABLE("));
+});
+
+test("applies keyword and function casing to Oracle table-function helpers", () => {
+  const lowerKeywords = buildSqlCompletionItems("select * from ", "select * from ".length, {
+    tables,
+    columnsByTable,
+    databaseType: "oracle",
+    keywordCase: "lower",
+    functionCase: "preserve",
+  });
+  assert.equal(lowerKeywords.find((item) => item.label === "table")?.apply, "table(${function_call})");
+  assert.equal(lowerKeywords.find((item) => item.label === "XMLTABLE")?.apply, "XMLTABLE(${xpath})");
+
+  const lowerFunctions = buildSqlCompletionItems("select * from ", "select * from ".length, {
+    tables,
+    columnsByTable,
+    databaseType: "oracle",
+    keywordCase: "upper",
+    functionCase: "lower",
+  });
+  assert.equal(lowerFunctions.find((item) => item.label === "TABLE")?.apply, "TABLE(${function_call})");
+  assert.equal(lowerFunctions.find((item) => item.label === "xmltable")?.apply, "xmltable(${xpath})");
+  assert.equal(lowerFunctions.find((item) => item.label === "json_table")?.apply, "json_table(${expr}, ${path})");
 });
 
 test("suggests package members after package qualifier", () => {
@@ -2172,7 +2291,7 @@ test("suggests INSERT columns for a SQL Server three-part target", () => {
     dialect: "sqlserver",
   });
 
-  assert.equal(items.find((item) => item.type === "snippet" && item.label === "orders.*")?.apply, "target_marker");
+  assert.equal(items.find((item) => item.type === "snippet" && item.label === "orders.*")?.apply, "target_marker) VALUES (${1:value})");
 });
 
 test("detects MySQL backtick-qualified INSERT INTO column list context", () => {
@@ -2220,7 +2339,7 @@ test("suggests all target columns for INSERT INTO column list", () => {
 
   const allColumns = items.find((item) => item.type === "snippet" && item.label === "users.*");
   assert.ok(allColumns);
-  assert.equal(allColumns.apply, "id, name, email");
+  assert.equal(allColumns.apply, "id, name, email) VALUES (${1:value}, ${2:value}, ${3:value})");
 });
 
 test("keeps INSERT INTO all-column expansion available after a column prefix", () => {
@@ -2231,7 +2350,7 @@ test("keeps INSERT INTO all-column expansion available after a column prefix", (
 
   const allColumns = items.find((item) => item.type === "snippet" && item.label === "users.*");
   assert.ok(allColumns);
-  assert.equal(allColumns.apply, "id, name, email");
+  assert.equal(allColumns.apply, "id, name, email) VALUES (${1:value}, ${2:value}, ${3:value})");
 });
 
 test("quotes PostgreSQL identifiers in INSERT INTO all-column expansion", () => {
@@ -2245,7 +2364,7 @@ test("quotes PostgreSQL identifiers in INSERT INTO all-column expansion", () => 
 
   const allColumns = items.find((item) => item.type === "snippet" && item.label === "OrderLines.*");
   assert.ok(allColumns);
-  assert.equal(allColumns.apply, 'article, "OrderId", "User", "has""quote"');
+  assert.equal(allColumns.apply, 'article, "OrderId", "User", "has""quote") VALUES (${1:value}, ${2:value}, ${3:value}, ${4:value})');
 });
 
 test("suggests all target columns for schema-qualified INSERT INTO column lists", () => {
@@ -2267,7 +2386,7 @@ test("suggests all target columns for schema-qualified INSERT INTO column lists"
 
   const allColumns = items.find((item) => item.type === "snippet" && item.label === "Users.*");
   assert.ok(allColumns);
-  assert.equal(allColumns.apply, "Id, DisplayName");
+  assert.equal(allColumns.apply, "Id, DisplayName) VALUES (${1:value}, ${2:value})");
 });
 
 test("scopes INSERT INTO all-column expansion to the database-qualified MySQL target", () => {
@@ -2281,7 +2400,7 @@ test("scopes INSERT INTO all-column expansion to the database-qualified MySQL ta
 
   const allColumns = items.find((item) => item.type === "snippet" && item.label === "orders.*");
   assert.ok(allColumns);
-  assert.equal(allColumns.apply, "id, number, status");
+  assert.equal(allColumns.apply, "id, number, status) VALUES (${1:value}, ${2:value}, ${3:value})");
 });
 
 test("suggests all target columns for MySQL backtick-qualified INSERT INTO", () => {
@@ -2295,7 +2414,7 @@ test("suggests all target columns for MySQL backtick-qualified INSERT INTO", () 
 
   const allColumns = items.find((item) => item.type === "snippet" && item.label === "orders.*");
   assert.ok(allColumns);
-  assert.equal(allColumns.apply, "id, number, status");
+  assert.equal(allColumns.apply, "id, number, status) VALUES (${1:value}, ${2:value}, ${3:value})");
 });
 
 // --- Column data type in detail ---
@@ -2479,7 +2598,7 @@ test("filters data type keywords out of SELECT context", () => {
 
 // --- Qualified column names for duplicates ---
 
-test("uses row-source aliases when multiple tables share column names", () => {
+test("uses row-source aliases for all columns across multiple tables", () => {
   const sql = "select  from public.users u join public.orders o on u.id = o.user_id";
   const items = buildSqlCompletionItems(sql, "select ".length, {
     tables,
@@ -2494,13 +2613,10 @@ test("uses row-source aliases when multiple tables share column names", () => {
     columns.some((item) => item.label === "o.id" && item.apply === "o.id"),
     "should show o.id",
   );
+  assert.ok(columns.some((item) => item.label === "u.name" && item.apply === "u.name"), "unique name should use its row-source alias");
   assert.ok(
-    columns.some((item) => item.label === "name"),
-    "unique name should remain unqualified",
-  );
-  assert.ok(
-    columns.some((item) => item.label === "user_id"),
-    "unique user_id should remain unqualified",
+    columns.some((item) => item.label === "o.user_id" && item.apply === "o.user_id"),
+    "unique user_id should use its row-source alias",
   );
 });
 
@@ -2555,6 +2671,36 @@ test("suggests table alias after FROM table", () => {
   const aliasItem = items.find((item) => item.type === "snippet" && item.detail?.includes("alias for"));
   assert.ok(aliasItem, "should suggest alias for table");
   assert.ok(aliasItem!.apply!.includes("AS"), "alias apply should include AS");
+});
+
+test("applies the configured keyword case to generated table aliases", () => {
+  const tableItems = buildSqlCompletionItems("select * from ord", "select * from ord".length, {
+    tables,
+    columnsByTable,
+    autoAliasTables: true,
+    keywordCase: "lower",
+  });
+  const tableItem = tableItems.find((item) => item.type === "table" && item.label === "orders");
+  assert.equal(tableItem?.apply, "orders as ord");
+
+  const aliasItems = buildSqlCompletionItems("select * from orders ", "select * from orders ".length, {
+    tables,
+    columnsByTable,
+    keywordCase: "lower",
+  });
+  const aliasItem = aliasItems.find((item) => item.type === "snippet" && item.detail === "alias for orders");
+  assert.equal(aliasItem?.apply, "as ord ");
+});
+
+test("keeps generated table aliases uppercase when keyword case is preserved", () => {
+  const items = buildSqlCompletionItems("select * from ord", "select * from ord".length, {
+    tables,
+    columnsByTable,
+    autoAliasTables: true,
+    keywordCase: "preserve",
+  });
+  const tableItem = items.find((item) => item.type === "table" && item.label === "orders");
+  assert.equal(tableItem?.apply, "orders AS ord");
 });
 
 test("prioritizes table acronym matches above alias snippets", () => {
@@ -2937,6 +3083,82 @@ test("boosts foreign-key related table candidates in JOIN table context", () => 
   assert.ok(items[0]?.detail?.includes("related by"));
 });
 
+test("keeps automatic SQL Server aliases on foreign-key related JOIN candidates", () => {
+  const foreignKeysByTable = new Map<string, SqlCompletionForeignKey[]>([
+    ["dbo.orders", [{ name: "orders_customer_id_fkey", column: "customer_id", ref_schema: "dbo", ref_table: "customers", ref_column: "id" }]],
+  ]);
+  const sql = "select * from dbo.orders o join cus";
+  const items = buildSqlCompletionItems(sql, sql.length, {
+    tables: [
+      { name: "orders", schema: "dbo", type: "table" },
+      { name: "customers", schema: "dbo", type: "table" },
+    ],
+    columnsByTable,
+    foreignKeysByTable,
+    dialect: "sqlserver",
+    databaseType: "sqlserver",
+    autoAliasTables: true,
+  });
+
+  assert.equal(items[0]?.label, "customers");
+  assert.ok(items[0]?.detail?.includes("related by"));
+  assert.equal(items[0]?.apply, "customers AS cs");
+});
+
+test("does not add aliases to foreign-key related JOIN candidates when disabled", () => {
+  const foreignKeysByTable = new Map<string, SqlCompletionForeignKey[]>([
+    ["dbo.orders", [{ name: "orders_customer_id_fkey", column: "customer_id", ref_schema: "dbo", ref_table: "customers", ref_column: "id" }]],
+  ]);
+  const sql = "select * from dbo.orders o join cus";
+  const items = buildSqlCompletionItems(sql, sql.length, {
+    tables: [
+      { name: "orders", schema: "dbo", type: "table" },
+      { name: "customers", schema: "dbo", type: "table" },
+    ],
+    columnsByTable,
+    foreignKeysByTable,
+    dialect: "sqlserver",
+    databaseType: "sqlserver",
+    autoAliasTables: false,
+  });
+
+  assert.equal(items[0]?.label, "customers");
+  assert.ok(items[0]?.detail?.includes("related by"));
+  assert.equal(items[0]?.apply, "customers");
+});
+
+test("schema-qualifies foreign-key related JOIN candidates when the target table name spans schemas", () => {
+  const foreignKeysByTable = new Map<string, SqlCompletionForeignKey[]>([
+    ["dbo.orders", [{ name: "orders_customer_id_fkey", column: "customer_id", ref_schema: "sales", ref_table: "customers", ref_column: "id" }]],
+  ]);
+  const sql = "select * from dbo.orders o join cus";
+  const items = buildSqlCompletionItems(sql, sql.length, {
+    tables: [
+      { name: "orders", schema: "dbo", type: "table" },
+      { name: "customers", schema: "dbo", type: "table" },
+      { name: "customers", schema: "sales", type: "table" },
+    ],
+    columnsByTable,
+    foreignKeysByTable,
+    dialect: "sqlserver",
+    databaseType: "sqlserver",
+    autoAliasTables: true,
+  });
+
+  const fkCandidate = items.find((item) => item.type === "table" && item.detail?.includes("related by"));
+  assert.ok(fkCandidate, "should surface the foreign-key related candidate");
+  // customers exists in both dbo and sales, so the FK candidate must qualify with
+  // the referenced schema (sales.customers) instead of a bare, ambiguous customers.
+  assert.equal(fkCandidate?.apply, "sales.customers AS cs");
+  assert.equal(fkCandidate?.dedupeKey, "sales.customers");
+  // The FK candidate (higher boost) should win dedupe against the regular
+  // sales.customers candidate, leaving no bare `customers AS cs` entry.
+  assert.ok(
+    !items.some((item) => item.type === "table" && item.apply === "customers AS cs"),
+    "should not emit a bare unqualified customers candidate alongside the qualified FK candidate",
+  );
+});
+
 test("boosts inbound foreign-key table candidates in JOIN table context", () => {
   const foreignKeysByTable = new Map<string, SqlCompletionForeignKey[]>([["public.orders", [{ name: "orders_customer_id_fkey", column: "customer_id", ref_schema: "public", ref_table: "customers", ref_column: "id" }]]]);
   const sql = "select * from public.customers c join ord";
@@ -2966,7 +3188,9 @@ test("uses owner schema when ranking inbound foreign-key table candidates", () =
 
   assert.equal(items[0]?.label, "orders");
   assert.equal(items[0]?.detail, "related by sales.orders.customer_id → id");
-  assert.equal(items[0]?.apply, "orders");
+  // orders exists in both public and sales, so the FK candidate must schema-qualify
+  // with the owner schema (sales.orders) to match buildTableItems' qualification.
+  assert.equal(items[0]?.apply, "sales.orders");
 });
 
 test("suggests composite explicit foreign-key join conditions", () => {

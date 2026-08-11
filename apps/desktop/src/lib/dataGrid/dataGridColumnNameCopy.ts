@@ -25,7 +25,7 @@ export function isColumnNameCopySeparator(value: unknown): value is ColumnNameCo
 }
 
 // SQL 执行能力是产品能力，不代表数据库支持 SQL 标识符引用。
-const NON_SQL_DATABASE_TYPES = new Set<DatabaseType>(["redis", "mongodb", "elasticsearch", "qdrant", "milvus", "weaviate", "chromadb", "etcd", "zookeeper", "mq", "nacos"]);
+const NON_SQL_DATABASE_TYPES = new Set<DatabaseType>(["redis", "mongodb", "elasticsearch", "easysearch", "qdrant", "milvus", "weaviate", "chromadb", "etcd", "zookeeper", "consul", "mq", "nacos", "victoriametrics"]);
 // quoteTableIdentifier 对 jdbc/iotdb 原样返回（无引用字符可用）。
 const UNQUOTABLE_DATABASE_TYPES = new Set<DatabaseType>(["jdbc", "iotdb"]);
 
@@ -37,9 +37,10 @@ export function columnNamesForCopy(allColumnNames: readonly string[], visibleCol
   return [...(scope === "all" ? allColumnNames : visibleColumnNames)];
 }
 
-export function formatColumnNamesForCopy(names: readonly string[], options: { separator: ColumnNameCopySeparator; quote?: boolean; databaseType?: DatabaseType }): string {
+export function formatColumnNamesForCopy(names: readonly string[], options: { separator: ColumnNameCopySeparator; quote?: boolean; databaseType?: DatabaseType; showByComment?: boolean; commentByColumn?: Map<string, string> }): string {
   const quote = !!options.quote && supportsColumnNameQuoting(options.databaseType);
-  const parts = quote ? names.map((name) => quoteTableIdentifier(options.databaseType, name)) : [...names];
+  const displayNames = options.showByComment && options.commentByColumn ? names.map((name) => options.commentByColumn!.get(name) || name) : [...names];
+  const parts = quote ? displayNames.map((name) => quoteTableIdentifier(options.databaseType, name)) : displayNames;
   return parts.join(COLUMN_NAME_COPY_SEPARATOR_VALUES[options.separator]);
 }
 

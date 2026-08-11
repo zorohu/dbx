@@ -96,6 +96,11 @@ pub(crate) fn model_is_assistant_compatible(provider: &AiProvider, model_id: &st
         | AiProvider::CodexCli
         | AiProvider::ClaudeCodeCli
         | AiProvider::PiAgentCli
+        | AiProvider::OpenCodeCli
+        | AiProvider::CursorCli
+        | AiProvider::GrokCli
+        | AiProvider::CodeBuddyCli
+        | AiProvider::MiniMax
         | AiProvider::Custom => true,
     }
 }
@@ -198,7 +203,9 @@ mod tests {
 
     #[test]
     fn generic_providers_do_not_filter_unknown_model_taxonomies() {
-        for provider in [AiProvider::AnthropicCompatible, AiProvider::OpenaiCompatible, AiProvider::Custom] {
+        for provider in
+            [AiProvider::AnthropicCompatible, AiProvider::OpenaiCompatible, AiProvider::Custom, AiProvider::MiniMax]
+        {
             for model in ["text-embedding-private-chat", "company/image-reasoner", "future-model"] {
                 assert!(model_is_assistant_compatible(&provider, model), "{}:{model}", provider.as_str());
             }

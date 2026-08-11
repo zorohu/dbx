@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { buildSqlCompletionItems, getSqlCompletionContext, shouldAutoOpenSqlCompletion } from "@/lib/sql/sqlCompletion";
+import { buildSelectStarExpansion, buildSqlCompletionItems, getSqlCompletionContext, selectStarResultColumnsMatch, shouldAutoOpenSqlCompletion } from "@/lib/sql/sqlCompletion";
+import { sqlCompletionContextFromSemantic } from "@/lib/sql/semantic/completion";
+import { buildSqlSemanticModel } from "@/lib/sql/semantic/model";
+import { originForSqlCompletionProvider, originForTypedSqlCompletionStart, shouldAllowSqlCompletionTrigger, type SqlCompletionTriggerFacts } from "@/lib/sql/sqlCompletionTriggerPolicy";
 
 describe("sqlCompletion keyword snippets", () => {
   it("auto-opens and suggests SELECT when typing sel", () => {
@@ -14,7 +17,243 @@ describe("sqlCompletion keyword snippets", () => {
   });
 });
 
+describe("SELECT star expansion", () => {
+  it("reuses completion column ordering for an unqualified star", () => {
+    const sql = "SELECT * FROM apis";
+    const context = getSqlCompletionContext(sql, "SELECT *".length);
+
+    expect(
+      buildSelectStarExpansion(
+        context,
+        new Map([
+          [
+            "apis",
+            [
+              { name: "id", table: "apis" },
+              { name: "created_at", table: "apis" },
+              { name: "method", table: "apis" },
+            ],
+          ],
+        ]),
+      ),
+    ).toBe("id, created_at, method");
+  });
+
+  it("expands a multi-table star with aliases and preserves duplicate column names", () => {
+    const sql = "SELECT * FROM tVillage tV INNER JOIN tland tl ON tV.villageId = tl.villageId";
+    const cursor = "SELECT *".length;
+    const context = sqlCompletionContextFromSemantic(buildSqlSemanticModel(sql, cursor), getSqlCompletionContext(sql, cursor));
+
+    expect(
+      buildSelectStarExpansion(
+        context,
+        new Map([
+          [
+            "tVillage",
+            [
+              { name: "villageId", table: "tVillage" },
+              { name: "villageName", table: "tVillage" },
+            ],
+          ],
+          [
+            "tland",
+            [
+              { name: "villageId", table: "tland" },
+              { name: "landName", table: "tland" },
+            ],
+          ],
+        ]),
+      ),
+    ).toBe("tV.villageId, tV.villageName, tl.villageId, tl.landName");
+  });
+
+  it("uses FROM/JOIN order even when the metadata map arrives in another order", () => {
+    const sql = "SELECT * FROM tVillage tv INNER JOIN tland tl ON tv.villageId = tl.villageId";
+    const cursor = "SELECT *".length;
+    const context = sqlCompletionContextFromSemantic(buildSqlSemanticModel(sql, cursor), getSqlCompletionContext(sql, cursor));
+
+    expect(
+      buildSelectStarExpansion(
+        context,
+        new Map([
+          [
+            "tland",
+            [
+              { name: "landName", table: "tland" },
+              { name: "villageId", table: "tland" },
+            ],
+          ],
+          [
+            "tVillage",
+            [
+              { name: "villageName", table: "tVillage" },
+              { name: "villageId", table: "tVillage" },
+            ],
+          ],
+        ]),
+      ),
+    ).toBe("tv.villageName, tv.villageId, tl.landName, tl.villageId");
+  });
+
+  it("preserves an alias while replacing only the star", () => {
+    const sql = "SELECT ap.* FROM apis AS ap";
+    const cursor = "SELECT ap.*".length;
+    const context = sqlCompletionContextFromSemantic(buildSqlSemanticModel(sql, cursor), getSqlCompletionContext(sql, cursor));
+
+    expect(
+      buildSelectStarExpansion(
+        context,
+        new Map([
+          [
+            "apis",
+            [
+              { name: "id", table: "apis" },
+              { name: "created_at", table: "apis" },
+            ],
+          ],
+        ]),
+      ),
+    ).toBe("id, ap.created_at");
+  });
+
+  it.each([
+    ["postgres", "postgres", '"Order Alias"', '"created at"'],
+    ["mysql", "mysql", "`Order Alias`", "`created at`"],
+    ["sqlserver", "sqlserver", "[Order Alias]", "[created at]"],
+    ["oracle", "mysql", '"Order Alias"', '"created at"'],
+  ] as const)("preserves a quoted %s alias for every expanded column", (databaseType, dialect, qualifierSql, quotedColumn) => {
+    const sql = `SELECT ${qualifierSql}.* FROM orders AS ${qualifierSql}`;
+    const cursor = sql.indexOf("*") + 1;
+    const context = sqlCompletionContextFromSemantic(buildSqlSemanticModel(sql, cursor, { databaseType, dialect }), getSqlCompletionContext(sql, cursor, { databaseType, dialect }));
+
+    expect(
+      buildSelectStarExpansion(
+        context,
+        new Map([
+          [
+            "orders",
+            [
+              { name: "id", table: "orders" },
+              { name: "created at", table: "orders" },
+            ],
+          ],
+        ]),
+        dialect,
+        qualifierSql,
+        databaseType,
+      ),
+    ).toBe(`id, ${qualifierSql}.${quotedColumn}`);
+  });
+
+  it("expands an unqualified star from result columns when the table has an alias", () => {
+    const sql = "select *\nfrom apis as ap\nlimit 100;";
+    const cursor = "select *".length;
+    const context = sqlCompletionContextFromSemantic(buildSqlSemanticModel(sql, cursor), getSqlCompletionContext(sql, cursor));
+
+    expect(
+      buildSelectStarExpansion(
+        context,
+        new Map([
+          [
+            "apis",
+            [
+              { name: "id", table: "apis" },
+              { name: "created_at", table: "apis" },
+              { name: "updated_at", table: "apis" },
+              { name: "deleted_at", table: "apis" },
+              { name: "method", table: "apis" },
+            ],
+          ],
+        ]),
+      ),
+    ).toBe("id, created_at, updated_at, deleted_at, method");
+  });
+
+  it("accepts result columns only when their source still contains the target star", () => {
+    const currentSql = "select * from apis;\nselect * from users;";
+    const sourceStatement = "select * from users";
+    const sourceFrom = currentSql.lastIndexOf("select");
+    const targetFrom = currentSql.lastIndexOf("*");
+
+    expect(selectStarResultColumnsMatch({ currentSql, targetFrom, targetTo: targetFrom + 1, statementSql: sourceStatement, sourceStatement, sourceFrom, sourceTo: sourceFrom + sourceStatement.length })).toBe(true);
+    expect(selectStarResultColumnsMatch({ currentSql, targetFrom: currentSql.indexOf("*"), targetTo: currentSql.indexOf("*") + 1, statementSql: "select * from apis", sourceStatement, sourceFrom, sourceTo: sourceFrom + sourceStatement.length })).toBe(false);
+  });
+
+  it("rejects stale and incomplete result source metadata", () => {
+    expect(selectStarResultColumnsMatch({ currentSql: "select * from users", targetFrom: 7, targetTo: 8, statementSql: "select * from users", sourceStatement: "select * from apis" })).toBe(false);
+    expect(selectStarResultColumnsMatch({ currentSql: "select * from users", targetFrom: 7, targetTo: 8, statementSql: "select * from users", sourceStatement: "select * from users", sourceFrom: 0 })).toBe(false);
+  });
+});
+
 describe("sqlCompletion database functions", () => {
+  it("suggests ClickHouse functions with canonical casing and preferred placeholders", () => {
+    const sql = "SELECT tostart";
+    const items = buildSqlCompletionItems(sql, sql.length, {
+      databaseType: "clickhouse",
+      tables: [],
+      columnsByTable: new Map(),
+      functionCase: "lower",
+    });
+
+    expect(items.find((item) => item.label === "toStartOfDay")).toMatchObject({
+      type: "function",
+      apply: "toStartOfDay(${value})",
+    });
+  });
+
+  it("uses exact ClickHouse window function placeholders", () => {
+    const denseRankSql = "SELECT dense_";
+    const denseRankItems = buildSqlCompletionItems(denseRankSql, denseRankSql.length, {
+      databaseType: "clickhouse",
+      tables: [],
+      columnsByTable: new Map(),
+    });
+    expect(denseRankItems.find((item) => item.label === "dense_rank")?.apply).toBe("dense_rank()");
+
+    const ntileSql = "SELECT nti";
+    const ntileItems = buildSqlCompletionItems(ntileSql, ntileSql.length, {
+      databaseType: "clickhouse",
+      tables: [],
+      columnsByTable: new Map(),
+    });
+    expect(ntileItems.find((item) => item.label === "ntile")?.apply).toBe("ntile(${buckets})");
+  });
+
+  it("does not leak ClickHouse-only functions to MySQL", () => {
+    const sql = "SELECT tostart";
+    const items = buildSqlCompletionItems(sql, sql.length, {
+      databaseType: "mysql",
+      tables: [],
+      columnsByTable: new Map(),
+    });
+
+    expect(items.some((item) => item.label === "toStartOfDay")).toBe(false);
+  });
+
+  it("suggests only ClickHouse table functions alongside tables after FROM", () => {
+    const sql = "SELECT * FROM num";
+    const items = buildSqlCompletionItems(sql, sql.length, {
+      databaseType: "clickhouse",
+      tables: [{ name: "number_events", type: "table" }],
+      columnsByTable: new Map(),
+    });
+
+    expect(items).toEqual(expect.arrayContaining([expect.objectContaining({ label: "numbers", type: "function" }), expect.objectContaining({ label: "number_events", type: "table" })]));
+    expect(items.some((item) => item.label === "toStartOfDay")).toBe(false);
+  });
+
+  it("does not insert a duplicate opening parenthesis before an existing call", () => {
+    const sql = "SELECT toStart()";
+    const cursor = "SELECT toStart".length;
+    const items = buildSqlCompletionItems(sql, cursor, {
+      databaseType: "clickhouse",
+      tables: [],
+      columnsByTable: new Map(),
+    });
+
+    expect(items.find((item) => item.label === "toStartOfDay")?.apply).toBe("toStartOfDay");
+  });
+
   it("suggests MySQL Unix timestamp functions with function snippets", () => {
     const fromUnixSql = "SELECT from_unix";
     const fromUnixItems = buildSqlCompletionItems(fromUnixSql, fromUnixSql.length, {
@@ -373,6 +612,13 @@ describe("sqlCompletion scoped context classification", () => {
     expect(context.referencedTables).toEqual(expect.arrayContaining([expect.objectContaining({ schema: "dbo", name: "Users", alias: "u" }), expect.objectContaining({ name: "Orders", alias: "o" })]));
   });
 
+  it("preserves SQL Server database and omitted schema in legacy table references", () => {
+    const sql = "SELECT * FROM BarDB..orders AS o WHERE o.";
+    const context = getSqlCompletionContext(sql, sql.length, { databaseType: "sqlserver" });
+
+    expect(context.referencedTables).toEqual([expect.objectContaining({ database: "BarDB", schema: "dbo", name: "orders", alias: "o" })]);
+  });
+
   it("treats schema-qualified table prefixes in FROM as table completion input", () => {
     const sql = "SELECT * FROM dws_game_sdk_base.di";
     const context = getSqlCompletionContext(sql, sql.length);
@@ -509,5 +755,111 @@ describe("sqlCompletion scoped metadata ranking", () => {
 
     expect(oracleItems.map((item) => item.apply).sort()).toEqual(["ORDERS", "REPORTING.ORDERS"]);
     expect(sqlServerItems).toEqual([expect.objectContaining({ label: "Orders", apply: "Orders" })]);
+  });
+});
+
+describe("shouldAllowSqlCompletionTrigger", () => {
+  const typingFacts = (overrides: Partial<SqlCompletionTriggerFacts> = {}): SqlCompletionTriggerFacts => ({
+    origin: "typing",
+    hasIdentifierPrefix: false,
+    qualifierTriggered: false,
+    useDatabasePrefix: null,
+    ...overrides,
+  });
+
+  const explicitFacts = (overrides: Partial<SqlCompletionTriggerFacts> = {}): SqlCompletionTriggerFacts => ({
+    origin: "explicit",
+    hasIdentifierPrefix: false,
+    qualifierTriggered: false,
+    useDatabasePrefix: null,
+    ...overrides,
+  });
+
+  describe("explicit", () => {
+    it("allows explicit completion in any mode", () => {
+      expect(shouldAllowSqlCompletionTrigger("manual", explicitFacts())).toBe(true);
+      expect(shouldAllowSqlCompletionTrigger("require-prefix", explicitFacts())).toBe(true);
+      expect(shouldAllowSqlCompletionTrigger("positional", explicitFacts())).toBe(true);
+    });
+  });
+
+  describe("manual", () => {
+    it("rejects all typing completions", () => {
+      expect(shouldAllowSqlCompletionTrigger("manual", typingFacts())).toBe(false);
+      expect(shouldAllowSqlCompletionTrigger("manual", typingFacts({ hasIdentifierPrefix: true }))).toBe(false);
+      expect(shouldAllowSqlCompletionTrigger("manual", typingFacts({ qualifierTriggered: true }))).toBe(false);
+      expect(shouldAllowSqlCompletionTrigger("manual", typingFacts({ useDatabasePrefix: "m" }))).toBe(false);
+      expect(shouldAllowSqlCompletionTrigger("manual", typingFacts({ positionalEligible: true }))).toBe(false);
+    });
+  });
+
+  describe("require-prefix", () => {
+    it("allows when identifier prefix is non-empty", () => {
+      expect(shouldAllowSqlCompletionTrigger("require-prefix", typingFacts({ hasIdentifierPrefix: true }))).toBe(true);
+    });
+
+    it("allows when qualifier is triggered (dot with qualifier)", () => {
+      expect(shouldAllowSqlCompletionTrigger("require-prefix", typingFacts({ qualifierTriggered: true }))).toBe(true);
+    });
+
+    it("allows when useDatabasePrefix is non-empty", () => {
+      expect(shouldAllowSqlCompletionTrigger("require-prefix", typingFacts({ useDatabasePrefix: "m" }))).toBe(true);
+      expect(shouldAllowSqlCompletionTrigger("require-prefix", typingFacts({ useDatabasePrefix: "Bar" }))).toBe(true);
+    });
+
+    it("rejects empty prefix, no qualifier, no useDatabasePrefix", () => {
+      expect(shouldAllowSqlCompletionTrigger("require-prefix", typingFacts())).toBe(false);
+    });
+
+    it("rejects empty useDatabasePrefix (USE<space> without prefix)", () => {
+      expect(shouldAllowSqlCompletionTrigger("require-prefix", typingFacts({ useDatabasePrefix: "" }))).toBe(false);
+    });
+
+    it("does not use positionalEligible", () => {
+      // Even if positionalEligible is true, require-prefix ignores it.
+      expect(shouldAllowSqlCompletionTrigger("require-prefix", typingFacts({ positionalEligible: true }))).toBe(false);
+    });
+  });
+
+  describe("positional", () => {
+    it("allows when positionalEligible is true", () => {
+      expect(shouldAllowSqlCompletionTrigger("positional", typingFacts({ positionalEligible: true }))).toBe(true);
+    });
+
+    it("allows when useDatabasePrefix is set (even empty)", () => {
+      expect(shouldAllowSqlCompletionTrigger("positional", typingFacts({ useDatabasePrefix: "" }))).toBe(true);
+      expect(shouldAllowSqlCompletionTrigger("positional", typingFacts({ useDatabasePrefix: "m" }))).toBe(true);
+    });
+
+    it("rejects when positionalEligible is false and no useDatabasePrefix", () => {
+      expect(shouldAllowSqlCompletionTrigger("positional", typingFacts({ positionalEligible: false }))).toBe(false);
+    });
+
+    it("rejects when positionalEligible is undefined and no useDatabasePrefix", () => {
+      expect(shouldAllowSqlCompletionTrigger("positional", typingFacts())).toBe(false);
+    });
+  });
+});
+
+describe("originForTypedSqlCompletionStart", () => {
+  it("starts a new automatic session as typing", () => {
+    expect(originForTypedSqlCompletionStart(null)).toBe("typing");
+  });
+
+  it("preserves the origin of an active completion session", () => {
+    expect(originForTypedSqlCompletionStart("typing")).toBe("typing");
+    expect(originForTypedSqlCompletionStart("explicit")).toBe("explicit");
+  });
+});
+
+describe("originForSqlCompletionProvider", () => {
+  it("classifies an unmarked provider call from CodeMirror", () => {
+    expect(originForSqlCompletionProvider(null, false)).toBe("typing");
+    expect(originForSqlCompletionProvider(null, true)).toBe("explicit");
+  });
+
+  it("preserves the active session independently of the current provider flag", () => {
+    expect(originForSqlCompletionProvider("typing", true)).toBe("typing");
+    expect(originForSqlCompletionProvider("explicit", false)).toBe("explicit");
   });
 });

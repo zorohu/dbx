@@ -29,6 +29,15 @@ pub async fn list_database_storage(
 }
 
 #[tauri::command]
+pub async fn get_sqlserver_completion_context(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    database: String,
+) -> Result<db::sqlserver::SqlServerCompletionContext, String> {
+    dbx_core::schema::get_sqlserver_completion_context_core(&state, &connection_id, &database).await
+}
+
+#[tauri::command]
 pub async fn list_doris_catalogs(
     state: State<'_, Arc<AppState>>,
     connection_id: String,
@@ -231,6 +240,10 @@ pub async fn list_objects(
                 updated_at: None,
                 parent_schema: table.parent_schema,
                 parent_name: table.parent_name,
+                custom_type_kind: None,
+                has_members: None,
+                trigger: None,
+                xugu_type_members_expandable: None,
             })
             .collect());
     }
@@ -300,6 +313,17 @@ pub async fn get_object_source(
 }
 
 #[tauri::command]
+pub async fn get_custom_type_details(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    database: String,
+    schema: String,
+    name: String,
+) -> Result<db::CustomTypeDetails, String> {
+    dbx_core::schema::get_custom_type_details_core(&state, &connection_id, &database, &schema, &name).await
+}
+
+#[tauri::command]
 pub async fn get_columns(
     state: State<'_, Arc<AppState>>,
     connection_id: String,
@@ -322,6 +346,16 @@ pub async fn get_columns(
         client_session_id.as_deref(),
     )
     .await
+}
+
+#[tauri::command]
+pub async fn get_all_columns(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    database: String,
+    schema: String,
+) -> Result<Vec<db::TableColumnsResult>, String> {
+    dbx_core::schema::get_all_columns_core(&state, &connection_id, &database, &schema).await
 }
 
 #[tauri::command]

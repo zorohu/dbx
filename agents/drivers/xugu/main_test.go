@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -141,6 +142,85 @@ func TestRuntimeRejectsSessionsBeyondLimit(t *testing.T) {
 	}
 }
 
+func TestRuntimeReconnectReleasesDetachedControlAndAllowsReplacement(t *testing.T) {
+	runtime := newRuntimeServer()
+	params := connectParams{
+		Host:     "127.0.0.1",
+		Port:     5138,
+		Database: "SHOP_DEMO",
+		Username: "DBX_LOCAL_TEST",
+		Password: "secret",
+	}
+	controlKey := buildDSN(xuguControlParams(params))
+	oldControl, err := sql.Open("xugu-test-fast", "old-control")
+	if err != nil {
+		t.Fatal(err)
+	}
+	businessDB, err := sql.Open("xugu-test-fast", "business")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer businessDB.Close()
+
+	session := &agentSession{
+		server:     newServer(),
+		controlKey: controlKey,
+	}
+	session.server.params = params
+	session.server.cancelDB = oldControl
+	runtime.controls[controlKey] = &sharedControl{db: oldControl, refs: 1}
+
+	err = runtime.reconnectSessionWith(
+		session,
+		func(server *server, _ connectParams, cancelDB *sql.DB, _ bool) (bool, error) {
+			if cancelDB != oldControl {
+				t.Fatalf("reconnect control = %p, want %p", cancelDB, oldControl)
+			}
+			server.db = businessDB
+			server.cancelDB = nil
+			return false, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.controlKey != "" {
+		t.Fatalf("detached control key = %q, want empty", session.controlKey)
+	}
+	if _, exists := runtime.controls[controlKey]; exists {
+		t.Fatal("detached shared control should be removed")
+	}
+	if err := businessDB.Ping(); err != nil {
+		t.Fatalf("business reconnect should remain usable: %v", err)
+	}
+	if err := oldControl.Ping(); err == nil {
+		t.Fatal("detached shared control should be closed")
+	}
+
+	replacementControl, err := sql.Open("xugu-test-fast", "replacement-control")
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened := 0
+	replacementKey, replacementDB, err := runtime.acquireControlWith(
+		params,
+		func(connectParams) (*sql.DB, error) {
+			opened++
+			return replacementControl, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opened != 1 || replacementKey != controlKey || replacementDB != replacementControl {
+		t.Fatalf("unexpected replacement control: opened=%d key=%q db=%p", opened, replacementKey, replacementDB)
+	}
+	if control := runtime.controls[controlKey]; control == nil || control.refs != 1 || control.db != replacementControl {
+		t.Fatalf("replacement control not registered: %#v", control)
+	}
+	runtime.releaseControl(replacementKey)
+}
+
 func TestNewXuguDatabaseSessionFindsOnlyNewSession(t *testing.T) {
 	existing := xuguDatabaseSession{nodeID: 1, sessionID: 10}
 	created := xuguDatabaseSession{nodeID: 1, sessionID: 11}
@@ -153,6 +233,89 @@ func TestNewXuguDatabaseSessionFindsOnlyNewSession(t *testing.T) {
 	}
 	if result != created {
 		t.Fatalf("unexpected session: %+v", result)
+	}
+}
+
+func TestControlSessionFromSnapshotDegradesWhenAmbiguous(t *testing.T) {
+	existing := xuguDatabaseSession{nodeID: 1, sessionID: 10}
+	createdA := xuguDatabaseSession{nodeID: 1, sessionID: 11}
+	createdB := xuguDatabaseSession{nodeID: 1, sessionID: 12}
+
+	if _, n, ok := controlSessionFromSnapshot(
+		map[xuguDatabaseSession]struct{}{existing: {}},
+		map[xuguDatabaseSession]struct{}{existing: {}, createdA: {}, createdB: {}},
+	); ok || n != 2 {
+		t.Fatalf("expected ambiguous session set to degrade with n=2, got ok=%v n=%d", ok, n)
+	}
+	if _, n, ok := controlSessionFromSnapshot(
+		map[xuguDatabaseSession]struct{}{existing: {}},
+		map[xuguDatabaseSession]struct{}{existing: {}},
+	); ok || n != 0 {
+		t.Fatalf("expected empty delta to degrade with n=0, got ok=%v n=%d", ok, n)
+	}
+	if _, err := newXuguDatabaseSession(
+		map[xuguDatabaseSession]struct{}{existing: {}},
+		map[xuguDatabaseSession]struct{}{existing: {}, createdA: {}, createdB: {}},
+	); err == nil {
+		t.Fatal("expected error when session identity is ambiguous")
+	}
+
+	// Unique new session still attaches.
+	if got, n, ok := controlSessionFromSnapshot(
+		map[xuguDatabaseSession]struct{}{existing: {}},
+		map[xuguDatabaseSession]struct{}{existing: {}, createdA: {}},
+	); !ok || n != 1 || got != createdA {
+		t.Fatalf("expected unique session %v, got %v ok=%v n=%d", createdA, got, ok, n)
+	}
+}
+
+func TestCancelActiveQueryWithoutKillSessionIsSafe(t *testing.T) {
+	s := newServer()
+	// Degraded sessions leave killSession nil; cancel must not panic.
+	s.killSession = nil
+	s.cancelActiveQuery()
+
+	ctx, cancel := s.beginActiveOperationWithTimeout(1)
+	defer s.endActiveOperation(cancel)
+	if ctx == nil {
+		t.Fatal("expected active context")
+	}
+	s.cancelActiveQuery()
+}
+
+func TestServerDisconnectClearsDegradedControlState(t *testing.T) {
+	s := newServer()
+	s.params = connectParams{Database: "SHOP_DEMO", Username: "DBX_LOCAL_TEST"}
+	s.nodeID = 0
+	s.databaseSessionID = 0
+	s.killSession = nil
+	s.cancelDB = nil
+	s.ownsCancelDB = false
+	if err := s.disconnect(); err != nil {
+		t.Fatal(err)
+	}
+	if s.db != nil || s.cancelDB != nil || s.killSession != nil {
+		t.Fatalf("expected cleared session state, got db=%v cancelDB=%v killSessionSet=%v", s.db, s.cancelDB, s.killSession != nil)
+	}
+}
+
+func TestXuguControlParamsForcesSystemDatabase(t *testing.T) {
+	params := connectParams{
+		Host:     "127.0.0.1",
+		Port:     5138,
+		Database: "SHOP_DEMO",
+		Username: "DBX_LOCAL_TEST",
+		Password: "secret",
+	}
+	control := xuguControlParams(params)
+	if control.Database != "SYSTEM" {
+		t.Fatalf("control database = %q, want SYSTEM", control.Database)
+	}
+	if control.ConnectionString != "" {
+		t.Fatalf("control connection string should be cleared, got %q", control.ConnectionString)
+	}
+	if params.Database != "SHOP_DEMO" {
+		t.Fatal("xuguControlParams must not mutate caller's database")
 	}
 }
 
@@ -464,6 +627,9 @@ func TestListDatabasesSQLUsesXuguDictionary(t *testing.T) {
 	if !strings.Contains(sqlText, "ALL_DATABASES") || strings.Contains(sqlText, "SYS_DATABASES") {
 		t.Fatalf("database listing should query low-privilege ALL_DATABASES, got: %s", xuguListDatabasesSQL)
 	}
+	if strings.Contains(sqlText, "CURRENT_DB_ID") {
+		t.Fatalf("database listing must remain global instead of being scoped to CURRENT_DB_ID: %s", xuguListDatabasesSQL)
+	}
 }
 
 func TestFallbackDatabasesFromParams(t *testing.T) {
@@ -544,6 +710,65 @@ func TestSchemaListingSQLUsesLowPrivilegeDictionary(t *testing.T) {
 
 	if !strings.Contains(sqlText, "ALL_SCHEMAS") || strings.Contains(sqlText, "SYS_SCHEMAS") {
 		t.Fatalf("schema listing should query low-privilege ALL_SCHEMAS, got: %s", xuguListSchemasSQL)
+	}
+	if !strings.Contains(sqlText, "DB_ID = CURRENT_DB_ID") {
+		t.Fatalf("schema listing must be scoped to the selected database: %s", xuguListSchemasSQL)
+	}
+}
+
+func TestXuguMetadataQueriesAreCurrentDatabaseScoped(t *testing.T) {
+	queries := map[string]string{
+		"schemas":        xuguListSchemasSQL,
+		"primary keys":   xuguPrimaryKeyColumnsSQL,
+		"columns":        xuguListColumnsSQL,
+		"legacy columns": xuguLegacyListColumnsSQL,
+		"indexes":        xuguListIndexesSQL,
+		"table metadata": xuguTableMetadataSQL,
+		"identity":       xuguTableIdentitySQL,
+		"constraints":    xuguTableConstraintsSQL,
+		"foreign keys":   xuguTableForeignKeysSQL,
+		"partitions":     xuguTablePartitionsSQL,
+		"subpartitions":  xuguTableSubpartitionsSQL,
+		"sequences":      xuguCatalogSequenceNameSelectSQL,
+		"synonyms":       xuguCatalogSynonymSelectSQL,
+	}
+	for name, query := range queries {
+		if !strings.Contains(strings.ToUpper(query), "CURRENT_DB_ID") {
+			t.Errorf("%s metadata query is not scoped to the selected database: %s", name, query)
+		}
+	}
+
+	for name, query := range map[string]string{
+		"tables":  xuguListTablesQuery("APP_TEST", metadataListConstraints{}).SQL,
+		"objects": xuguListObjectsQuery("APP_TEST", metadataListConstraints{}).SQL,
+	} {
+		if !strings.Contains(strings.ToUpper(query), "CURRENT_DB_ID") {
+			t.Errorf("%s listing query is not scoped to the selected database: %s", name, query)
+		}
+	}
+
+	for _, objectType := range []string{"VIEW", "TRIGGER", "PROCEDURE", "FUNCTION", "PACKAGE", "PACKAGE_BODY", "TYPE", "TYPE_BODY"} {
+		query, _, err := objectSourceQuery("APP_TEST", "OBJECT", objectType)
+		if err != nil {
+			t.Fatalf("object source query for %s: %v", objectType, err)
+		}
+		if !strings.Contains(strings.ToUpper(query), "CURRENT_DB_ID") {
+			t.Errorf("%s source query is not scoped to the selected database: %s", objectType, query)
+		}
+	}
+
+	for name, query := range map[string]string{
+		"catalog table lookup":     xuguCatalogTableNameQuery("APP_TEST", "T", false),
+		"catalog table fallback":   xuguCatalogTableNameQuery("APP_TEST", "T", true),
+		"sequence metadata":        xuguSequenceMetadataQuery("APP_TEST", "S"),
+		"sequence exact lookup":    xuguCatalogSequenceNameQuery("APP_TEST", "S", false),
+		"sequence fallback lookup": xuguCatalogSequenceNameQuery("APP_TEST", "S", true),
+		"synonym exact lookup":     xuguCatalogSynonymQuery("APP_TEST", "S", false),
+		"synonym fallback lookup":  xuguCatalogSynonymQuery("APP_TEST", "S", true),
+	} {
+		if !strings.Contains(strings.ToUpper(query), "CURRENT_DB_ID") {
+			t.Errorf("%s is not scoped to the selected database: %s", name, query)
+		}
 	}
 }
 
@@ -678,6 +903,58 @@ func TestTableChildMetadataPresentationHelpers(t *testing.T) {
 	if got := xuguAutoPartitionUnit(2); got != "MONTH" {
 		t.Fatalf("auto partition unit = %q", got)
 	}
+	if got := triggerLevelName(int64(1)); got != "FOR EACH ROW" {
+		t.Fatalf("row trigger level = %q", got)
+	}
+	if got := triggerLevelName(int64(2)); got != "FOR STATEMENT" {
+		t.Fatalf("statement trigger level = %q", got)
+	}
+}
+
+func TestListTriggersReturnsXuguTriggerDetails(t *testing.T) {
+	db, err := sql.Open("xugu-test-trigger-details", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	s := newServer()
+	s.db = db
+	s.params.Database = "TEST_DB"
+
+	triggers, err := s.listTriggers("APP", "EVENTS")
+	if err != nil {
+		t.Fatalf("listTriggers: %v", err)
+	}
+	if len(triggers) != 2 {
+		t.Fatalf("trigger count = %d, want 2", len(triggers))
+	}
+	row := triggers[0]
+	if row.Name != "TR_EVENTS_ROW" || row.Timing != "BEFORE" || row.Event != "INSERT OR UPDATE" || row.Level != "FOR EACH ROW" {
+		t.Fatalf("unexpected row trigger identity: %#v", row)
+	}
+	if row.Condition == nil || *row.Condition != "NEW_VALUE >= 0" || row.Language == nil || *row.Language != "PL/SQL" {
+		t.Fatalf("unexpected row trigger metadata: %#v", row)
+	}
+	if row.Enabled == nil || !*row.Enabled || row.Valid == nil || !*row.Valid {
+		t.Fatalf("expected enabled valid row trigger: %#v", row)
+	}
+	if row.Comment == nil || *row.Comment != "row audit trigger" || row.CreatedAt == nil || *row.CreatedAt != "2026-08-10 09:30:00" {
+		t.Fatalf("unexpected row trigger annotation metadata: %#v", row)
+	}
+
+	statement := triggers[1]
+	if statement.Level != "FOR STATEMENT" || statement.Enabled == nil || *statement.Enabled || statement.Valid == nil || *statement.Valid {
+		t.Fatalf("expected disabled invalid statement trigger: %#v", statement)
+	}
+
+	objects, err := s.listObjects("APP", metadataListConstraints{ObjectTypes: []string{"TRIGGER"}})
+	if err != nil {
+		t.Fatalf("listObjects triggers: %v", err)
+	}
+	if len(objects) != 2 || objects[0].Trigger == nil || objects[0].Trigger.Level != "FOR EACH ROW" || objects[0].Valid == nil || !*objects[0].Valid {
+		t.Fatalf("unexpected schema trigger objects: %#v", objects)
+	}
 }
 
 func TestTableChildMetadataRPCsReturnCatalogObjects(t *testing.T) {
@@ -714,11 +991,31 @@ func TestTableChildMetadataRPCsReturnCatalogObjects(t *testing.T) {
 }
 
 func TestXuguMetadataAccessErrorDetection(t *testing.T) {
-	if !isXuguMetadataAccessError(errors.New("[E18012] 权限不够")) {
-		t.Fatal("expected E18012 permission error to be treated as metadata access error")
+	tests := []struct {
+		name    string
+		message string
+		want    bool
+	}{
+		{name: "permission code", message: "[E18012] 权限不够", want: true},
+		{name: "permission text", message: "permission denied reading ALL_TABLES", want: true},
+		{name: "missing catalog view", message: `表或视图 "ALL_TABLES" 不存在`, want: true},
+		{name: "catalog name in syntax error", message: "syntax error near ALL_TABLES", want: false},
+		{name: "catalog name in network error", message: "network timeout while querying SYS_TABLES", want: false},
+		{name: "catalog name after missing endpoint", message: "network endpoint not found while querying SYS_TABLES", want: false},
+		{name: "unrelated network error", message: "network timeout", want: false},
 	}
-	if isXuguMetadataAccessError(errors.New("network timeout")) {
-		t.Fatal("network errors should not trigger database-list fallback")
+	if !isXuguConnectionClosedError(io.EOF) {
+		t.Fatal("expected EOF to be treated as a closed Xugu connection")
+	}
+	if !isXuguMetadataUnavailableError(errors.New("接收数据库连接失败: EOF")) {
+		t.Fatal("expected Xugu connection EOF to be treated as unavailable metadata")
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := isXuguMetadataAccessError(errors.New(test.message)); got != test.want {
+				t.Fatalf("isXuguMetadataAccessError(%q) = %t, want %t", test.message, got, test.want)
+			}
+		})
 	}
 }
 
@@ -765,14 +1062,28 @@ func TestXuguListObjectsQueryIncludesProgrammableObjects(t *testing.T) {
 		ObjectTypes: []string{"procedure", "function", "package", "package-body", "trigger", "sequence", "synonym", "type", "type-body"},
 	})
 
-	for _, want := range []string{"ALL_PROCEDURES", "p.VALID", "ALL_PACKAGES", "p.BODY IS NOT NULL", "ALL_TRIGGERS", "ALL_SEQUENCES", "ALL_SYNONYMS", "y.IS_PUBLIC = FALSE", "ALL_TYPES", "u.BODY IS NOT NULL", "OBJECT_NAME, OBJECT_TYPE, COMMENTS, VALID", "OBJECT_TYPE IN (?,?,?,?,?,?,?,?,?)"} {
+	for _, want := range []string{"ALL_PROCEDURES", "p.VALID", "ALL_PACKAGES", "p.BODY IS NOT NULL", "ALL_TRIGGERS", "ALL_SEQUENCES", "ALL_SYNONYMS", "y.IS_PUBLIC = FALSE", "ALL_TYPES", "u.UDT_TYPE = 1001", "XUGU_TYPE_MEMBERS_EXPANDABLE", "u.BODY IS NOT NULL", "OBJECT_NAME, OBJECT_TYPE, COMMENTS, VALID", "OBJECT_TYPE IN (?,?,?,?,?,?,?,?,?)"} {
 		if !strings.Contains(query.SQL, want) {
 			t.Fatalf("expected SQL to contain %q:\n%s", want, query.SQL)
 		}
 	}
 
-	wantArgs := []any{"APP", "APP", "APP", "APP", "APP", "APP", "APP", "APP", "APP", "APP", "FUNCTION", "PACKAGE", "PACKAGE_BODY", "PROCEDURE", "SEQUENCE", "SYNONYM", "TRIGGER", "TYPE", "TYPE_BODY"}
+	wantArgs := []any{"APP", "APP", "APP", "APP", "APP", "APP", "APP", "APP", "FUNCTION", "PACKAGE", "PACKAGE_BODY", "PROCEDURE", "SEQUENCE", "SYNONYM", "TRIGGER", "TYPE", "TYPE_BODY"}
 	assertArgs(t, query.Args, wantArgs)
+}
+
+func TestXuguListObjectsQueryPreservesViewValidity(t *testing.T) {
+	query := xuguListObjectsQuery("APP", metadataListConstraints{ObjectTypes: []string{"VIEW"}})
+	upper := strings.ToUpper(query.SQL)
+	if !strings.Contains(upper, "FROM ALL_VIEWS V") {
+		t.Fatalf("view lookup should query ALL_VIEWS: %s", query.SQL)
+	}
+	if !strings.Contains(upper, "V.VALID") {
+		t.Fatalf("view lookup must preserve the catalog validity flag: %s", query.SQL)
+	}
+	if strings.Contains(upper, "NULL AS VALID") {
+		t.Fatalf("view lookup must not discard the catalog validity flag: %s", query.SQL)
+	}
 }
 
 func TestXuguListObjectsQueryKeepsPublicSynonymsOutOfSchemaGroups(t *testing.T) {
@@ -782,7 +1093,42 @@ func TestXuguListObjectsQueryKeepsPublicSynonymsOutOfSchemaGroups(t *testing.T) 
 			t.Fatalf("expected SQL to contain %q:\n%s", want, query.SQL)
 		}
 	}
-	assertArgs(t, query.Args, []any{"SYSDBA", "SYSDBA", "SYSDBA", "SYSDBA", "SYSDBA", "SYSDBA", "SYSDBA", "SYSDBA", "SYSDBA", "SYSDBA", "SYNONYM"})
+	assertArgs(t, query.Args, []any{"SYSDBA", "SYNONYM"})
+}
+
+func TestAvailableXuguObjectTypesRespectsConstraints(t *testing.T) {
+	tests := []struct {
+		name      string
+		requested []string
+		want      []string
+	}{
+		{
+			name: "unconstrained includes synonyms",
+			want: []string{"TABLE", "VIEW", "PROCEDURE", "FUNCTION", "PACKAGE", "PACKAGE_BODY", "TRIGGER", "SEQUENCE", "SYNONYM", "TYPE", "TYPE_BODY"},
+		},
+		{
+			name:      "requested families only",
+			requested: []string{"synonym", "function"},
+			want:      []string{"FUNCTION", "SYNONYM"},
+		},
+		{
+			name:      "aliases are normalized",
+			requested: []string{"base table"},
+			want:      []string{"TABLE"},
+		},
+		{
+			name:      "unsupported types stay empty",
+			requested: []string{"MATERIALIZED_VIEW"},
+			want:      []string{},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := availableXuguObjectTypes(test.requested); !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("availableXuguObjectTypes(%v) = %v, want %v", test.requested, got, test.want)
+			}
+		})
+	}
 }
 
 func TestXuguListObjectsQueryExcludesSystemSequences(t *testing.T) {
@@ -850,6 +1196,9 @@ func TestGetSynonymSourceReconstructsPrivateQuotedDDL(t *testing.T) {
 	}
 	if source["schema"] != "SYSDBA" || source["name"] != "dbxSynonymReplayCase" {
 		t.Fatalf("synonym source must preserve catalog spelling: %#v", source)
+	}
+	if source["editable"] != false {
+		t.Fatalf("synonym source must be read-only: %#v", source)
 	}
 
 	ddl, _ := source["source"].(string)
@@ -1649,6 +1998,29 @@ func TestExecuteQueryPreservesXuguTypeBodyTerminator(t *testing.T) {
 	}
 }
 
+func TestRestoreBusinessSessionDatabaseReplaysUse(t *testing.T) {
+	resetXuguRecordingDriver()
+	db, err := sql.Open("xugu-test-recording", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	s := newServer()
+	s.db = db
+	s.params.Database = "SHOP_DEMO"
+	s.currentDatabase = "SHOP_DEMO"
+	if err := s.restoreBusinessSessionDatabase("SHOP_ARCHIVE"); err != nil {
+		t.Fatalf("restoreBusinessSessionDatabase() error: %v", err)
+	}
+	if got := recordedXuguSQL(); got != `USE "SHOP_ARCHIVE"` {
+		t.Fatalf("restoreBusinessSessionDatabase() executed %q", got)
+	}
+	if s.currentDatabase != "SHOP_ARCHIVE" {
+		t.Fatalf("currentDatabase = %q, want SHOP_ARCHIVE", s.currentDatabase)
+	}
+}
+
 func TestXuguShowStatementsUseResultSetQueryPath(t *testing.T) {
 	resetXuguShowResultDriver()
 	db, err := sql.Open("xugu-test-show-result", "")
@@ -1699,6 +2071,8 @@ func TestXuguQueryKeywordBoundariesUseResultSetPath(t *testing.T) {
 		{name: "parenthesized select", sqlText: "SELECT(1);", wantQuery: "SELECT(1)", wantColumns: []string{"VALUE"}, wantValue: int64(1)},
 		{name: "select hint", sqlText: "SELECT/*+ index */1;", wantQuery: "SELECT/*+ index */1", wantColumns: []string{"VALUE"}, wantValue: int64(1)},
 		{name: "show comment", sqlText: "SHOW/* metadata */ DB_INFO;", wantQuery: "SHOW/* metadata */ DB_INFO", wantColumns: []string{"DB_NAME", "DB_ID", "DB_OWNER", "DB_CHARSET", "DB_TIMEZ"}, wantValue: "SYSTEM"},
+		{name: "explain", sqlText: "EXPLAIN SELECT 1;", wantQuery: "EXPLAIN SELECT 1", wantColumns: []string{"PLAN"}, wantValue: "SeqScan"},
+		{name: "explain verbose", sqlText: "EXPLAIN VERBOSE SELECT 1;", wantQuery: "EXPLAIN VERBOSE SELECT 1", wantColumns: []string{"PLAN"}, wantValue: "SeqScan cost=1"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			resetXuguShowResultDriver()
@@ -1732,6 +2106,40 @@ func TestXuguQueryKeywordBoundariesUseResultSetPath(t *testing.T) {
 	}
 }
 
+func TestXuguExplainStatementsUseResultSetQueryPagePath(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		sqlText string
+		want    string
+	}{
+		{name: "explain", sqlText: "EXPLAIN SELECT 1;", want: "SeqScan"},
+		{name: "explain verbose", sqlText: "EXPLAIN VERBOSE SELECT 1;", want: "SeqScan cost=1"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			resetXuguShowResultDriver()
+			db, err := sql.Open("xugu-test-show-result", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+
+			s := newServer()
+			s.db = db
+			page, err := s.executeQueryPage(queryOptions{SQL: test.sqlText}, 10)
+			if err != nil {
+				t.Fatalf("executeQueryPage(%q): %v", test.sqlText, err)
+			}
+			if len(page.Rows) != 1 || len(page.Rows[0]) == 0 || page.Rows[0][0] != test.want {
+				t.Fatalf("rows = %#v, want first value %q", page.Rows, test.want)
+			}
+			_, execs := recordedXuguShowStatements()
+			if len(execs) != 0 {
+				t.Fatalf("EXPLAIN statements must not use ExecContext, got %v", execs)
+			}
+		})
+	}
+}
+
 func TestIsQuerySQLRecognizesQueryKeywordBoundaries(t *testing.T) {
 	for _, test := range []struct {
 		sqlText string
@@ -1746,9 +2154,13 @@ func TestIsQuerySQLRecognizesQueryKeywordBoundaries(t *testing.T) {
 		{sqlText: "/* Xugu metadata */ SHOW CHARSETS", want: true},
 		{sqlText: "SHOW/* metadata */ DB_INFO", want: true},
 		{sqlText: "-- leading comment\nSELECT(1)", want: true},
+		{sqlText: "EXPLAIN SELECT 1", want: true},
+		{sqlText: "EXPLAIN VERBOSE SELECT 1", want: true},
+		{sqlText: "/* leading comment */ explain verbose SELECT 1", want: true},
 		{sqlText: "SELECTIVE settings", want: false},
 		{sqlText: "SHOWCASE settings", want: false},
 		{sqlText: "SHOW_CURRENT_SCHEMA", want: false},
+		{sqlText: "EXPLAINATION SELECT 1", want: false},
 		{sqlText: "CREATE TABLE items (id INTEGER)", want: false},
 	} {
 		t.Run(test.sqlText, func(t *testing.T) {
@@ -1792,9 +2204,336 @@ func init() {
 	sql.Register("xugu-test-show-result", &xuguShowResultDriver{})
 	sql.Register("xugu-test-sequence-source", &xuguSequenceSourceDriver{})
 	sql.Register("xugu-test-synonym-source", &xuguSynonymSourceDriver{})
+	sql.Register("xugu-test-permission-metadata", &xuguPermissionMetadataDriver{})
+	sql.Register("xugu-test-fallback-errors", &xuguFallbackErrorDriver{})
+	sql.Register("xugu-test-eof", &xuguEOFDriver{})
+	sql.Register("xugu-test-trigger-details", &xuguTriggerDetailsDriver{})
+}
+
+type xuguEOFDriver struct{}
+
+func (d *xuguEOFDriver) Open(name string) (driver.Conn, error) {
+	return &xuguEOFConn{}, nil
+}
+
+type xuguEOFConn struct{}
+
+func (c *xuguEOFConn) Prepare(query string) (driver.Stmt, error) {
+	return nil, errors.New("not supported")
+}
+func (c *xuguEOFConn) Close() error              { return nil }
+func (c *xuguEOFConn) Begin() (driver.Tx, error) { return nil, errors.New("not supported") }
+func (c *xuguEOFConn) QueryContext(_ context.Context, _ string, _ []driver.NamedValue) (driver.Rows, error) {
+	return nil, io.EOF
+}
+
+func TestXuguMetadataRootsDegradeAfterCatalogConnectionClose(t *testing.T) {
+	db, err := sql.Open("xugu-test-eof", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	s := newServer()
+	s.db = db
+	s.params = connectParams{Database: "SHOP_DEMO", Username: "APP_TEST"}
+	s.currentDatabase = "SHOP_DEMO"
+
+	requests := []func() error{
+		func() error { _, err := s.listDatabases(); return err },
+		func() error { _, err := s.listSchemas(); return err },
+		func() error { _, err := s.listTables("APP_TEST", metadataListConstraints{}); return err },
+		func() error { _, err := s.listObjects("APP_TEST", metadataListConstraints{}); return err },
+		func() error { _, err := s.getColumns("APP_TEST", "T_CUSTOMERS"); return err },
+		func() error { _, err := s.listIndexes("APP_TEST", "T_CUSTOMERS"); return err },
+		func() error { _, err := s.listForeignKeys("APP_TEST", "T_CUSTOMERS"); return err },
+		func() error { _, err := s.listConstraints("APP_TEST", "T_CUSTOMERS"); return err },
+		func() error { _, err := s.listTriggers("APP_TEST", "T_CUSTOMERS"); return err },
+		func() error { _, err := s.listPartitions("APP_TEST", "T_CUSTOMERS"); return err },
+		func() error { _, err := s.listSubpartitions("APP_TEST", "T_CUSTOMERS"); return err },
+	}
+	for index, request := range requests {
+		if err := request(); err != nil {
+			t.Fatalf("metadata root %d should degrade without RPC error: %v", index, err)
+		}
+	}
+}
+
+func TestMetadataPermissionFallbackDoesNotReturnRPCError(t *testing.T) {
+	db, err := sql.Open("xugu-test-permission-metadata", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	s := newServer()
+	s.db = db
+	s.params.Username = "APP"
+
+	tables, err := s.listTables("APP", metadataListConstraints{})
+	if err != nil || len(tables) != 1 || tables[0].Name != "PUBLIC_TABLE" {
+		t.Fatalf("listTables permission fallback = %#v, %v; want USER_TABLES result", tables, err)
+	}
+	objects, err := s.listObjects("APP", metadataListConstraints{})
+	if err != nil || len(objects) != 2 {
+		t.Fatalf("listObjects permission fallback = %#v, %v; want table and accessible synonym", objects, err)
+	}
+	objectNames := map[string]string{}
+	for _, object := range objects {
+		objectNames[object.ObjectType] = object.Name
+	}
+	if objectNames["TABLE"] != "PUBLIC_TABLE" || objectNames["SYNONYM"] != "PRIVATE_SYNONYM" {
+		t.Fatalf("listObjects permission fallback = %#v", objects)
+	}
+	indexes, err := s.listIndexes("APP", "PUBLIC_TABLE")
+	if err != nil || len(indexes) != 0 {
+		t.Fatalf("listIndexes permission fallback = %#v, %v; want empty success", indexes, err)
+	}
+	partitions, err := s.listPartitions("APP", "PUBLIC_TABLE")
+	if err != nil || len(partitions) != 0 {
+		t.Fatalf("listPartitions permission fallback = %#v, %v; want empty success", partitions, err)
+	}
+	subpartitions, err := s.listSubpartitions("APP", "PUBLIC_TABLE")
+	if err != nil || len(subpartitions) != 0 {
+		t.Fatalf("listSubpartitions permission fallback = %#v, %v; want empty success", subpartitions, err)
+	}
+}
+
+func TestGetColumnsFallsBackToDirectObjectAccessOnMetadataPermission(t *testing.T) {
+	db, err := sql.Open("xugu-test-permission-metadata", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	s := newServer()
+	s.db = db
+	columns, err := s.getColumns("APP", "PUBLIC_TABLE")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(columns) != 2 || columns[0].Name != "ID" || columns[0].DataType != "INTEGER" || columns[1].Name != "NAME" {
+		t.Fatalf("direct column fallback = %#v", columns)
+	}
+}
+
+func TestTableDDLFallsBackToDirectObjectAccessOnMetadataPermission(t *testing.T) {
+	db, err := sql.Open("xugu-test-permission-metadata", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	s := newServer()
+	s.db = db
+	ddl, err := s.getTableDDL("APP", "PUBLIC_TABLE")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`CREATE TABLE "APP"."PUBLIC_TABLE"`,
+		`"ID" INTEGER`,
+		`"NAME" VARCHAR(40)`,
+	} {
+		if !strings.Contains(ddl, want) {
+			t.Fatalf("fallback table DDL missing %q:\n%s", want, ddl)
+		}
+	}
+}
+
+func TestMetadataFallbackPropagatesUserCatalogErrors(t *testing.T) {
+	db, err := sql.Open("xugu-test-fallback-errors", "user-catalog-error")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	s := newServer()
+	s.db = db
+	s.params.Username = "APP"
+
+	if tables, err := s.listTables("APP", metadataListConstraints{}); err == nil || !strings.Contains(err.Error(), "network timeout reading USER_TABLES") {
+		t.Fatalf("listTables fallback = %#v, %v; want USER_TABLES error", tables, err)
+	}
+	if objects, err := s.listObjects("APP", metadataListConstraints{}); err == nil || !strings.Contains(err.Error(), "network timeout reading USER_TABLES") {
+		t.Fatalf("listObjects fallback = %#v, %v; want USER_TABLES error", objects, err)
+	}
+}
+
+func TestTableDDLFallbackPropagatesDirectSelectError(t *testing.T) {
+	db, err := sql.Open("xugu-test-fallback-errors", "ddl-select-error")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	s := newServer()
+	s.db = db
+	ddl, err := s.getTableDDL("APP", "PUBLIC_TABLE")
+	if err == nil || !strings.Contains(err.Error(), "network timeout selecting APP.PUBLIC_TABLE") {
+		t.Fatalf("table DDL fallback = %q, %v; want direct SELECT error", ddl, err)
+	}
+}
+
+func TestTableDDLFallbackDegradesDirectPermissionError(t *testing.T) {
+	db, err := sql.Open("xugu-test-fallback-errors", "ddl-select-permission")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	s := newServer()
+	s.db = db
+	ddl, err := s.getTableDDL("APP", "PUBLIC_TABLE")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(ddl, "did not expose enough metadata") {
+		t.Fatalf("permission-limited table DDL fallback = %q", ddl)
+	}
+}
+
+func TestObjectSourcePermissionFallbackIsExplicitAndReadOnly(t *testing.T) {
+	db, err := sql.Open("xugu-test-permission-metadata", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	s := newServer()
+	s.db = db
+	for _, objectType := range []string{"PROCEDURE", "SEQUENCE", "SYNONYM"} {
+		source, err := s.getObjectSource("APP", "PRIVATE_OBJECT", objectType)
+		if err != nil {
+			t.Fatalf("%s source fallback: %v", objectType, err)
+		}
+		if source["editable"] != false || !strings.Contains(source["source"].(string), "did not expose source metadata") {
+			t.Fatalf("%s source fallback = %#v", objectType, source)
+		}
+	}
 }
 
 type xuguShowResultDriver struct{}
+
+type xuguPermissionMetadataDriver struct{}
+
+type xuguFallbackErrorDriver struct{}
+
+func (d *xuguFallbackErrorDriver) Open(name string) (driver.Conn, error) {
+	return &xuguFallbackErrorConn{mode: name}, nil
+}
+
+type xuguFallbackErrorConn struct {
+	mode string
+}
+
+func (c *xuguFallbackErrorConn) Prepare(query string) (driver.Stmt, error) {
+	return nil, errors.New("not supported")
+}
+func (c *xuguFallbackErrorConn) Close() error              { return nil }
+func (c *xuguFallbackErrorConn) Begin() (driver.Tx, error) { return nil, errors.New("not supported") }
+func (c *xuguFallbackErrorConn) ExecContext(_ context.Context, _ string, _ []driver.NamedValue) (driver.Result, error) {
+	return driver.ResultNoRows, nil
+}
+func (c *xuguFallbackErrorConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
+	upper := strings.ToUpper(query)
+	switch c.mode {
+	case "user-catalog-error":
+		if strings.Contains(upper, "FROM USER_TABLES") {
+			return nil, errors.New("network timeout reading USER_TABLES")
+		}
+		if strings.Contains(upper, "FROM ALL_TABLES") {
+			return nil, errors.New("[E18012] 权限不够")
+		}
+	case "ddl-select-error", "ddl-select-permission":
+		if strings.Contains(upper, `SELECT * FROM "APP"."PUBLIC_TABLE" WHERE 1 = 0`) {
+			if c.mode == "ddl-select-permission" {
+				return nil, errors.New("permission denied selecting APP.PUBLIC_TABLE")
+			}
+			return nil, errors.New("network timeout selecting APP.PUBLIC_TABLE")
+		}
+		if strings.Contains(upper, "SELECT S.SCHEMA_NAME, T.TABLE_NAME") && strings.Contains(upper, "FROM ALL_TABLES") {
+			return nil, errors.New("[E18012] 权限不够")
+		}
+	}
+	return nil, fmt.Errorf("unexpected fallback-error query for %s: %s", c.mode, query)
+}
+
+func (d *xuguPermissionMetadataDriver) Open(name string) (driver.Conn, error) {
+	return &xuguPermissionMetadataConn{}, nil
+}
+
+type xuguPermissionMetadataConn struct{}
+
+func (c *xuguPermissionMetadataConn) Prepare(query string) (driver.Stmt, error) {
+	return nil, errors.New("not supported")
+}
+func (c *xuguPermissionMetadataConn) Close() error { return nil }
+func (c *xuguPermissionMetadataConn) Begin() (driver.Tx, error) {
+	return nil, errors.New("not supported")
+}
+func (c *xuguPermissionMetadataConn) ExecContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Result, error) {
+	if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(query)), "SET SCHEMA") {
+		return nil, errors.New("[E18012] 权限不够")
+	}
+	return driver.ResultNoRows, nil
+}
+func (c *xuguPermissionMetadataConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
+	upper := strings.ToUpper(query)
+	if strings.Contains(upper, "SELECT S.SCHEMA_NAME, T.TABLE_NAME") {
+		return &xuguStaticRows{columns: []string{"SCHEMA_NAME", "TABLE_NAME"}}, nil
+	}
+	if strings.Contains(upper, "FROM USER_TABLES") {
+		return &xuguStaticRows{
+			columns: []string{"TABLE_NAME", "TABLE_TYPE", "COMMENTS"},
+			values:  [][]driver.Value{{"PUBLIC_TABLE", "TABLE", nil}},
+		}, nil
+	}
+	if strings.Contains(upper, "FROM USER_VIEWS") {
+		return &xuguStaticRows{columns: []string{"VIEW_NAME", "TABLE_TYPE", "COMMENTS"}}, nil
+	}
+	if strings.Contains(upper, "FROM ALL_SYNONYMS") && strings.Contains(upper, "AS OBJECT_TYPE") && !strings.Contains(upper, "FROM ALL_TABLES") {
+		return &xuguStaticRows{
+			columns: []string{"OBJECT_NAME", "OBJECT_TYPE", "COMMENTS", "VALID", "XUGU_TYPE_MEMBERS_EXPANDABLE"},
+			values:  [][]driver.Value{{"PRIVATE_SYNONYM", "SYNONYM", nil, true, nil}},
+		}, nil
+	}
+	if strings.Contains(upper, "ALL_") || strings.Contains(upper, "SYS_") {
+		return nil, errors.New("[E18012] 权限不够")
+	}
+	if strings.Contains(upper, `SELECT * FROM "APP"."PUBLIC_TABLE" WHERE 1 = 0`) {
+		return &xuguPermissionColumnsRows{}, nil
+	}
+	return nil, fmt.Errorf("unexpected permission-fallback query: %s", query)
+}
+
+type xuguPermissionColumnsRows struct {
+	index int
+}
+
+func (r *xuguPermissionColumnsRows) Columns() []string {
+	return []string{"ID", "NAME"}
+}
+func (r *xuguPermissionColumnsRows) Close() error { return nil }
+func (r *xuguPermissionColumnsRows) Next(dest []driver.Value) error {
+	if r.index > 0 {
+		return io.EOF
+	}
+	r.index++
+	return io.EOF
+}
+func (r *xuguPermissionColumnsRows) ColumnTypeDatabaseTypeName(index int) string {
+	return []string{"INTEGER", "VARCHAR"}[index]
+}
+func (r *xuguPermissionColumnsRows) ColumnTypeLength(index int) (length int64, ok bool) {
+	if index == 1 {
+		return 40, true
+	}
+	return 0, false
+}
+func (r *xuguPermissionColumnsRows) ColumnTypeNullable(index int) (nullable, ok bool) {
+	return index != 0, true
+}
 
 var xuguShowResultState struct {
 	sync.Mutex
@@ -1839,6 +2578,10 @@ func (c *xuguShowResultConn) QueryContext(_ context.Context, query string, _ []d
 			columns: []string{"DB_NAME", "DB_ID", "DB_OWNER", "DB_CHARSET", "DB_TIMEZ"},
 			values:  [][]driver.Value{{"SYSTEM", int64(1), "SYS", "UTF8.UTF8_GENERAL_CI", "GMT+08:00"}},
 		}, nil
+	case "EXPLAIN SELECT 1":
+		return &xuguStaticRows{columns: []string{"PLAN"}, values: [][]driver.Value{{"SeqScan"}}}, nil
+	case "EXPLAIN VERBOSE SELECT 1":
+		return &xuguStaticRows{columns: []string{"PLAN"}, values: [][]driver.Value{{"SeqScan cost=1"}}}, nil
 	default:
 		return nil, fmt.Errorf("unexpected query: %s", query)
 	}
@@ -2047,6 +2790,47 @@ func (c *xuguTableObjectsConn) QueryContext(_ context.Context, query string, _ [
 	default:
 		return nil, fmt.Errorf("unexpected query: %s", query)
 	}
+}
+
+type xuguTriggerDetailsDriver struct{}
+
+func (d *xuguTriggerDetailsDriver) Open(name string) (driver.Conn, error) {
+	return &xuguTriggerDetailsConn{}, nil
+}
+
+type xuguTriggerDetailsConn struct{}
+
+func (c *xuguTriggerDetailsConn) Prepare(query string) (driver.Stmt, error) {
+	return nil, errors.New("not supported")
+}
+func (c *xuguTriggerDetailsConn) Close() error              { return nil }
+func (c *xuguTriggerDetailsConn) Begin() (driver.Tx, error) { return nil, errors.New("not supported") }
+func (c *xuguTriggerDetailsConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
+	upper := strings.ToUpper(query)
+	if !strings.Contains(upper, "FROM ALL_TRIGGERS") || !strings.Contains(upper, "CURRENT_DB_ID") {
+		return nil, fmt.Errorf("unexpected trigger details query: %s", query)
+	}
+	for _, column := range []string{"TRIG_TYPE", "TRIG_COND", "LANGUAGE", "ENABLE", "VALID", "COMMENTS", "CREATE_TIME"} {
+		if !strings.Contains(upper, column) {
+			return nil, fmt.Errorf("trigger details query omits %s: %s", column, query)
+		}
+	}
+	if strings.Contains(upper, "JOIN ALL_TABLES") {
+		return &xuguStaticRows{
+			columns: []string{"TRIG_NAME", "TRIG_EVENT", "TRIG_TIME", "TRIG_TYPE", "TRIG_COND", "LANGUAGE", "ENABLE", "VALID", "COMMENTS", "CREATE_TIME"},
+			values: [][]driver.Value{
+				{"TR_EVENTS_ROW", int64(3), int64(1), int64(1), "NEW_VALUE >= 0", "PL/SQL", true, true, "row audit trigger", "2026-08-10 09:30:00"},
+				{"TR_EVENTS_STATEMENT", int64(4), int64(4), int64(2), nil, "PL/SQL", false, false, nil, nil},
+			},
+		}, nil
+	}
+	return &xuguStaticRows{
+		columns: []string{"OBJECT_NAME", "OBJECT_TYPE", "COMMENTS", "VALID", "TRIG_EVENT", "TRIG_TIME", "TRIG_TYPE", "TRIG_COND", "LANGUAGE", "ENABLE", "CREATE_TIME"},
+		values: [][]driver.Value{
+			{"TR_EVENTS_ROW", "TRIGGER", "row audit trigger", true, int64(3), int64(1), int64(1), "NEW_VALUE >= 0", "PL/SQL", true, "2026-08-10 09:30:00"},
+			{"TR_EVENTS_STATEMENT", "TRIGGER", nil, false, int64(4), int64(4), int64(2), nil, "PL/SQL", false, nil},
+		},
+	}, nil
 }
 
 type xuguLegacyColumnsDriver struct{}

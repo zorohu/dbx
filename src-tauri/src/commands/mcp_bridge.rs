@@ -60,6 +60,7 @@ struct MongoFindDocumentsRequest {
     filter: Option<String>,
     projection: Option<String>,
     sort: Option<String>,
+    collation: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -368,6 +369,7 @@ mod tests {
         assert!(ensure_mcp_execute_and_show_supported(&DatabaseType::MongoDb).is_err());
         assert!(ensure_mcp_execute_and_show_supported(&DatabaseType::Redis).is_err());
         assert!(ensure_mcp_execute_and_show_supported(&DatabaseType::Elasticsearch).is_err());
+        assert!(ensure_mcp_execute_and_show_supported(&DatabaseType::Easysearch).is_err());
     }
 
     #[test]
@@ -1180,6 +1182,7 @@ async fn handle_mongo_find_documents_data(state: &Arc<AppState>, body: &str, str
         req.filter.as_deref(),
         req.projection.as_deref(),
         req.sort.as_deref(),
+        req.collation.as_deref(),
     )
     .await
     {

@@ -69,6 +69,7 @@ pub enum AiProvider {
     Gemini,
     Deepseek,
     Qwen,
+    MiniMax,
     Ollama,
     #[serde(rename = "openai-compatible")]
     OpenaiCompatible,
@@ -78,6 +79,14 @@ pub enum AiProvider {
     ClaudeCodeCli,
     #[serde(rename = "pi-agent-cli")]
     PiAgentCli,
+    #[serde(rename = "opencode-cli")]
+    OpenCodeCli,
+    #[serde(rename = "cursor-cli")]
+    CursorCli,
+    #[serde(rename = "grok-cli")]
+    GrokCli,
+    #[serde(rename = "codebuddy-cli")]
+    CodeBuddyCli,
     Custom,
 }
 
@@ -90,10 +99,15 @@ impl AiProvider {
             AiProvider::Gemini => "gemini",
             AiProvider::Deepseek => "deepseek",
             AiProvider::Qwen => "qwen",
+            AiProvider::MiniMax => "minimax",
             AiProvider::Ollama => "ollama",
             AiProvider::OpenaiCompatible => "openai-compatible",
             AiProvider::ClaudeCodeCli => "claude-code-cli",
             AiProvider::PiAgentCli => "pi-agent-cli",
+            AiProvider::OpenCodeCli => "opencode-cli",
+            AiProvider::CursorCli => "cursor-cli",
+            AiProvider::GrokCli => "grok-cli",
+            AiProvider::CodeBuddyCli => "codebuddy-cli",
             AiProvider::CodexCli => "codex-cli",
             AiProvider::Custom => "custom",
         }
@@ -276,6 +290,13 @@ pub struct AiModelEffortPreference {
     pub selection: AiEffortSelection,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AiAssistantMode {
+    Ask,
+    Agent,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AiChatSelectionState {
@@ -285,11 +306,18 @@ pub struct AiChatSelectionState {
     pub active: Option<AiActiveModelSelection>,
     #[serde(default)]
     pub effort_preferences: Vec<AiModelEffortPreference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_mode: Option<AiAssistantMode>,
 }
 
 impl Default for AiChatSelectionState {
     fn default() -> Self {
-        Self { version: default_ai_chat_selection_version(), active: None, effort_preferences: Vec::new() }
+        Self {
+            version: default_ai_chat_selection_version(),
+            active: None,
+            effort_preferences: Vec::new(),
+            default_mode: None,
+        }
     }
 }
 
@@ -371,6 +399,22 @@ pub struct AiConfig {
     pub pi_agent_cli_path: Option<String>,
     #[serde(default)]
     pub pi_agent_cli_env: HashMap<String, String>,
+    #[serde(default)]
+    pub opencode_cli_path: Option<String>,
+    #[serde(default)]
+    pub opencode_cli_env: HashMap<String, String>,
+    #[serde(default)]
+    pub cursor_cli_path: Option<String>,
+    #[serde(default)]
+    pub cursor_cli_env: HashMap<String, String>,
+    #[serde(default)]
+    pub grok_cli_path: Option<String>,
+    #[serde(default)]
+    pub grok_cli_env: HashMap<String, String>,
+    #[serde(default)]
+    pub codebuddy_cli_path: Option<String>,
+    #[serde(default)]
+    pub codebuddy_cli_env: HashMap<String, String>,
 }
 
 fn default_enable_thinking() -> bool {
@@ -378,10 +422,19 @@ fn default_enable_thinking() -> bool {
 }
 
 /// Whether the provider is a CLI-based provider that goes through its own
-/// executable (claude-code, codex, pi) rather than through `with_retry` /
+/// executable (claude-code, codex, cursor, opencode, pi) rather than through `with_retry` /
 /// `with_stream_retry`.
 pub fn is_cli_provider(provider: &AiProvider) -> bool {
-    matches!(provider, AiProvider::CodexCli | AiProvider::ClaudeCodeCli | AiProvider::PiAgentCli)
+    matches!(
+        provider,
+        AiProvider::CodexCli
+            | AiProvider::ClaudeCodeCli
+            | AiProvider::PiAgentCli
+            | AiProvider::OpenCodeCli
+            | AiProvider::CursorCli
+            | AiProvider::GrokCli
+            | AiProvider::CodeBuddyCli
+    )
 }
 
 /// Merge the global `max_retries` setting into an `AiConfig`.
@@ -594,6 +647,7 @@ pub fn resolve_endpoint(config: &AiConfig) -> String {
         AiProvider::Openai
         | AiProvider::Deepseek
         | AiProvider::Qwen
+        | AiProvider::MiniMax
         | AiProvider::Ollama
         | AiProvider::OpenaiCompatible
         | AiProvider::Custom => {
@@ -609,6 +663,10 @@ pub fn resolve_endpoint(config: &AiConfig) -> String {
         | AiProvider::CodexCli
         | AiProvider::ClaudeCodeCli
         | AiProvider::PiAgentCli
+        | AiProvider::OpenCodeCli
+        | AiProvider::CursorCli
+        | AiProvider::GrokCli
+        | AiProvider::CodeBuddyCli
         | AiProvider::Gemini => unreachable!(),
     }
 }
@@ -868,7 +926,9 @@ fn apply_chat_completion_thinking_toggle(body: &mut serde_json::Value, config: &
         return;
     }
 
-    if matches!(config.provider, AiProvider::Ollama) {
+    if matches!(config.provider, AiProvider::MiniMax) {
+        body["thinking"] = json!({ "type": "disabled" });
+    } else if matches!(config.provider, AiProvider::Ollama) {
         // Ollama's OpenAI-compatible API uses reasoning_effort instead of
         // forwarding provider-specific chat template arguments.
         body["reasoning_effort"] = json!("none");
@@ -1044,7 +1104,12 @@ fn emit_responses_function_call_item(
 fn provider_requires_api_key(provider: &AiProvider) -> bool {
     matches!(
         provider,
-        AiProvider::Claude | AiProvider::Openai | AiProvider::Gemini | AiProvider::Deepseek | AiProvider::Qwen
+        AiProvider::Claude
+            | AiProvider::Openai
+            | AiProvider::Gemini
+            | AiProvider::Deepseek
+            | AiProvider::Qwen
+            | AiProvider::MiniMax
     )
 }
 
@@ -1054,7 +1119,7 @@ fn normalized_api_key(config: &AiConfig) -> &str {
 
 fn validate_config(config: &AiConfig) -> Result<(), String> {
     crate::ai_effort::validate_runtime_effort(config)?;
-    if matches!(config.provider, AiProvider::CodexCli | AiProvider::ClaudeCodeCli | AiProvider::PiAgentCli) {
+    if is_cli_provider(&config.provider) {
         return Ok(());
     }
     if provider_requires_api_key(&config.provider) && config.api_key.trim().is_empty() {
@@ -1070,7 +1135,7 @@ fn validate_config(config: &AiConfig) -> Result<(), String> {
 }
 
 fn validate_model_list_config(config: &AiConfig) -> Result<(), String> {
-    if matches!(config.provider, AiProvider::CodexCli | AiProvider::ClaudeCodeCli | AiProvider::PiAgentCli) {
+    if is_cli_provider(&config.provider) {
         return Ok(());
     }
     if provider_requires_api_key(&config.provider) && config.api_key.trim().is_empty() {
@@ -1449,6 +1514,10 @@ pub async fn list_models_core(config: &AiConfig) -> Result<Vec<AiModelInfo>, Str
         AiProvider::CodexCli => crate::ai_codex_cli::list_codex_models(config).await?,
         AiProvider::ClaudeCodeCli => crate::ai_claude_code_cli::list_claude_code_models(config).await?,
         AiProvider::PiAgentCli => crate::ai_pi_agent_cli::list_pi_agent_models(config).await?,
+        AiProvider::OpenCodeCli => crate::ai_opencode_cli::list_opencode_models(config).await?,
+        AiProvider::CursorCli => crate::ai_cursor_cli::list_cursor_models(config).await?,
+        AiProvider::GrokCli => crate::ai_grok_cli::list_grok_models(config).await?,
+        AiProvider::CodeBuddyCli => crate::ai_codebuddy_cli::list_codebuddy_models(config).await?,
         _ => {
             validate_model_list_config(config)?;
             let client = build_ai_http_client(config, 30)?;
@@ -1459,9 +1528,11 @@ pub async fn list_models_core(config: &AiConfig) -> Result<Vec<AiModelInfo>, Str
                     let models = list_openai_compatible_models(&client, config).await?;
                     retain_ollama_completion_models(&client, config, models).await
                 }
-                AiProvider::Openai | AiProvider::Deepseek | AiProvider::Qwen | AiProvider::OpenaiCompatible => {
-                    list_openai_compatible_models(&client, config).await?
-                }
+                AiProvider::Openai
+                | AiProvider::Deepseek
+                | AiProvider::Qwen
+                | AiProvider::MiniMax
+                | AiProvider::OpenaiCompatible => list_openai_compatible_models(&client, config).await?,
                 AiProvider::Custom => {
                     if uses_anthropic_messages_api(config) {
                         list_claude_models(&client, config).await?
@@ -1469,7 +1540,15 @@ pub async fn list_models_core(config: &AiConfig) -> Result<Vec<AiModelInfo>, Str
                         list_openai_compatible_models(&client, config).await?
                     }
                 }
-                AiProvider::CodexCli | AiProvider::ClaudeCodeCli | AiProvider::PiAgentCli => unreachable!(),
+                AiProvider::CodexCli
+                | AiProvider::ClaudeCodeCli
+                | AiProvider::PiAgentCli
+                | AiProvider::OpenCodeCli
+                | AiProvider::CursorCli
+                | AiProvider::GrokCli
+                | AiProvider::CodeBuddyCli => {
+                    unreachable!()
+                }
             }
         }
     };
@@ -1488,7 +1567,19 @@ pub async fn resolve_model_effort_core(config: &AiConfig, model_id: &str) -> Res
         return crate::ai_pi_agent_cli::resolve_pi_agent_model_effort(config, model_id).await;
     }
 
-    if matches!(config.provider, AiProvider::CodexCli | AiProvider::ClaudeCodeCli) {
+    if matches!(config.provider, AiProvider::OpenCodeCli) {
+        return crate::ai_opencode_cli::resolve_opencode_model_effort(config, model_id).await;
+    }
+
+    if matches!(config.provider, AiProvider::CodeBuddyCli) {
+        return crate::ai_codebuddy_cli::resolve_codebuddy_model_effort(config, model_id).await;
+    }
+
+    if matches!(config.provider, AiProvider::CursorCli) {
+        return Ok(AiEffortCapability::Unsupported);
+    }
+
+    if matches!(config.provider, AiProvider::CodexCli | AiProvider::ClaudeCodeCli | AiProvider::GrokCli) {
         let models = list_models_core(config).await?;
         return Ok(models
             .into_iter()
@@ -2016,6 +2107,19 @@ pub async fn test_connection_core(config: &AiConfig) -> Result<AiTestConnectionR
     if matches!(config.provider, AiProvider::PiAgentCli) {
         return crate::ai_pi_agent_cli::test_pi_agent_connection(config).await;
     }
+    if matches!(config.provider, AiProvider::OpenCodeCli) {
+        return crate::ai_opencode_cli::test_opencode_connection(config).await;
+    }
+    if matches!(config.provider, AiProvider::CursorCli) {
+        return crate::ai_cursor_cli::test_cursor_connection(config).await;
+    }
+
+    if matches!(config.provider, AiProvider::GrokCli) {
+        return crate::ai_grok_cli::test_grok_connection(config).await;
+    }
+    if matches!(config.provider, AiProvider::CodeBuddyCli) {
+        return crate::ai_codebuddy_cli::test_codebuddy_connection(config).await;
+    }
     let mut resolved_config = config.clone();
     if resolved_config.model.trim().is_empty() {
         let model = list_models_core(&resolved_config)
@@ -2371,7 +2475,7 @@ where
 pub async fn complete(request: &AiCompletionRequest) -> Result<String, String> {
     validate_config(&request.config)?;
 
-    if matches!(request.config.provider, AiProvider::CodexCli | AiProvider::ClaudeCodeCli | AiProvider::PiAgentCli) {
+    if is_cli_provider(&request.config.provider) {
         return Err("CLI providers are only supported in DBX AI agent mode".to_string());
     }
 
@@ -2388,10 +2492,19 @@ pub async fn complete(request: &AiCompletionRequest) -> Result<String, String> {
 
             match request.config.provider {
                 AiProvider::Gemini => call_gemini(&client, request).await,
-                AiProvider::CodexCli | AiProvider::ClaudeCodeCli | AiProvider::PiAgentCli => unreachable!(),
+                AiProvider::CodexCli
+                | AiProvider::ClaudeCodeCli
+                | AiProvider::PiAgentCli
+                | AiProvider::OpenCodeCli
+                | AiProvider::CursorCli
+                | AiProvider::GrokCli
+                | AiProvider::CodeBuddyCli => {
+                    unreachable!()
+                }
                 AiProvider::Openai
                 | AiProvider::Deepseek
                 | AiProvider::Qwen
+                | AiProvider::MiniMax
                 | AiProvider::Ollama
                 | AiProvider::OpenaiCompatible => {
                     if request.config.api_style == AiApiStyle::Responses {
@@ -2426,7 +2539,7 @@ pub async fn stream(
 ) -> Result<(), String> {
     validate_config(&request.config)?;
 
-    if matches!(request.config.provider, AiProvider::CodexCli | AiProvider::ClaudeCodeCli | AiProvider::PiAgentCli) {
+    if is_cli_provider(&request.config.provider) {
         return Err("CLI providers are only supported in DBX AI agent mode".to_string());
     }
 
@@ -2439,10 +2552,19 @@ pub async fn stream(
 
     match request.config.provider {
         AiProvider::Gemini => stream_gemini(&client, session_id, request, cancelled, &on_chunk).await,
-        AiProvider::CodexCli | AiProvider::ClaudeCodeCli | AiProvider::PiAgentCli => unreachable!(),
+        AiProvider::CodexCli
+        | AiProvider::ClaudeCodeCli
+        | AiProvider::PiAgentCli
+        | AiProvider::OpenCodeCli
+        | AiProvider::CursorCli
+        | AiProvider::GrokCli
+        | AiProvider::CodeBuddyCli => {
+            unreachable!()
+        }
         AiProvider::Openai
         | AiProvider::Deepseek
         | AiProvider::Qwen
+        | AiProvider::MiniMax
         | AiProvider::Ollama
         | AiProvider::OpenaiCompatible => {
             if request.config.api_style == AiApiStyle::Responses {
@@ -3532,17 +3654,37 @@ fn build_gemini_contents(messages: &[AiMessage]) -> Vec<serde_json::Value> {
             }
             if m.role == "assistant" && !m.tool_calls.is_empty() {
                 let mut parts: Vec<serde_json::Value> = Vec::new();
-                if !m.content.is_empty() {
-                    parts.push(json!({ "text": m.content }));
-                }
-                for tc in &m.tool_calls {
-                    if let Some(payload) =
-                        tc.provider_payload.as_ref().filter(|payload| payload.get("functionCall").is_some())
-                    {
-                        parts.push(payload.clone());
-                    } else {
-                        parts.push(json!({ "functionCall": { "name": tc.name, "args": tc.arguments } }));
+                let mut has_text_part = false;
+                if let Some(model_parts) = m
+                    .tool_calls
+                    .iter()
+                    .filter_map(|tc| tc.provider_payload.as_ref())
+                    .find_map(|payload| payload.get("model_parts").and_then(serde_json::Value::as_array))
+                {
+                    for part in model_parts {
+                        if part.get("text").is_some() {
+                            has_text_part = true;
+                        }
+                        parts.push(part.clone());
                     }
+                } else {
+                    for tc in &m.tool_calls {
+                        if let Some(payload) = &tc.provider_payload {
+                            if payload.get("functionCall").is_some()
+                                || payload.get("thought_signature").is_some()
+                                || payload.get("thoughtSignature").is_some()
+                            {
+                                parts.push(payload.clone());
+                            } else {
+                                parts.push(json!({ "functionCall": { "name": tc.name, "args": tc.arguments } }));
+                            }
+                        } else {
+                            parts.push(json!({ "functionCall": { "name": tc.name, "args": tc.arguments } }));
+                        }
+                    }
+                }
+                if !m.content.is_empty() && !has_text_part {
+                    parts.insert(0, json!({ "text": m.content }));
                 }
                 contents.push(json!({ "role": "model", "parts": parts }));
             } else {
@@ -3562,19 +3704,31 @@ fn build_gemini_contents(messages: &[AiMessage]) -> Vec<serde_json::Value> {
     contents
 }
 
-fn emit_gemini_tool_call_part(part: &serde_json::Value, index: u32, on_event: &impl Fn(StreamToolEvent)) -> bool {
-    let Some(function_call) = part.get("functionCall") else {
-        return false;
+fn append_gemini_model_parts(event: &serde_json::Value, model_parts: &mut Vec<serde_json::Value>) {
+    let Some(parts) = event["candidates"][0]["content"]["parts"].as_array() else {
+        return;
     };
+    model_parts.extend(parts.iter().cloned());
+}
 
-    let name = function_call["name"].as_str().unwrap_or_default().to_string();
-    let arguments = function_call["args"].clone();
-    let id = format!("gemini-tc-{name}-{index}");
-    on_event(StreamToolEvent::ToolCallStart { index, id, name });
-    on_event(StreamToolEvent::ToolCallProviderPayload { index, payload: part.clone() });
-    on_event(StreamToolEvent::ToolCallDelta { index, fragment: arguments.to_string() });
-    on_event(StreamToolEvent::ToolCallComplete { index });
-    true
+fn emit_gemini_tool_call_parts(model_parts: &[serde_json::Value], on_event: &impl Fn(StreamToolEvent)) -> u32 {
+    let mut index = 0;
+    for part in model_parts {
+        let Some(function_call) = part.get("functionCall") else {
+            continue;
+        };
+
+        let name = function_call["name"].as_str().unwrap_or_default().to_string();
+        let arguments = function_call["args"].clone();
+        let id = format!("gemini-tc-{name}-{index}");
+        on_event(StreamToolEvent::ToolCallStart { index, id, name });
+        let payload = if index == 0 { json!({ "model_parts": model_parts }) } else { part.clone() };
+        on_event(StreamToolEvent::ToolCallProviderPayload { index, payload });
+        on_event(StreamToolEvent::ToolCallDelta { index, fragment: arguments.to_string() });
+        on_event(StreamToolEvent::ToolCallComplete { index });
+        index += 1;
+    }
+    index
 }
 
 /// Streaming Gemini call with tool support.
@@ -3625,7 +3779,7 @@ async fn stream_gemini_with_tools(
 
             let mut byte_stream = res.bytes_stream();
             let mut buf = Vec::new();
-            let mut tool_call_idx: u32 = 0;
+            let mut model_parts: Vec<serde_json::Value> = Vec::new();
             let mut token_usage: Option<TokenUsage> = None;
 
             loop {
@@ -3658,12 +3812,9 @@ async fn stream_gemini_with_tools(
                                                     done: false,
                                                 }));
                                             }
-                                            // Function call (Gemini sends complete objects, not deltas)
                                             emitted.store(true, std::sync::atomic::Ordering::Relaxed);
-                                            if emit_gemini_tool_call_part(part, tool_call_idx, on_event) {
-                                                tool_call_idx += 1;
-                                            }
                                         }
+                                        append_gemini_model_parts(&event, &mut model_parts);
                                     }
                                 }
                             }
@@ -3675,6 +3826,7 @@ async fn stream_gemini_with_tools(
                 }
             }
 
+            emit_gemini_tool_call_parts(&model_parts, on_event);
             Ok(token_usage)
         }
     })
@@ -3692,7 +3844,7 @@ pub async fn stream_with_tools(
     on_chunk: impl Fn(AiStreamChunk),
 ) -> Result<(Vec<crate::agent_events::ToolCall>, Option<TokenUsage>), String> {
     validate_config(config)?;
-    if matches!(config.provider, AiProvider::CodexCli | AiProvider::ClaudeCodeCli | AiProvider::PiAgentCli) {
+    if is_cli_provider(&config.provider) {
         return Err("CLI providers are only supported through the DBX AI agent loop".to_string());
     }
 
@@ -3797,23 +3949,41 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::{
-        apply_chat_completion_thinking_toggle, build_ai_http_client, build_gemini_contents,
+        append_gemini_model_parts, apply_chat_completion_thinking_toggle, build_ai_http_client, build_gemini_contents,
         build_responses_input_with_tools, call_claude, classify_error, claude_headers, claude_system_prompt, complete,
-        drain_next_stream_line, emit_gemini_tool_call_part, emit_responses_function_call_item, format_transport_error,
+        drain_next_stream_line, emit_gemini_tool_call_parts, emit_responses_function_call_item, format_transport_error,
         gemini_text, is_kimi_model, is_retryable_error, list_models_core, maybe_bearer_headers, maybe_tag_retry_after,
         measure_first_stream_chunk, merge_global_max_retries, ollama_selected_model_tool_support, openai_response_text,
         openai_stream_reasoning, openai_stream_text, parse_dynamic_effort_capability, parse_gemini_model_list_response,
-        parse_model_list_response, parse_retry_after, parse_retry_after_secs, resolve_endpoint,
-        resolve_gemini_stream_endpoint, resolve_model_effort_core, resolve_model_list_endpoint,
+        parse_model_list_response, parse_retry_after, parse_retry_after_secs, provider_requires_api_key,
+        resolve_endpoint, resolve_gemini_stream_endpoint, resolve_model_effort_core, resolve_model_list_endpoint,
         resolve_ollama_show_endpoint, responses_function_tool, responses_max_output_tokens, responses_stream_text,
         responses_text, responses_token_usage, retain_ollama_completion_models, retry_after_secs,
         set_chat_completion_token_limit, stream, stream_claude, stream_claude_with_tools, stream_data_payload,
         stream_error, stream_openai_with_tools, stream_with_tools, test_connection_core, uses_anthropic_messages_api,
-        validate_config, validate_model_list_config, with_retry, with_stream_retry, AiApiStyle, AiAuthMethod,
-        AiCapabilitySource, AiCompletionRequest, AiConfig, AiEffortCapability, AiEffortOption, AiEffortSelection,
-        AiMessage, AiModelInfo, AiProvider, AiReasoningLevel, StreamToolEvent, StreamingToolCallAccumulator,
-        ToolCallRef, AUTHORIZATION, CLAUDE_DEFAULT_SYSTEM, TEST_PROMPT,
+        validate_config, validate_model_list_config, with_retry, with_stream_retry, AiApiStyle, AiAssistantMode,
+        AiAuthMethod, AiCapabilitySource, AiChatSelectionState, AiCompletionRequest, AiConfig, AiEffortCapability,
+        AiEffortOption, AiEffortSelection, AiMessage, AiModelInfo, AiProvider, AiReasoningLevel, StreamToolEvent,
+        StreamingToolCallAccumulator, ToolCallRef, AUTHORIZATION, CLAUDE_DEFAULT_SYSTEM, TEST_PROMPT,
     };
+
+    #[test]
+    fn ai_chat_selection_default_mode_serde() {
+        // Old blobs without a defaultMode field load as None (no migration needed).
+        let legacy: AiChatSelectionState =
+            serde_json::from_str(r#"{"version":1,"active":null,"effortPreferences":[]}"#).unwrap();
+        assert_eq!(legacy.default_mode, None);
+
+        let agent: AiChatSelectionState = serde_json::from_str(r#"{"version":1,"defaultMode":"agent"}"#).unwrap();
+        assert_eq!(agent.default_mode, Some(AiAssistantMode::Agent));
+
+        let ask: AiChatSelectionState = serde_json::from_str(r#"{"version":1,"defaultMode":"ask"}"#).unwrap();
+        assert_eq!(ask.default_mode, Some(AiAssistantMode::Ask));
+
+        // camelCase key + lowercase value round-trip.
+        let serialized = serde_json::to_value(agent).unwrap();
+        assert_eq!(serialized["defaultMode"], serde_json::json!("agent"));
+    }
 
     struct CapturedJsonRequest {
         headers: String,
@@ -4044,6 +4214,14 @@ mod tests {
                 claude_code_cli_env: Default::default(),
                 pi_agent_cli_path: None,
                 pi_agent_cli_env: Default::default(),
+                opencode_cli_path: None,
+                opencode_cli_env: Default::default(),
+                cursor_cli_path: None,
+                cursor_cli_env: Default::default(),
+                grok_cli_path: None,
+                grok_cli_env: Default::default(),
+                codebuddy_cli_path: None,
+                codebuddy_cli_env: Default::default(),
             },
             system_prompt: "Be concise.".to_string(),
             messages: vec![AiMessage {
@@ -4315,16 +4493,20 @@ mod tests {
             "thoughtSignature": "encrypted-signature"
         });
         let accumulator = RefCell::new(StreamingToolCallAccumulator::new());
+        let model_parts = vec![response_part.clone()];
 
-        assert!(emit_gemini_tool_call_part(&response_part, 0, &|event| {
-            accumulator.borrow_mut().process(event, &|_| {});
-        }));
+        assert_eq!(
+            emit_gemini_tool_call_parts(&model_parts, &|event| {
+                accumulator.borrow_mut().process(event, &|_| {});
+            }),
+            1
+        );
 
         let calls = accumulator.into_inner().finalize();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "list_tables");
         assert_eq!(calls[0].arguments, serde_json::json!({ "schema": "public" }));
-        assert_eq!(calls[0].provider_payload.as_ref(), Some(&response_part));
+        assert_eq!(calls[0].provider_payload.as_ref(), Some(&serde_json::json!({ "model_parts": model_parts })));
 
         let contents = build_gemini_contents(&[
             AiMessage {
@@ -4349,6 +4531,116 @@ mod tests {
         assert_eq!(contents[0]["role"], "model");
         assert_eq!(contents[0]["parts"][0], response_part);
         assert_eq!(contents[1]["parts"][0]["functionResponse"]["name"], "list_tables");
+    }
+
+    #[test]
+    fn gemini_tool_call_replays_parts_accumulated_across_stream_events() {
+        let first_event = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "thought": true,
+                        "text": "planning",
+                        "thoughtSignature": "encrypted-signature"
+                    }]
+                }
+            }]
+        });
+        let second_event = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "functionCall": {
+                            "name": "list_tables",
+                            "args": { "schema": "public" }
+                        }
+                    }]
+                }
+            }]
+        });
+        let mut model_parts = Vec::new();
+        append_gemini_model_parts(&first_event, &mut model_parts);
+        append_gemini_model_parts(&second_event, &mut model_parts);
+        let accumulator = RefCell::new(StreamingToolCallAccumulator::new());
+
+        assert_eq!(
+            emit_gemini_tool_call_parts(&model_parts, &|event| {
+                accumulator.borrow_mut().process(event, &|_| {});
+            }),
+            1
+        );
+
+        let calls = accumulator.into_inner().finalize();
+        let contents = build_gemini_contents(&[AiMessage {
+            role: "assistant".to_string(),
+            content: "planning".to_string(),
+            tool_call_id: None,
+            tool_calls: vec![ToolCallRef {
+                id: calls[0].id.clone(),
+                name: calls[0].name.clone(),
+                arguments: calls[0].arguments.clone(),
+                provider_payload: calls[0].provider_payload.clone(),
+            }],
+        }]);
+
+        assert_eq!(contents[0]["parts"], serde_json::Value::Array(model_parts));
+    }
+
+    #[test]
+    fn gemini_parallel_tool_calls_replay_model_parts_once() {
+        let model_parts = vec![
+            serde_json::json!({ "thought": true, "thoughtSignature": "encrypted-signature" }),
+            serde_json::json!({ "functionCall": { "name": "list_tables", "args": { "schema": "public" } } }),
+            serde_json::json!({ "functionCall": { "name": "get_columns", "args": { "table": "users" } } }),
+        ];
+        let accumulator = RefCell::new(StreamingToolCallAccumulator::new());
+        assert_eq!(
+            emit_gemini_tool_call_parts(&model_parts, &|event| {
+                accumulator.borrow_mut().process(event, &|_| {});
+            }),
+            2
+        );
+        let calls = accumulator.into_inner().finalize();
+
+        let contents = build_gemini_contents(&[AiMessage {
+            role: "assistant".to_string(),
+            content: String::new(),
+            tool_call_id: None,
+            tool_calls: calls
+                .iter()
+                .map(|call| ToolCallRef {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                    provider_payload: call.provider_payload.clone(),
+                })
+                .collect(),
+        }]);
+
+        assert_eq!(contents[0]["parts"], serde_json::Value::Array(model_parts));
+        assert_eq!(contents[0]["parts"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn gemini_incomplete_stream_does_not_emit_partial_tool_calls() {
+        let event = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "functionCall": {
+                            "name": "list_tables",
+                            "args": { "schema": "public" }
+                        }
+                    }]
+                }
+            }]
+        });
+        let mut model_parts = Vec::new();
+        append_gemini_model_parts(&event, &mut model_parts);
+        let accumulator = StreamingToolCallAccumulator::new();
+
+        assert_eq!(model_parts.len(), 1);
+        assert!(accumulator.finalize().is_empty());
     }
 
     #[test]
@@ -4511,6 +4803,12 @@ mod tests {
         assert!(config.codex_cli_env.is_empty());
         assert!(config.pi_agent_cli_path.is_none());
         assert!(config.pi_agent_cli_env.is_empty());
+        assert!(config.opencode_cli_path.is_none());
+        assert!(config.opencode_cli_env.is_empty());
+        assert!(config.cursor_cli_path.is_none());
+        assert!(config.cursor_cli_env.is_empty());
+        assert!(config.codebuddy_cli_path.is_none());
+        assert!(config.codebuddy_cli_env.is_empty());
     }
 
     #[test]
@@ -4536,6 +4834,14 @@ mod tests {
             claude_code_cli_env: Default::default(),
             pi_agent_cli_path: None,
             pi_agent_cli_env: Default::default(),
+            opencode_cli_path: None,
+            opencode_cli_env: Default::default(),
+            cursor_cli_path: None,
+            cursor_cli_env: Default::default(),
+            grok_cli_path: None,
+            grok_cli_env: Default::default(),
+            codebuddy_cli_path: None,
+            codebuddy_cli_env: Default::default(),
         };
 
         let err = build_ai_http_client(&config, 1).unwrap_err();
@@ -4566,6 +4872,14 @@ mod tests {
             claude_code_cli_env: Default::default(),
             pi_agent_cli_path: None,
             pi_agent_cli_env: Default::default(),
+            opencode_cli_path: None,
+            opencode_cli_env: Default::default(),
+            cursor_cli_path: None,
+            cursor_cli_env: Default::default(),
+            grok_cli_path: None,
+            grok_cli_env: Default::default(),
+            codebuddy_cli_path: None,
+            codebuddy_cli_env: Default::default(),
         };
 
         build_ai_http_client(&config, 1).unwrap();
@@ -4594,6 +4908,14 @@ mod tests {
             claude_code_cli_env: Default::default(),
             pi_agent_cli_path: None,
             pi_agent_cli_env: Default::default(),
+            opencode_cli_path: None,
+            opencode_cli_env: Default::default(),
+            cursor_cli_path: None,
+            cursor_cli_env: Default::default(),
+            grok_cli_path: None,
+            grok_cli_env: Default::default(),
+            codebuddy_cli_path: None,
+            codebuddy_cli_env: Default::default(),
         };
 
         build_ai_http_client(&config, 1).unwrap();
@@ -4622,6 +4944,14 @@ mod tests {
             claude_code_cli_env: Default::default(),
             pi_agent_cli_path: None,
             pi_agent_cli_env: Default::default(),
+            opencode_cli_path: None,
+            opencode_cli_env: Default::default(),
+            cursor_cli_path: None,
+            cursor_cli_env: Default::default(),
+            grok_cli_path: None,
+            grok_cli_env: Default::default(),
+            codebuddy_cli_path: None,
+            codebuddy_cli_env: Default::default(),
         };
 
         assert_eq!(
@@ -4654,6 +4984,14 @@ mod tests {
             claude_code_cli_env: Default::default(),
             pi_agent_cli_path: None,
             pi_agent_cli_env: Default::default(),
+            opencode_cli_path: None,
+            opencode_cli_env: Default::default(),
+            cursor_cli_path: None,
+            cursor_cli_env: Default::default(),
+            grok_cli_path: None,
+            grok_cli_env: Default::default(),
+            codebuddy_cli_path: None,
+            codebuddy_cli_env: Default::default(),
         };
 
         assert_eq!(resolve_endpoint(&ollama), "http://localhost:11434/v1/chat/completions");
@@ -4683,6 +5021,14 @@ mod tests {
             claude_code_cli_env: Default::default(),
             pi_agent_cli_path: None,
             pi_agent_cli_env: Default::default(),
+            opencode_cli_path: None,
+            opencode_cli_env: Default::default(),
+            cursor_cli_path: None,
+            cursor_cli_env: Default::default(),
+            grok_cli_path: None,
+            grok_cli_env: Default::default(),
+            codebuddy_cli_path: None,
+            codebuddy_cli_env: Default::default(),
         };
 
         for provider in
@@ -4694,9 +5040,14 @@ mod tests {
             assert!(maybe_bearer_headers(&config).unwrap().get(AUTHORIZATION).is_none());
         }
 
-        for provider in
-            [AiProvider::Claude, AiProvider::Openai, AiProvider::Gemini, AiProvider::Deepseek, AiProvider::Qwen]
-        {
+        for provider in [
+            AiProvider::Claude,
+            AiProvider::Openai,
+            AiProvider::Gemini,
+            AiProvider::Deepseek,
+            AiProvider::Qwen,
+            AiProvider::MiniMax,
+        ] {
             let config = AiConfig { provider, ..base.clone() };
             assert_eq!(validate_config(&config).unwrap_err(), "API key is required");
             assert_eq!(validate_model_list_config(&config).unwrap_err(), "API key is required");
@@ -4726,6 +5077,14 @@ mod tests {
             claude_code_cli_env: Default::default(),
             pi_agent_cli_path: None,
             pi_agent_cli_env: Default::default(),
+            opencode_cli_path: None,
+            opencode_cli_env: Default::default(),
+            cursor_cli_path: None,
+            cursor_cli_env: Default::default(),
+            grok_cli_path: None,
+            grok_cli_env: Default::default(),
+            codebuddy_cli_path: None,
+            codebuddy_cli_env: Default::default(),
         };
         assert_eq!(resolve_model_list_endpoint(&openai).unwrap(), "https://api.openai.com/v1/models");
 
@@ -4750,6 +5109,14 @@ mod tests {
             claude_code_cli_env: Default::default(),
             pi_agent_cli_path: None,
             pi_agent_cli_env: Default::default(),
+            opencode_cli_path: None,
+            opencode_cli_env: Default::default(),
+            cursor_cli_path: None,
+            cursor_cli_env: Default::default(),
+            grok_cli_path: None,
+            grok_cli_env: Default::default(),
+            codebuddy_cli_path: None,
+            codebuddy_cli_env: Default::default(),
         };
         assert_eq!(resolve_model_list_endpoint(&claude).unwrap(), "https://api.anthropic.com/v1/models");
     }
@@ -4777,6 +5144,14 @@ mod tests {
             claude_code_cli_env: Default::default(),
             pi_agent_cli_path: None,
             pi_agent_cli_env: Default::default(),
+            opencode_cli_path: None,
+            opencode_cli_env: Default::default(),
+            cursor_cli_path: None,
+            cursor_cli_env: Default::default(),
+            grok_cli_path: None,
+            grok_cli_env: Default::default(),
+            codebuddy_cli_path: None,
+            codebuddy_cli_env: Default::default(),
         };
 
         assert!(uses_anthropic_messages_api(&config));
@@ -4834,6 +5209,52 @@ mod tests {
     }
 
     #[test]
+    fn minimax_provider_uses_openai_compatible_endpoints_and_round_trips() {
+        let config = AiConfig {
+            provider: AiProvider::MiniMax,
+            api_key: "key".to_string(),
+            auth_method: AiAuthMethod::Bearer,
+            endpoint: "https://api.minimax.io/v1".to_string(),
+            model: "MiniMax-M3".to_string(),
+            models: Vec::new(),
+            api_style: AiApiStyle::Completions,
+            proxy_enabled: false,
+            proxy_url: String::new(),
+            enable_thinking: true,
+            reasoning_level: AiReasoningLevel::Default,
+            runtime_effort: None,
+            context_window: None,
+            max_retries: None,
+            codex_cli_path: None,
+            codex_cli_env: Default::default(),
+            claude_code_cli_path: None,
+            claude_code_cli_env: Default::default(),
+            pi_agent_cli_path: None,
+            pi_agent_cli_env: Default::default(),
+            opencode_cli_path: None,
+            opencode_cli_env: Default::default(),
+            cursor_cli_path: None,
+            cursor_cli_env: Default::default(),
+            grok_cli_path: None,
+            grok_cli_env: Default::default(),
+            codebuddy_cli_path: None,
+            codebuddy_cli_env: Default::default(),
+        };
+
+        assert!(!uses_anthropic_messages_api(&config));
+        assert_eq!(resolve_endpoint(&config), "https://api.minimax.io/v1/chat/completions");
+        assert_eq!(resolve_model_list_endpoint(&config).unwrap(), "https://api.minimax.io/v1/models");
+        assert!(provider_requires_api_key(&config.provider));
+
+        let no_key = AiConfig { api_key: String::new(), ..config.clone() };
+        assert_eq!(validate_config(&no_key).unwrap_err(), "API key is required");
+
+        let provider_json = serde_json::to_string(&AiProvider::MiniMax).unwrap();
+        assert_eq!(provider_json, r#""minimax""#);
+        assert!(matches!(serde_json::from_str::<AiProvider>(&provider_json).unwrap(), AiProvider::MiniMax));
+    }
+
+    #[test]
     fn auto_adds_v1_to_openai_compatible_endpoints() {
         // Endpoint without /v1 — auto add
         let config = AiConfig {
@@ -4857,6 +5278,14 @@ mod tests {
             claude_code_cli_env: Default::default(),
             pi_agent_cli_path: None,
             pi_agent_cli_env: Default::default(),
+            opencode_cli_path: None,
+            opencode_cli_env: Default::default(),
+            cursor_cli_path: None,
+            cursor_cli_env: Default::default(),
+            grok_cli_path: None,
+            grok_cli_env: Default::default(),
+            codebuddy_cli_path: None,
+            codebuddy_cli_env: Default::default(),
         };
         assert_eq!(resolve_endpoint(&config), "https://api.example.com/v1/chat/completions");
         assert_eq!(resolve_model_list_endpoint(&config).unwrap(), "https://api.example.com/v1/models");
@@ -4920,6 +5349,14 @@ mod tests {
             claude_code_cli_env: Default::default(),
             pi_agent_cli_path: None,
             pi_agent_cli_env: Default::default(),
+            opencode_cli_path: None,
+            opencode_cli_env: Default::default(),
+            cursor_cli_path: None,
+            cursor_cli_env: Default::default(),
+            grok_cli_path: None,
+            grok_cli_env: Default::default(),
+            codebuddy_cli_path: None,
+            codebuddy_cli_env: Default::default(),
         };
 
         assert_eq!(resolve_endpoint(&config), "https://api.openai.com/v1/responses");
@@ -4955,6 +5392,14 @@ mod tests {
             claude_code_cli_env: Default::default(),
             pi_agent_cli_path: None,
             pi_agent_cli_env: Default::default(),
+            opencode_cli_path: None,
+            opencode_cli_env: Default::default(),
+            cursor_cli_path: None,
+            cursor_cli_env: Default::default(),
+            grok_cli_path: None,
+            grok_cli_env: Default::default(),
+            codebuddy_cli_path: None,
+            codebuddy_cli_env: Default::default(),
         };
 
         let api_key_headers = claude_headers(&config).unwrap();
@@ -5070,6 +5515,14 @@ mod tests {
             claude_code_cli_env: Default::default(),
             pi_agent_cli_path: None,
             pi_agent_cli_env: Default::default(),
+            opencode_cli_path: None,
+            opencode_cli_env: Default::default(),
+            cursor_cli_path: None,
+            cursor_cli_env: Default::default(),
+            grok_cli_path: None,
+            grok_cli_env: Default::default(),
+            codebuddy_cli_path: None,
+            codebuddy_cli_env: Default::default(),
         };
         assert_eq!(resolve_ollama_show_endpoint(&config).unwrap(), "http://localhost:11434/api/show");
 
@@ -5102,6 +5555,14 @@ mod tests {
             claude_code_cli_env: Default::default(),
             pi_agent_cli_path: None,
             pi_agent_cli_env: Default::default(),
+            opencode_cli_path: None,
+            opencode_cli_env: Default::default(),
+            cursor_cli_path: None,
+            cursor_cli_env: Default::default(),
+            grok_cli_path: None,
+            grok_cli_env: Default::default(),
+            codebuddy_cli_path: None,
+            codebuddy_cli_env: Default::default(),
         };
 
         assert_eq!(ollama_selected_model_tool_support(&config).await.unwrap(), Some(true));
@@ -5183,6 +5644,14 @@ mod tests {
             claude_code_cli_env: Default::default(),
             pi_agent_cli_path: None,
             pi_agent_cli_env: Default::default(),
+            opencode_cli_path: None,
+            opencode_cli_env: Default::default(),
+            cursor_cli_path: None,
+            cursor_cli_env: Default::default(),
+            grok_cli_path: None,
+            grok_cli_env: Default::default(),
+            codebuddy_cli_path: None,
+            codebuddy_cli_env: Default::default(),
         };
         let models = vec![
             AiModelInfo::new("qwen3:0.6b", None),
@@ -5444,6 +5913,14 @@ mod tests {
             claude_code_cli_env: Default::default(),
             pi_agent_cli_path: None,
             pi_agent_cli_env: Default::default(),
+            opencode_cli_path: None,
+            opencode_cli_env: Default::default(),
+            cursor_cli_path: None,
+            cursor_cli_env: Default::default(),
+            grok_cli_path: None,
+            grok_cli_env: Default::default(),
+            codebuddy_cli_path: None,
+            codebuddy_cli_env: Default::default(),
         };
 
         let mut body = serde_json::json!({
@@ -5655,6 +6132,14 @@ mod tests {
             claude_code_cli_env: Default::default(),
             pi_agent_cli_path: None,
             pi_agent_cli_env: Default::default(),
+            opencode_cli_path: None,
+            opencode_cli_env: Default::default(),
+            cursor_cli_path: None,
+            cursor_cli_env: Default::default(),
+            grok_cli_path: None,
+            grok_cli_env: Default::default(),
+            codebuddy_cli_path: None,
+            codebuddy_cli_env: Default::default(),
         };
         let mut body = serde_json::json!({
             "model": &config.model,
@@ -5692,6 +6177,14 @@ mod tests {
             claude_code_cli_env: Default::default(),
             pi_agent_cli_path: None,
             pi_agent_cli_env: Default::default(),
+            opencode_cli_path: None,
+            opencode_cli_env: Default::default(),
+            cursor_cli_path: None,
+            cursor_cli_env: Default::default(),
+            grok_cli_path: None,
+            grok_cli_env: Default::default(),
+            codebuddy_cli_path: None,
+            codebuddy_cli_env: Default::default(),
         };
         let mut body = serde_json::json!({ "model": &config.model });
 
@@ -5735,6 +6228,14 @@ mod tests {
             claude_code_cli_env: Default::default(),
             pi_agent_cli_path: None,
             pi_agent_cli_env: Default::default(),
+            opencode_cli_path: None,
+            opencode_cli_env: Default::default(),
+            cursor_cli_path: None,
+            cursor_cli_env: Default::default(),
+            grok_cli_path: None,
+            grok_cli_env: Default::default(),
+            codebuddy_cli_path: None,
+            codebuddy_cli_env: Default::default(),
         };
         let mut body = serde_json::json!({ "model": &config.model });
 
@@ -5746,6 +6247,47 @@ mod tests {
                 "chat_template_kwargs": { "enable_thinking": false }
             }))
         );
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn minimax_uses_native_thinking_toggle() {
+        let config = AiConfig {
+            provider: AiProvider::MiniMax,
+            api_key: "key".to_string(),
+            auth_method: AiAuthMethod::Bearer,
+            endpoint: "https://api.minimax.io/v1".to_string(),
+            model: "MiniMax-M3".to_string(),
+            models: vec![],
+            api_style: AiApiStyle::Completions,
+            proxy_enabled: false,
+            proxy_url: String::new(),
+            enable_thinking: false,
+            reasoning_level: AiReasoningLevel::Default,
+            runtime_effort: None,
+            context_window: None,
+            max_retries: None,
+            codex_cli_path: None,
+            codex_cli_env: Default::default(),
+            claude_code_cli_path: None,
+            claude_code_cli_env: Default::default(),
+            pi_agent_cli_path: None,
+            pi_agent_cli_env: Default::default(),
+            opencode_cli_path: None,
+            opencode_cli_env: Default::default(),
+            cursor_cli_path: None,
+            cursor_cli_env: Default::default(),
+            grok_cli_path: None,
+            grok_cli_env: Default::default(),
+            codebuddy_cli_path: None,
+            codebuddy_cli_env: Default::default(),
+        };
+        let mut body = serde_json::json!({ "model": &config.model });
+
+        apply_chat_completion_thinking_toggle(&mut body, &config);
+
+        assert_eq!(body["thinking"]["type"], "disabled");
+        assert!(body.get("extra_body").is_none());
         assert!(body.get("reasoning_effort").is_none());
     }
 
@@ -5772,6 +6314,14 @@ mod tests {
             claude_code_cli_env: Default::default(),
             pi_agent_cli_path: None,
             pi_agent_cli_env: Default::default(),
+            opencode_cli_path: None,
+            opencode_cli_env: Default::default(),
+            cursor_cli_path: None,
+            cursor_cli_env: Default::default(),
+            grok_cli_path: None,
+            grok_cli_env: Default::default(),
+            codebuddy_cli_path: None,
+            codebuddy_cli_env: Default::default(),
         };
         let mut body = serde_json::json!({ "model": &config.model });
 
@@ -5836,6 +6386,14 @@ mod tests {
             claude_code_cli_env: Default::default(),
             pi_agent_cli_path: None,
             pi_agent_cli_env: Default::default(),
+            opencode_cli_path: None,
+            opencode_cli_env: Default::default(),
+            cursor_cli_path: None,
+            cursor_cli_env: Default::default(),
+            grok_cli_path: None,
+            grok_cli_env: Default::default(),
+            codebuddy_cli_path: None,
+            codebuddy_cli_env: Default::default(),
         };
         let request = AiCompletionRequest {
             config: config.clone(),
@@ -5894,6 +6452,14 @@ mod tests {
             claude_code_cli_env: Default::default(),
             pi_agent_cli_path: None,
             pi_agent_cli_env: Default::default(),
+            opencode_cli_path: None,
+            opencode_cli_env: Default::default(),
+            cursor_cli_path: None,
+            cursor_cli_env: Default::default(),
+            grok_cli_path: None,
+            grok_cli_env: Default::default(),
+            codebuddy_cli_path: None,
+            codebuddy_cli_env: Default::default(),
         };
         let mut body = serde_json::json!({
             "model": &config.model,
@@ -6409,6 +6975,7 @@ mod tests {
             AiProvider::Deepseek,
             AiProvider::Qwen,
             AiProvider::Ollama,
+            AiProvider::MiniMax,
         ] {
             let mut config = test_config(provider.clone());
             config.max_retries = None;
@@ -6419,7 +6986,15 @@ mod tests {
 
     #[test]
     fn merge_global_max_retries_skips_cli_providers() {
-        for provider in [AiProvider::CodexCli, AiProvider::ClaudeCodeCli, AiProvider::PiAgentCli] {
+        for provider in [
+            AiProvider::CodexCli,
+            AiProvider::ClaudeCodeCli,
+            AiProvider::PiAgentCli,
+            AiProvider::OpenCodeCli,
+            AiProvider::CursorCli,
+            AiProvider::GrokCli,
+            AiProvider::CodeBuddyCli,
+        ] {
             let mut config = test_config(provider.clone());
             config.max_retries = None;
             merge_global_max_retries(&mut config, 0);

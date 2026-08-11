@@ -41,7 +41,19 @@ export type ActiveTabSidebarTarget =
       connectionId: string;
     }
   | {
+      type: "etcd-access-control";
+      connectionId: string;
+    }
+  | {
       type: "zookeeper-root";
+      connectionId: string;
+    }
+  | {
+      type: "consul-root";
+      connectionId: string;
+    }
+  | {
+      type: "consul-overview";
       connectionId: string;
     }
   | {
@@ -136,8 +148,18 @@ export function activeTabSidebarTarget(tab: QueryTab | undefined | null): Active
     return { type: "etcd-dashboard", connectionId: tab.connectionId };
   }
 
+  if (tab.mode === "etcd-access-control") {
+    return { type: "etcd-access-control", connectionId: tab.connectionId };
+  }
+
   if (tab.mode === "zookeeper") {
     return { type: "zookeeper-root", connectionId: tab.connectionId };
+  }
+  if (tab.mode === "consul") {
+    return { type: "consul-root", connectionId: tab.connectionId };
+  }
+  if (tab.mode === "consul-overview") {
+    return { type: "consul-overview", connectionId: tab.connectionId };
   }
 
   if (tab.mode === "mq" && tab.mqTenant) {
@@ -211,8 +233,18 @@ export function matchesTarget(node: TreeNode, target: ActiveTabSidebarTarget): b
     return node.type === "etcd-dashboard" && node.connectionId === target.connectionId;
   }
 
+  if (target.type === "etcd-access-control") {
+    return node.type === "etcd-access-control" && node.connectionId === target.connectionId;
+  }
+
   if (target.type === "zookeeper-root") {
     return node.type === "zookeeper-root" && node.connectionId === target.connectionId;
+  }
+  if (target.type === "consul-root") {
+    return node.type === "consul-root" && node.connectionId === target.connectionId;
+  }
+  if (target.type === "consul-overview") {
+    return node.type === "consul-overview" && node.connectionId === target.connectionId;
   }
 
   if (target.type === "mq-tenant") {

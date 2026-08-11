@@ -1,13 +1,20 @@
 import { describe, expect, it } from "vitest";
+import type { ConnectionConfig } from "@/types/database";
 import {
+  GAUSSDB_M_JDBC_DRIVER_CLASS,
   connectionObjectTreeNodeSchema,
+  connectionObjectTreeQuerySchema,
   connectionQueryExecutionSchema,
+  connectionShouldDiscoverJdbcSchemas,
   connectionShouldLoadIdentifierQuote,
+  connectionUsesConnectionRootSchemaMode,
   connectionUsesDatabaseObjectTreeMode,
   effectiveDatabaseTypeForConnection,
+  gaussdbConnectionMode,
   gaussdbIdentifierQuoteOverride,
   gaussdbIdentifierQuoteStyle,
   inferJdbcDialect,
+  setGaussdbConnectionMode,
   setGaussdbIdentifierQuoteStyle,
   supportsGaussdbIdentifierQuoteStyle,
 } from "@/lib/database/jdbcDialect";
@@ -58,6 +65,22 @@ describe("jdbc dialect inference", () => {
     ).toBe("sqlserver");
   });
 
+  it.each([
+    ["jdbc:oracle:thin:@//localhost:1521/XE", "oracle"],
+    ["jdbc:dm://localhost:5236/DAMENG", "dameng"],
+  ] as const)("uses connection-root schemas for %s", (connectionString, dialect) => {
+    const connection = {
+      db_type: "jdbc" as const,
+      connection_string: connectionString,
+    };
+
+    expect(inferJdbcDialect(connection)).toBe(dialect);
+    expect(connectionUsesConnectionRootSchemaMode(connection)).toBe(true);
+    expect(connectionUsesDatabaseObjectTreeMode(connection)).toBe(false);
+    expect(connectionObjectTreeQuerySchema(connection, "DBX_TEST", "DBX_TEST")).toBe("DBX_TEST");
+    expect(connectionObjectTreeNodeSchema(connection, "DBX_TEST", "DBX_TEST")).toBe("DBX_TEST");
+  });
+
   it("detects GaussDB-compatible JDBC connections as schema-aware", () => {
     const gaussdbConnection = {
       db_type: "jdbc" as const,
@@ -82,6 +105,8 @@ describe("jdbc dialect inference", () => {
     expect(connectionShouldLoadIdentifierQuote({ db_type: "jdbc", jdbc_driver_class: "org.postgresql.Driver" })).toBe(true);
     expect(connectionShouldLoadIdentifierQuote({ db_type: "kingbase" })).toBe(true);
     expect(connectionShouldLoadIdentifierQuote({ db_type: "gaussdb" })).toBe(true);
+    expect(connectionShouldLoadIdentifierQuote({ db_type: "gbase", driver_profile: "gbase8s" })).toBe(true);
+    expect(connectionShouldLoadIdentifierQuote({ db_type: "gbase", driver_profile: "gbase8a" })).toBe(false);
     expect(
       connectionShouldLoadIdentifierQuote({
         db_type: "jdbc",
@@ -89,6 +114,11 @@ describe("jdbc dialect inference", () => {
         external_config: { gaussdbIdentifierQuoteStyle: "backtick" },
       }),
     ).toBe(false);
+  });
+
+  it("falls back to a flat table tree when GBase 8s reports no schemas", () => {
+    expect(connectionShouldDiscoverJdbcSchemas({ db_type: "gbase", driver_profile: "gbase8s" })).toBe(true);
+    expect(connectionShouldDiscoverJdbcSchemas({ db_type: "gbase", driver_profile: "gbase8a" })).toBe(false);
   });
 
   it("recognizes GaussDB reached through PostgreSQL-compatible JDBC drivers", () => {
@@ -135,6 +165,58 @@ describe("jdbc dialect inference", () => {
 
     expect(inferJdbcDialect(damengConnection)).toBe("dameng");
   });
+
+  it("uses Hive tree and execution semantics for Inceptor JDBC metadata", () => {
+    const connection = {
+      db_type: "jdbc" as const,
+      connection_string: "jdbc:hive2://inceptor.example.com:10000/default",
+      database_info: { productName: "Apache Hive", driverName: "Inceptor JDBC 8.37.3" },
+    };
+
+    expect(inferJdbcDialect(connection)).toBe("hive");
+    expect(effectiveDatabaseTypeForConnection(connection)).toBe("hive");
+    expect(connectionUsesDatabaseObjectTreeMode(connection)).toBe(false);
+    expect(connectionObjectTreeNodeSchema(connection, "CS")).toBe("CS");
+    expect(connectionQueryExecutionSchema(connection, "CS", undefined, false)).toBe("CS");
+  });
+
+  it.each([
+    { driver_profile: "inceptor" },
+    { driver_label: "Inceptor JDBC 8.37.3" },
+    { jdbc_driver_class: "io.transwarp.inceptor.jdbc.InceptorDriver" },
+    { jdbc_driver_paths: ["C:\\drivers\\InceptorJDBC.jar"] },
+    { database_info: { driverName: "Inceptor JDBC 8.37.3" } },
+    { database_info: { serverComment: "Transwarp Inceptor Server" } },
+  ])("detects Inceptor from explicit JDBC identity %#", (identity) => {
+    expect(inferJdbcDialect({ db_type: "jdbc", ...identity })).toBe("hive");
+  });
+
+  it("recognizes Apache Hive metadata without changing generic hive2 or MySQL inference", () => {
+    expect(inferJdbcDialect({ db_type: "jdbc", database_info: { productName: "Apache Hive" } })).toBe("hive");
+    expect(inferJdbcDialect({ db_type: "jdbc", driver_label: "Kyuubi JDBC", connection_string: "jdbc:hive2://kyuubi.example.com/default" })).toBe("mysql");
+    expect(inferJdbcDialect({ db_type: "jdbc", connection_string: "jdbc:hive2://hiveserver.example.com/default" })).toBe("mysql");
+    expect(inferJdbcDialect({ db_type: "jdbc", connection_string: "jdbc:mysql://mysql.example.com/app" })).toBe("mysql");
+  });
+
+  it("prefers explicit Kyuubi identity over Apache Hive product metadata", () => {
+    expect(inferJdbcDialect({ db_type: "jdbc", driver_label: "Kyuubi JDBC", database_info: { productName: "Apache Hive" } })).toBe("mysql");
+  });
+});
+
+describe("GaussDB connection mode", () => {
+  it("keeps native connections compatible and configures M mode for the vendor JDBC driver", () => {
+    const connection = { db_type: "gaussdb", driver_profile: "gaussdb", driver_label: "GaussDB" } as ConnectionConfig;
+
+    expect(gaussdbConnectionMode(connection)).toBe("native");
+    setGaussdbConnectionMode(connection, "m-jdbc");
+    expect(connection.driver_profile).toBe("gaussdb-m");
+    expect(connection.jdbc_driver_class).toBe(GAUSSDB_M_JDBC_DRIVER_CLASS);
+    expect(gaussdbIdentifierQuoteOverride(connection)).toBeUndefined();
+
+    setGaussdbConnectionMode(connection, "native");
+    expect(connection.driver_profile).toBe("gaussdb");
+    expect(connection.jdbc_driver_class).toBeUndefined();
+  });
 });
 
 describe("query execution schema", () => {
@@ -164,7 +246,29 @@ describe("query execution schema", () => {
 });
 
 describe("object tree node schema", () => {
+  it("ignores database-shaped schema metadata for MySQL tables", () => {
+    expect(connectionObjectTreeNodeSchema({ db_type: "mysql" }, "app", "app")).toBeUndefined();
+  });
+
   it("uses the SQLite database alias to qualify attached tables", () => {
     expect(connectionObjectTreeNodeSchema({ db_type: "sqlite" }, "analytics")).toBe("analytics");
+  });
+
+  it("keeps unqualified Informix metadata on the login owner", () => {
+    expect(connectionObjectTreeQuerySchema({ db_type: "informix" }, "prulife")).toBe("");
+    expect(connectionObjectTreeNodeSchema({ db_type: "informix" }, "prulife")).toBeUndefined();
+  });
+
+  it.each([
+    { db_type: "jdbc" as const, connection_string: "jdbc:informix-sqli://localhost:9088/prulife" },
+    { db_type: "gbase" as const, driver_profile: "gbase8s" },
+  ])("keeps compatible Informix metadata on the login owner", (connection) => {
+    expect(connectionObjectTreeQuerySchema(connection, "prulife")).toBe("");
+    expect(connectionObjectTreeNodeSchema(connection, "prulife")).toBeUndefined();
+  });
+
+  it("preserves explicit Informix owners", () => {
+    expect(connectionObjectTreeQuerySchema({ db_type: "informix" }, "prulife", "xtdpcky")).toBe("xtdpcky");
+    expect(connectionObjectTreeNodeSchema({ db_type: "informix" }, "prulife", "xtdpcky")).toBe("xtdpcky");
   });
 });

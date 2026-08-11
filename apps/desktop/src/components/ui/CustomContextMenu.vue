@@ -1,22 +1,10 @@
 <script setup lang="ts">
-import { ref, watch, onBeforeUnmount, onMounted, nextTick, type Component } from "vue";
-import { ChevronRight } from "@lucide/vue";
+import { ref, watch, onBeforeUnmount, onMounted, nextTick } from "vue";
+import { Check, ChevronRight } from "@lucide/vue";
 import { shortcutDisplayKeys } from "@/lib/editor/shortcutDisplay";
-import { registerGlobalContextMenu, type ContextMenuRegistration } from "@/components/ui/customContextMenuRegistry";
+import { registerGlobalContextMenu, type ContextMenuRegistration, type ContextMenuItem } from "@/components/ui/customContextMenuRegistry";
 
-export interface ContextMenuItem {
-  label: string;
-  action?: () => void;
-  disabled?: boolean | (() => boolean);
-  separator?: boolean;
-  icon?: Component;
-  iconClass?: string;
-  // Raw shortcut syntax such as `Mod+C` or `Shift+Alt+U`; display formatting stays in this component.
-  shortcut?: string;
-  variant?: "default" | "destructive";
-  visible?: boolean;
-  children?: ContextMenuItem[];
-}
+export type { ContextMenuItem };
 
 type ContextMenuItemsSource = ContextMenuItem[] | (() => ContextMenuItem[]);
 
@@ -85,7 +73,8 @@ function onScroll(e: Event) {
 }
 
 function onKeydown(e: KeyboardEvent) {
-  if (e.key === "Escape") close();
+  if (["Alt", "Control", "Meta", "Shift"].includes(e.key)) return;
+  close();
 }
 
 function onResize() {
@@ -96,12 +85,12 @@ watch(show, (val) => {
   contextMenuRegistration?.setOpen(val);
   if (val) {
     document.addEventListener("pointerdown", onPointerDownOutside, true);
-    document.addEventListener("keydown", onKeydown);
+    document.addEventListener("keydown", onKeydown, true);
     document.addEventListener("scroll", onScroll, true);
     window.addEventListener("resize", onResize);
   } else {
     document.removeEventListener("pointerdown", onPointerDownOutside, true);
-    document.removeEventListener("keydown", onKeydown);
+    document.removeEventListener("keydown", onKeydown, true);
     document.removeEventListener("scroll", onScroll, true);
     window.removeEventListener("resize", onResize);
   }
@@ -262,7 +251,7 @@ onBeforeUnmount(() => {
   contextMenuRegistration?.dispose();
   contextMenuRegistration = null;
   document.removeEventListener("pointerdown", onPointerDownOutside, true);
-  document.removeEventListener("keydown", onKeydown);
+  document.removeEventListener("keydown", onKeydown, true);
   document.removeEventListener("scroll", onScroll, true);
   window.removeEventListener("resize", onResize);
 });
@@ -280,7 +269,8 @@ onBeforeUnmount(() => {
           </div>
           <button v-else :disabled="itemIsDisabled(item)" :class="[...itemButtonClass(item.variant), activeSubIndex === index ? 'bg-accent text-accent-foreground' : '']" @click="handleItemClick(item)" @mouseenter="(e) => onItemMouseEnter(index, e)" @mouseleave="onItemMouseLeave">
             <span class="flex size-4 shrink-0 items-center justify-center">
-              <component :is="item.icon" v-if="item.icon" :class="['size-4', item.iconClass]" />
+              <Check v-if="item.checked" class="size-4 text-primary" />
+              <component :is="item.icon" v-else-if="item.icon" :class="['size-4', item.iconClass]" />
             </span>
             <span class="flex-1 whitespace-nowrap">{{ item.label }}</span>
             <span v-if="item.shortcut" class="ml-8 inline-flex shrink-0 items-center gap-1 text-muted-foreground">
@@ -310,7 +300,8 @@ onBeforeUnmount(() => {
           </div>
           <button v-else :disabled="itemIsDisabled(child)" :class="itemButtonClass(child.variant)" @click="handleSubItemClick(child)">
             <span class="flex size-4 shrink-0 items-center justify-center">
-              <component :is="child.icon" v-if="child.icon" :class="['size-4', child.iconClass]" />
+              <Check v-if="child.checked" class="size-4 text-primary" />
+              <component :is="child.icon" v-else-if="child.icon" :class="['size-4', child.iconClass]" />
             </span>
             <span class="flex-1 whitespace-nowrap">{{ child.label }}</span>
             <span v-if="child.shortcut" class="ml-8 inline-flex shrink-0 items-center gap-1 text-muted-foreground">

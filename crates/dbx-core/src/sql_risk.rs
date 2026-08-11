@@ -95,6 +95,14 @@ fn classify_statement(stmt: &Statement, detect_select_into: bool) -> SqlRisk {
         | Statement::ShowStatus { .. }
         | Statement::ShowProcessList { .. } => SqlRisk::ReadOnly,
 
+        // sqlparser has no dedicated MySQL `SHOW TRIGGERS` node and uses its
+        // loose `ShowVariable` fallback, with TRIGGERS as the first identifier.
+        Statement::ShowVariable { variable }
+            if variable.first().is_some_and(|identifier| identifier.value.eq_ignore_ascii_case("triggers")) =>
+        {
+            SqlRisk::ReadOnly
+        }
+
         // Write operations
         Statement::Insert { .. } | Statement::Update { .. } | Statement::Delete { .. } | Statement::Merge { .. } => {
             SqlRisk::Write
@@ -676,6 +684,13 @@ pub fn classify_sql_risk(sql: &str, dialect: &str) -> Result<SqlRisk, String> {
 /// Classify SQL risk using both the parser dialect and the concrete database
 /// type so dialect-specific write forms cannot be mistaken for read queries.
 pub fn classify_sql_risk_for_database(sql: &str, database_type: DatabaseType) -> Result<SqlRisk, String> {
+    if let Some(risk) = crate::query_execution_sql::classify_search_engine_query_risk(sql, database_type) {
+        return Ok(match risk {
+            crate::query_execution_sql::SearchEngineQueryRisk::ReadOnly => SqlRisk::ReadOnly,
+            crate::query_execution_sql::SearchEngineQueryRisk::Write => SqlRisk::Write,
+            crate::query_execution_sql::SearchEngineQueryRisk::Dangerous => SqlRisk::Ddl,
+        });
+    }
     let database_type_name = format!("{database_type:?}");
     let normalized = normalize_dialect(&database_type_name);
     classify_sql_risk_with_database(sql, normalized, Some(database_type))
@@ -686,6 +701,9 @@ pub fn classify_sql_risk_for_database(sql: &str, database_type: DatabaseType) ->
 /// and single-table UPDATE/DELETE statements with an effective predicate;
 /// broader or opaque mutations require central high-risk permission.
 pub fn is_dangerous_sql_for_database(sql: &str, database_type: DatabaseType) -> bool {
+    if let Some(risk) = crate::query_execution_sql::classify_search_engine_query_risk(sql, database_type) {
+        return risk == crate::query_execution_sql::SearchEngineQueryRisk::Dangerous;
+    }
     let database_type_name = format!("{database_type:?}");
     let normalized = normalize_dialect(&database_type_name);
     let parser_dialect = resolve_dialect(normalized);
@@ -712,6 +730,9 @@ pub fn is_dangerous_sql_for_database(sql: &str, database_type: DatabaseType) -> 
 /// A `USE` statement mutates pooled/session state and could redirect later SQL,
 /// so it is forbidden independently of read/write and high-risk permissions.
 pub fn mcp_sql_has_forbidden_database_switch(sql: &str, database_type: DatabaseType) -> bool {
+    if crate::query_execution_sql::classify_search_engine_query_risk(sql, database_type).is_some() {
+        return false;
+    }
     let database_type_name = format!("{database_type:?}");
     let normalized = normalize_dialect(&database_type_name);
     let dialect = resolve_dialect(normalized);
@@ -784,8 +805,15 @@ fn classify_sql_risk_with_database(
     let parser_dialect = resolve_dialect(normalized_dialect);
     let detect_select_into = database_type.is_none();
     let has_locking_clause = sql_contains_top_level_locking_clause(sql, parser_dialect.as_ref());
-    let has_dialect_specific_write = database_type
-        .is_some_and(|database_type| crate::query_execution_sql::has_dialect_specific_write(sql, database_type));
+    let has_dialect_specific_write = match database_type {
+        Some(database_type) => crate::query_execution_sql::has_dialect_specific_write(sql, database_type),
+        // Preserve MySQL executable-comment and file-output detection even
+        // when callers provide a dialect string instead of a database type.
+        None if normalized_dialect == "mysql" => {
+            crate::query_execution_sql::has_dialect_specific_write(sql, DatabaseType::Mysql)
+        }
+        None => false,
+    };
 
     match Parser::parse_sql(parser_dialect.as_ref(), sql) {
         Ok(stmts) if !stmts.is_empty() => {
@@ -859,6 +887,40 @@ mod tests {
         assert_eq!(classify_sql_risk("SHOW TABLES", "mysql").unwrap(), SqlRisk::ReadOnly);
         assert_eq!(classify_sql_risk("DESCRIBE users", "mysql").unwrap(), SqlRisk::ReadOnly);
         assert_eq!(classify_sql_risk("EXPLAIN SELECT * FROM users", "postgres").unwrap(), SqlRisk::ReadOnly);
+    }
+
+    #[test]
+    fn classify_mysql_show_triggers_as_read_only() {
+        for sql in [
+            "SHOW TRIGGERS;",
+            "SHOW TRIGGERS FROM `rs_main` LIKE 'trg_order_items_after_%';",
+            "show triggers in `rs_main` where `Event` = 'INSERT';",
+        ] {
+            assert_eq!(classify_sql_risk(sql, "mysql").unwrap(), SqlRisk::ReadOnly, "expected read-only: {sql}");
+            assert_eq!(
+                classify_sql_risk_for_database(sql, DatabaseType::Mysql).unwrap(),
+                SqlRisk::ReadOnly,
+                "expected read-only: {sql}"
+            );
+            assert!(!is_dangerous_sql_for_database(sql, DatabaseType::Mysql), "expected safe SQL: {sql}");
+        }
+    }
+
+    #[test]
+    fn mysql_show_triggers_preserves_write_detection() {
+        for (sql, expected_risk) in [
+            ("SHOW TRIGGERS; DELETE FROM order_items", SqlRisk::Write),
+            ("SHOW TRIGGERS; DROP TABLE order_items", SqlRisk::Ddl),
+            ("SHOW TRIGGERS; /*!50000 DELETE FROM order_items */", SqlRisk::Write),
+        ] {
+            assert_eq!(classify_sql_risk(sql, "mysql").unwrap(), expected_risk, "expected write detection: {sql}");
+            assert_eq!(
+                classify_sql_risk_for_database(sql, DatabaseType::Mysql).unwrap(),
+                expected_risk,
+                "expected write detection: {sql}"
+            );
+            assert!(is_dangerous_sql_for_database(sql, DatabaseType::Mysql), "expected dangerous SQL: {sql}");
+        }
     }
 
     #[test]
@@ -1233,5 +1295,26 @@ mod tests {
         // Statements not explicitly handled should be conservative (Write)
         // This depends on sqlparser's coverage, but we can test the catch-all
         assert_eq!(classify_sql_risk("GRANT SELECT ON users TO admin", "postgres").unwrap(), SqlRisk::Ddl);
+    }
+
+    #[test]
+    fn classifies_search_engine_rest_risk_by_method_and_path() {
+        for database_type in [DatabaseType::Elasticsearch, DatabaseType::Easysearch] {
+            assert_eq!(
+                classify_sql_risk_for_database("GET /_cluster/health", database_type).unwrap(),
+                SqlRisk::ReadOnly
+            );
+            assert_eq!(
+                classify_sql_risk_for_database("POST /products/_search\n{}", database_type).unwrap(),
+                SqlRisk::ReadOnly
+            );
+            assert_eq!(
+                classify_sql_risk_for_database("PUT /products/_doc/1\n{}", database_type).unwrap(),
+                SqlRisk::Write
+            );
+            assert!(!is_dangerous_sql_for_database("PUT /products/_doc/1\n{}", database_type));
+            assert_eq!(classify_sql_risk_for_database("DELETE /products", database_type).unwrap(), SqlRisk::Ddl);
+            assert!(is_dangerous_sql_for_database("DELETE /products", database_type));
+        }
     }
 }

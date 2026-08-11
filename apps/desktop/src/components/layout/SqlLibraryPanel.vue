@@ -2,7 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, reactive, ref, watch } from "vue";
 import type { CSSProperties } from "vue";
 import { useI18n } from "vue-i18n";
-import { ArrowDownWideNarrow, Download, FilePlus, FileText, FolderCog, FolderClosed, FolderOpen, FolderPlus, Library, LocateFixed, Pencil, Search, Trash2, Upload, X } from "@lucide/vue";
+import { ArrowDownWideNarrow, Download, FilePlus, FileText, FolderCog, FolderClosed, FolderOpen, FolderPlus, Library, LocateFixed, Pencil, Play, Search, Trash2, Upload, X } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import CustomContextMenu, { type ContextMenuItem as CtxMenuItem } from "@/components/ui/CustomContextMenu.vue";
@@ -18,6 +18,7 @@ import { useSettingsStore } from "@/stores/settingsStore";
 import { focusSidebarRenameInput } from "@/lib/sidebar/sidebarRenameFocus";
 import { savedSqlFolderBranchFileCount } from "@/lib/savedSql/savedSqlFolderCounts";
 import { ensureSqlExtension, stripSqlExtension } from "@/lib/savedSql/savedSqlFileName";
+import { savedSqlExecutionTargetFromTab, type SavedSqlOpenTargetMode } from "@/lib/savedSql/savedSqlExecutionTarget";
 import type { SavedSqlFile, SavedSqlFolder } from "@/types/database";
 
 const { t } = useI18n();
@@ -40,18 +41,14 @@ type DropPosition = "before" | "after" | "inside";
 const activeConnectionIds = computed(() => new Set(connectionStore.connections.map((c) => c.id)));
 const searchText = ref("");
 const searchQuery = computed(() => searchText.value.trim().toLowerCase());
-const orphanedIds = computed(() => savedSqlStore.orphanedFileIds(activeConnectionIds.value));
 
 // Sort mode: "folder" (default tree structure) or "date" (flat list by update date)
 const sortMode = ref<"folder" | "date">("folder");
 
-function isConnectionVisible(connectionId: string) {
-  return activeConnectionIds.value.has(connectionId);
-}
-
 function getConnectionLabel(connectionId: string) {
+  if (!connectionId) return t("sqlLibrary.unassociated");
   const conn = connectionStore.connections.find((c) => c.id === connectionId);
-  return conn?.name || connectionId;
+  return conn?.name || t("sqlLibrary.deletedConnection");
 }
 
 function folderPath(folder: SavedSqlFolder) {
@@ -179,13 +176,13 @@ async function exportFolderContents(folder?: SavedSqlFolder) {
     if (folder) {
       await writeFolder(folder, rootDir);
     } else {
-      for (const libraryFolder of savedSqlStore.allFolders.filter((item) => isConnectionVisible(item.connectionId) && !item.parentFolderId)) {
+      for (const libraryFolder of savedSqlStore.allFolders.filter((item) => !item.parentFolderId)) {
         const folderDir = await join(rootDir, sanitizeFileSystemSegment(libraryFolder.name));
         await mkdir(folderDir, { recursive: true });
         await writeFolder(libraryFolder, folderDir);
       }
 
-      const unfiled = savedSqlStore.filesWithoutFolder().filter((file) => !orphanedIds.value.has(file.id));
+      const unfiled = savedSqlStore.filesWithoutFolder();
       if (unfiled.length > 0) {
         const unfiledDir = await join(rootDir, sanitizeFileSystemSegment(t("sqlLibrary.unfiled")));
         await mkdir(unfiledDir, { recursive: true });
@@ -205,21 +202,9 @@ async function exportFolderContents(folder?: SavedSqlFolder) {
 }
 
 async function collectSqlFilesRecursively(dir: string): Promise<string[]> {
-  const { readDir } = await import("@tauri-apps/plugin-fs");
-  const { join } = await import("@tauri-apps/api/path");
+  const collectPaths = (entries: Awaited<ReturnType<typeof api.listSqlFilesInFolder>>): string[] => entries.flatMap((entry) => (entry.is_dir ? collectPaths(entry.children) : [entry.path]));
 
-  const results: string[] = [];
-  for (const entry of await readDir(dir)) {
-    const fullPath = await join(dir, entry.name);
-    if (entry.isDirectory) {
-      results.push(...(await collectSqlFilesRecursively(fullPath)));
-      continue;
-    }
-    if (!entry.isFile) continue;
-    if (!fullPath.toLowerCase().endsWith(".sql")) continue;
-    results.push(fullPath);
-  }
-  return results;
+  return collectPaths(await api.listSqlFilesInFolder(dir));
 }
 
 async function importDirectoryIntoLibrary(targetFolder?: SavedSqlFolder) {
@@ -250,7 +235,7 @@ async function importDirectoryIntoLibrary(targetFolder?: SavedSqlFolder) {
       return;
     }
 
-    const takenNames = new Set((targetFolder ? savedSqlStore.filesInFolder(targetFolder.id) : savedSqlStore.filesWithoutFolder()).filter((file) => !orphanedIds.value.has(file.id)).map((file) => file.name));
+    const takenNames = new Set((targetFolder ? savedSqlStore.filesInFolder(targetFolder.id) : savedSqlStore.filesWithoutFolder()).map((file) => file.name));
 
     for (const path of sqlPaths) {
       const content = await api.readExternalSqlFile(path);
@@ -331,11 +316,11 @@ function folderMatchesQuery(folder: SavedSqlFolder) {
   const q = searchQuery.value;
   if (!q) return true;
   if (folder.name.toLowerCase().includes(q)) return true;
-  return savedSqlStore.filesInFolder(folder.id).some((file) => !orphanedIds.value.has(file.id) && fileMatchesQuery(file));
+  return savedSqlStore.filesInFolder(folder.id).some((file) => fileMatchesQuery(file));
 }
 
 function childFolders(parentFolderId?: string) {
-  return savedSqlStore.allFolders.filter((folder) => isConnectionVisible(folder.connectionId) && (folder.parentFolderId || "") === (parentFolderId || ""));
+  return savedSqlStore.allFolders.filter((folder) => (folder.parentFolderId || "") === (parentFolderId || ""));
 }
 
 function descendantFolders(parentFolderId: string): SavedSqlFolder[] {
@@ -351,15 +336,11 @@ function folderBranchMatchesQuery(folder: SavedSqlFolder) {
 function filesInFolder(folderId: string) {
   const folder = savedSqlStore.allFolders.find((item) => item.id === folderId);
   const includeAllFilesForMatchedFolder = !!folder && !!searchQuery.value && folder.name.toLowerCase().includes(searchQuery.value);
-  return savedSqlStore
-    .filesInFolder(folderId)
-    .filter((file) => !orphanedIds.value.has(file.id))
-    .filter((file) => includeAllFilesForMatchedFolder || fileMatchesQuery(file));
+  return savedSqlStore.filesInFolder(folderId).filter((file) => includeAllFilesForMatchedFolder || fileMatchesQuery(file));
 }
 
 function folderFileCount(folderId: string) {
-  const visibleFolders = savedSqlStore.allFolders.filter((folder) => isConnectionVisible(folder.connectionId));
-  return savedSqlFolderBranchFileCount(folderId, visibleFolders, filesInFolder);
+  return savedSqlFolderBranchFileCount(folderId, savedSqlStore.allFolders, filesInFolder);
 }
 
 type SqlLibraryRow = { type: "folder"; folder: SavedSqlFolder; depth: number; folderIndex: number } | { type: "file"; file: SavedSqlFile; depth: number };
@@ -384,19 +365,11 @@ const visibleFolderRows = computed<SqlLibraryRow[]>(() => {
   return rows;
 });
 
-const visibleFiles = computed(() =>
-  savedSqlStore
-    .filesWithoutFolder()
-    .filter((file) => !orphanedIds.value.has(file.id))
-    .filter((file) => fileMatchesQuery(file)),
-);
+const visibleFiles = computed(() => savedSqlStore.filesWithoutFolder().filter((file) => fileMatchesQuery(file)));
 
 // Flat list sorted by updatedAt (descending) - combines all folders and files
 const itemsByDate = computed(() => {
-  const allFolders = savedSqlStore.allFolders
-    .filter((folder) => isConnectionVisible(folder.connectionId))
-    .filter((folder) => folderBranchMatchesQuery(folder))
-    .map((folder) => ({ type: "folder" as const, item: folder, updatedAt: folder.updatedAt }));
+  const allFolders = savedSqlStore.allFolders.filter((folder) => folderBranchMatchesQuery(folder)).map((folder) => ({ type: "folder" as const, item: folder, updatedAt: folder.updatedAt }));
 
   const allFiles = [...savedSqlStore.allFolders.flatMap((folder) => filesInFolder(folder.id)), ...visibleFiles.value].map((file) => ({ type: "file" as const, item: file, updatedAt: file.updatedAt }));
 
@@ -440,14 +413,7 @@ async function openNewQueryInFolder(folder?: SavedSqlFolder) {
   const connectionId = folder?.connectionId || connectionStore.activeConnectionId || connectionStore.connections[0]?.id;
   if (!connectionId) return;
 
-  const takenNames = folder
-    ? new Set(savedSqlStore.filesInFolder(folder.id).map((f) => f.name))
-    : new Set(
-        savedSqlStore
-          .filesWithoutFolder()
-          .filter((file) => !orphanedIds.value.has(file.id))
-          .map((f) => f.name),
-      );
+  const takenNames = folder ? new Set(savedSqlStore.filesInFolder(folder.id).map((f) => f.name)) : new Set(savedSqlStore.filesWithoutFolder().map((f) => f.name));
   const name = uniqueImportedName("new_query.sql", takenNames);
   const file = await savedSqlStore.saveFile({
     connectionId,
@@ -456,7 +422,8 @@ async function openNewQueryInFolder(folder?: SavedSqlFolder) {
     database: "",
     sql: "",
   });
-  queryStore.openSavedSql(file);
+  const tabId = queryStore.openSavedSql(file);
+  connectionStore.activeConnectionId = queryStore.tabs.find((tab) => tab.id === tabId)?.connectionId ?? file.connectionId;
 }
 
 // Batch selection state
@@ -468,6 +435,11 @@ const lastClickedItemIndex = ref<number | null>(null); // Unified index for both
 const activeItemId = ref<string | null>(null);
 const activeItemType = ref<"file" | "folder" | null>(null);
 const activeSavedSqlId = computed(() => queryStore.tabs.find((tab) => tab.id === queryStore.activeTabId)?.savedSqlId ?? null);
+const hasCurrentSavedSqlExecutionTarget = computed(() => {
+  const activeTab = queryStore.tabs.find((tab) => tab.id === queryStore.activeTabId);
+  const target = savedSqlExecutionTargetFromTab(activeTab);
+  return !!target && activeConnectionIds.value.has(target.connectionId);
+});
 
 watch(
   activeSavedSqlId,
@@ -676,12 +648,12 @@ async function moveFilesToFolder(fileIds: string[], folderId?: string) {
   toast(t("sqlLibrary.moveSuccess", { count: movableIds.length }), 2000);
 }
 
-async function openFile(file: SavedSqlFile) {
+async function openFile(file: SavedSqlFile, targetMode?: SavedSqlOpenTargetMode) {
   if (suppressNextRowClick.value) return;
   const loadedFile = await savedSqlStore.ensureFileContent(file.id);
   if (!loadedFile) return;
-  queryStore.openSavedSql(loadedFile);
-  connectionStore.activeConnectionId = loadedFile.connectionId;
+  const tabId = queryStore.openSavedSql(loadedFile, { targetMode });
+  connectionStore.activeConnectionId = queryStore.tabs.find((tab) => tab.id === tabId)?.connectionId ?? loadedFile.connectionId;
   void savedSqlStore.recordFileUsage(loadedFile.id);
 }
 
@@ -810,18 +782,16 @@ const contextTarget = ref<SavedSqlFolder | SavedSqlFile | "panel" | null>(null);
 function folderMoveMenuItems(fileIds: string[]): CtxMenuItem[] {
   const files = [...new Set(fileIds)].map((id) => savedSqlStore.getFile(id)).filter((file): file is SavedSqlFile => Boolean(file));
   const allInUnfiled = files.length > 0 && files.every((file) => !file.folderId);
-  const folderItems = savedSqlStore.allFoldersTreeOrder
-    .filter((folder) => isConnectionVisible(folder.connectionId))
-    .map((folder) => ({
-      label: folderPath(folder),
-      action: () =>
-        moveFilesToFolder(
-          files.map((file) => file.id),
-          folder.id,
-        ),
-      disabled: files.every((file) => file.folderId === folder.id),
-      icon: FolderClosed,
-    }));
+  const folderItems = savedSqlStore.allFoldersTreeOrder.map((folder) => ({
+    label: folderPath(folder),
+    action: () =>
+      moveFilesToFolder(
+        files.map((file) => file.id),
+        folder.id,
+      ),
+    disabled: files.every((file) => file.folderId === folder.id),
+    icon: FolderClosed,
+  }));
 
   return [
     {
@@ -884,6 +854,12 @@ const contextMenuItems = computed<CtxMenuItem[]>(() => {
   if ("sql" in target) {
     return [
       { label: t("savedSql.open"), action: () => openFile(target), icon: FileText },
+      {
+        label: t("sqlLibrary.openInCurrentDatabase"),
+        action: () => openFile(target, "current"),
+        icon: Play,
+        disabled: !hasCurrentSavedSqlExecutionTarget.value,
+      },
       { label: t("sqlLibrary.exportFile"), action: () => exportSingleFile(target), icon: Upload },
       { label: t("sqlLibrary.moveToFolder"), icon: FolderClosed, children: folderMoveMenuItems([target.id]) },
       { label: "", separator: true },
@@ -1203,7 +1179,7 @@ function showDropInside(targetId: string) {
               <div v-for="item in itemsByDate" :key="item.type + '-' + item.item.id">
                 <div
                   v-if="item.type === 'folder'"
-                  class="relative flex items-center gap-1 px-2 py-1.5 text-[13px] cursor-pointer group"
+                  class="relative flex cursor-default items-center gap-1 px-2 py-1.5 text-[13px] group"
                   :class="[folderRowClass(item.item.id), isDraggingItem(item.item.id) ? 'opacity-50' : '']"
                   @mousedown="handleDragMouseDown($event, item.item.id, 'folder')"
                   @click="handleFolderClick(item.item, $event)"
@@ -1247,7 +1223,7 @@ function showDropInside(targetId: string) {
 
                 <div
                   v-else
-                  class="relative flex items-center gap-1 px-2 py-1.5 text-[13px] cursor-pointer group"
+                  class="relative flex cursor-default items-center gap-1 px-2 py-1.5 text-[13px] group"
                   :class="[fileRowClass(item.item.id), isDraggingItem(item.item.id) ? 'opacity-50' : '']"
                   @mousedown="handleDragMouseDown($event, item.item.id, 'file')"
                   @click="handleFileClick(item.item, $event)"
@@ -1283,7 +1259,7 @@ function showDropInside(targetId: string) {
               <div v-for="row in visibleFolderRows" :key="row.type === 'folder' ? row.folder.id : row.file.id">
                 <div
                   v-if="row.type === 'folder'"
-                  class="relative flex items-center gap-1 py-1.5 pr-2 text-[13px] cursor-pointer group"
+                  class="relative flex cursor-default items-center gap-1 py-1.5 pr-2 text-[13px] group"
                   :style="{ paddingLeft: `${8 + row.depth * 16}px` }"
                   :class="[showDropInside(row.folder.id) ? 'ring-1 ring-primary/50 bg-primary/5' : folderRowClass(row.folder.id), isDraggingItem(row.folder.id) ? 'opacity-50' : '']"
                   @mousedown="handleDragMouseDown($event, row.folder.id, 'folder')"
@@ -1332,7 +1308,7 @@ function showDropInside(targetId: string) {
 
                 <div
                   v-else
-                  class="relative flex items-center gap-1 py-1.5 pr-2 text-[13px] cursor-pointer group"
+                  class="relative flex cursor-default items-center gap-1 py-1.5 pr-2 text-[13px] group"
                   :style="{ paddingLeft: `${8 + row.depth * 16}px` }"
                   :class="[fileRowClass(row.file.id), isDraggingItem(row.file.id) ? 'opacity-50' : '']"
                   @mousedown="handleDragMouseDown($event, row.file.id, 'file')"
@@ -1380,7 +1356,7 @@ function showDropInside(targetId: string) {
                 <div
                   v-for="file in visibleFiles"
                   :key="file.id"
-                  class="relative flex items-center gap-1 px-2 py-1.5 text-[13px] cursor-pointer group"
+                  class="relative flex cursor-default items-center gap-1 px-2 py-1.5 text-[13px] group"
                   :class="[fileRowClass(file.id), isDraggingItem(file.id) ? 'opacity-50' : '']"
                   @mousedown="handleDragMouseDown($event, file.id, 'file')"
                   @mousemove="updateDropTarget($event, file.id, 'file')"

@@ -18,6 +18,7 @@ export interface ParsedConnectionUrl {
   oracleConnectionType?: "service_name" | "sid";
   useMongoUrl?: boolean;
   portExplicit?: boolean;
+  apiPath?: string;
 }
 
 export type ConnectionProfile = {
@@ -37,6 +38,12 @@ const SCHEME_PROFILES: Record<string, ConnectionProfile> = {
   redis: { type: "redis", profile: "redis", label: "Redis", defaultPort: 6379 },
   rediss: { type: "redis", profile: "redis", label: "Redis", defaultPort: 6379 },
   etcd: { type: "etcd", profile: "etcd", label: "etcd", defaultPort: 2379 },
+  consul: { type: "consul", profile: "consul", label: "Consul", defaultPort: 8500 },
+  "nacos-v2": { type: "nacos", profile: "nacos", label: "Nacos", defaultPort: 8848 },
+  "nacos-v3": { type: "nacos", profile: "nacos", label: "Nacos", defaultPort: 8848 },
+  "r-nacos": { type: "nacos", profile: "nacos", label: "r-nacos", defaultPort: 8848 },
+  nacos: { type: "nacos", profile: "nacos", label: "Nacos", defaultPort: 8848 },
+  rnacos: { type: "nacos", profile: "nacos", label: "r-nacos", defaultPort: 8848 },
   zookeeper: { type: "zookeeper", profile: "zookeeper", label: "Apache ZooKeeper", defaultPort: 2181 },
   mongodb: { type: "mongodb", profile: "mongodb", label: "MongoDB", defaultPort: 27017 },
   "mongodb+srv": { type: "mongodb", profile: "mongodb", label: "MongoDB", defaultPort: 27017 },
@@ -45,18 +52,19 @@ const SCHEME_PROFILES: Record<string, ConnectionProfile> = {
   mssql: { type: "sqlserver", profile: "sqlserver", label: "SQL Server", defaultPort: 1433 },
   oracle: { type: "oracle", profile: "oracle", label: "Oracle", defaultPort: 1521 },
   elasticsearch: { type: "elasticsearch", profile: "elasticsearch", label: "Elasticsearch", defaultPort: 9200 },
+  easysearch: { type: "easysearch", profile: "easysearch", label: "Easysearch", defaultPort: 9200 },
   qdrant: { type: "qdrant", profile: "qdrant", label: "Qdrant", defaultPort: 6333 },
   milvus: { type: "milvus", profile: "milvus", label: "Milvus", defaultPort: 19530 },
   weaviate: { type: "weaviate", profile: "weaviate", label: "Weaviate", defaultPort: 8080 },
   chromadb: { type: "chromadb", profile: "chromadb", label: "ChromaDB", defaultPort: 8000 },
   dm: { type: "dameng", profile: "dm", label: "达梦 Dameng", defaultPort: 5236 },
   dameng: { type: "dameng", profile: "dm", label: "达梦 Dameng", defaultPort: 5236 },
-  kingbase: { type: "kingbase", profile: "kingbase", label: "KingBase", defaultPort: 54321 },
-  kingbase8: { type: "kingbase", profile: "kingbase", label: "KingBase", defaultPort: 54321 },
+  kingbase: { type: "kingbase", profile: "kingbase", label: "人大金仓 KingbaseES", defaultPort: 54321 },
+  kingbase8: { type: "kingbase", profile: "kingbase", label: "人大金仓 KingbaseES", defaultPort: 54321 },
   gaussdb: { type: "gaussdb", profile: "gaussdb", label: "GaussDB", defaultPort: 5432 },
   kwdb: { type: "kwdb", profile: "kwdb", label: "KWDB", defaultPort: 26257 },
-  gbase: { type: "gbase", profile: "gbase", label: "GBase", defaultPort: 5258 },
-  "gbasedbt-sqli": { type: "gbase", profile: "gbase8s", label: "GBase 8s", defaultPort: 9088 },
+  gbase: { type: "gbase", profile: "gbase", label: "南大通用 GBase", defaultPort: 5258 },
+  "gbasedbt-sqli": { type: "gbase", profile: "gbase8s", label: "南大通用 GBase 8s", defaultPort: 9088 },
   "informix-sqli": { type: "informix", profile: "informix", label: "Informix", defaultPort: 9088 },
   yashandb: { type: "yashandb", profile: "yashandb", label: "YashanDB", defaultPort: 1688 },
   opengauss: { type: "gaussdb", profile: "opengauss", label: "openGauss", defaultPort: 5432 },
@@ -67,15 +75,24 @@ const SCHEME_PROFILES: Record<string, ConnectionProfile> = {
   xugu: { type: "xugu", profile: "xugu", label: "XuguDB", defaultPort: 5138 },
   iotdb: { type: "iotdb", profile: "iotdb", label: "Apache IoTDB", defaultPort: 6667 },
   iris: { type: "iris", profile: "iris", label: "IRIS", defaultPort: 1972 },
+  victoriametrics: { type: "victoriametrics", profile: "victoriametrics", label: "VictoriaMetrics", defaultPort: 8428 },
 };
 
 const HTTP_SELECTED_PROFILES: Record<string, ConnectionProfile> = {
   clickhouse: SCHEME_PROFILES.clickhouse,
   elasticsearch: SCHEME_PROFILES.elasticsearch,
+  easysearch: SCHEME_PROFILES.easysearch,
   qdrant: SCHEME_PROFILES.qdrant,
   milvus: SCHEME_PROFILES.milvus,
   weaviate: SCHEME_PROFILES.weaviate,
   chromadb: SCHEME_PROFILES.chromadb,
+  victoriametrics: SCHEME_PROFILES.victoriametrics,
+  consul: SCHEME_PROFILES.consul,
+  "nacos-v2": SCHEME_PROFILES["nacos-v2"],
+  "nacos-v3": SCHEME_PROFILES["nacos-v3"],
+  "r-nacos": SCHEME_PROFILES["r-nacos"],
+  nacos: SCHEME_PROFILES.nacos,
+  rnacos: SCHEME_PROFILES.rnacos,
 };
 
 function decodeUrlPart(value: string): string {
@@ -169,6 +186,56 @@ function databaseFromPath(pathname: string): string | undefined {
   return decodeUrlPart(value.split("/")[0]);
 }
 
+function parseZooKeeperUrl(source: string): ParsedConnectionUrl | null {
+  const match = source.match(/^zookeeper:\/\/([^/?#]+)(\/[^?#]*)?(\?[^#]*)?$/i);
+  if (!match) return null;
+
+  const profile = SCHEME_PROFILES.zookeeper;
+  const authority = match[1];
+  const userInfoEnd = authority.lastIndexOf("@");
+  const userInfo = userInfoEnd >= 0 ? authority.slice(0, userInfoEnd) : "";
+  const endpointList = userInfoEnd >= 0 ? authority.slice(userInfoEnd + 1) : authority;
+  const [rawUsername, ...rawPasswordParts] = userInfo.split(":");
+  const username = userInfo ? decodeUrlPart(rawUsername) : "";
+  const password = userInfo ? decodeUrlPart(rawPasswordParts.join(":")) : "";
+  const endpoints = endpointList.split(",").map((endpoint) => endpoint.trim());
+  if (endpoints.some((endpoint) => !endpoint)) throw new Error("Invalid connection URL");
+
+  const normalizedEndpoints = endpoints.map((endpoint) => {
+    let endpointUrl: URL;
+    try {
+      endpointUrl = new URL(`zookeeper://${endpoint}`);
+    } catch {
+      throw new Error("Invalid connection URL");
+    }
+    if (endpointUrl.username || endpointUrl.password || (endpointUrl.pathname && endpointUrl.pathname !== "/") || endpointUrl.search || endpointUrl.hash) {
+      throw new Error("Invalid connection URL");
+    }
+    const rawHost = endpointUrl.hostname.replace(/^\[(.*)]$/, "$1");
+    const host = rawHost.includes(":") ? `[${rawHost}]` : rawHost;
+    const port = endpointUrl.port ? Number(endpointUrl.port) : profile.defaultPort;
+    return { host: rawHost, port, connectString: `${host}:${port}` };
+  });
+  const chroot = match[2] && match[2] !== "/" ? match[2] : "";
+  const urlParams = (match[3] || "").replace(/^\?/, "");
+  const name = queryParamValue(urlParams, "name")?.trim();
+
+  return {
+    ...(name ? { name } : {}),
+    dbType: profile.type,
+    driverProfile: profile.profile,
+    driverLabel: profile.label,
+    host: normalizedEndpoints[0].host,
+    port: normalizedEndpoints[0].port,
+    username,
+    password,
+    database: undefined,
+    urlParams: stripConnectionNameParam(urlParams),
+    ssl: false,
+    connectionString: `${normalizedEndpoints.map((endpoint) => endpoint.connectString).join(",")}${chroot}`,
+  };
+}
+
 function queryParamValue(params: string, key: string): string | undefined {
   for (const part of params.split(/[&;]/)) {
     if (!part) continue;
@@ -251,14 +318,16 @@ function isTidbCloudHost(host: string): boolean {
 }
 
 export function connectionProfileForScheme(scheme: string, preferredProfile?: string): ConnectionProfile | undefined {
-  if ((scheme === "http" || scheme === "https") && preferredProfile) {
-    return HTTP_SELECTED_PROFILES[preferredProfile];
+  const normalizedScheme = scheme.trim().toLowerCase();
+  const normalizedPreferredProfile = preferredProfile?.trim().toLowerCase();
+  if ((normalizedScheme === "http" || normalizedScheme === "https") && normalizedPreferredProfile) {
+    return HTTP_SELECTED_PROFILES[normalizedPreferredProfile];
   }
   // Cloudberry uses PostgreSQL URLs, so keep the selected product profile when parsing a pasted URL.
-  if ((scheme === "postgres" || scheme === "postgresql") && preferredProfile === "cloudberry") {
+  if ((normalizedScheme === "postgres" || normalizedScheme === "postgresql") && normalizedPreferredProfile === "cloudberry") {
     return SCHEME_PROFILES.cloudberry;
   }
-  return SCHEME_PROFILES[scheme];
+  return SCHEME_PROFILES[normalizedScheme];
 }
 
 function parseJdbcSqlServerUrl(source: string): ParsedConnectionUrl | null {
@@ -401,7 +470,7 @@ function parseJdbcGbase8sUrl(source: string): ParsedConnectionUrl | null {
   return {
     dbType: "gbase",
     driverProfile: "gbase8s",
-    driverLabel: "GBase 8s",
+    driverLabel: "南大通用 GBase 8s",
     host,
     port: match.groups.port ? Number(match.groups.port) : 9088,
     username: decodeUrlPart(rawUser),
@@ -522,6 +591,9 @@ export function parseConnectionUrl(value: string, preferredProfile?: string): Pa
   const mongoResult = parseMongoUrl(source);
   if (mongoResult) return mongoResult;
 
+  const zooKeeperResult = parseZooKeeperUrl(source);
+  if (zooKeeperResult) return zooKeeperResult;
+
   let parsed: URL;
   try {
     parsed = new URL(source);
@@ -585,9 +657,10 @@ export function parseConnectionUrl(value: string, preferredProfile?: string): Pa
     ...(profile.type === "sqlserver" && parsed.port ? { portExplicit: true } : {}),
     username: mysqlCredentials?.username ?? decodeUrlPart(parsed.username),
     password: mysqlCredentials?.password ?? decodeUrlPart(parsed.password),
-    database: databaseFromPath(parsed.pathname),
+    database: profile.type === "victoriametrics" ? "metrics" : databaseFromPath(parsed.pathname),
     urlParams: effectiveUrlParams,
     ssl: scheme === "rediss" || scheme === "https" || urlParamsRequireTls(profile.type, effectiveUrlParams) || (profile.type === "mysql" && isTidbCloudHost(parsed.hostname)),
+    ...(profile.type === "victoriametrics" ? { apiPath: parsed.pathname.replace(/\/+$/, "") } : {}),
   };
 }
 
@@ -623,7 +696,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
-function sqlServerExternalConfig(existing: unknown, parsed: ParsedConnectionUrl): unknown {
+function parsedExternalConfig(existing: unknown, parsed: ParsedConnectionUrl): unknown {
+  if (parsed.dbType === "victoriametrics") {
+    const next = isRecord(existing) ? { ...existing } : {};
+    next.apiPath = parsed.apiPath || "/prometheus";
+    return next;
+  }
   if (parsed.dbType !== "sqlserver") return existing;
 
   const next = isRecord(existing) ? { ...existing } : {};
@@ -652,6 +730,6 @@ export function applyParsedConnectionUrl(config: Omit<ConnectionConfig, "id">, p
     ssl: parsed.ssl,
     connection_string: parsed.connectionString,
     oracle_connection_type: parsed.oracleConnectionType,
-    external_config: sqlServerExternalConfig(config.external_config, parsed),
+    external_config: parsedExternalConfig(config.external_config, parsed),
   };
 }

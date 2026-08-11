@@ -1,11 +1,11 @@
 use crate::query::MAX_ROWS;
 use crate::sql::starts_with_executable_sql_keyword;
 use crate::types::{
-    ColumnInfo, DatabaseInfo, ForeignKeyInfo, IndexInfo, LinkedServerInfo, ObjectStatistics, QueryResult, TableInfo,
-    TriggerInfo,
+    ColumnInfo, DatabaseInfo, ForeignKeyInfo, IndexInfo, LinkedServerInfo, ObjectStatistics, QueryMessage, QueryResult,
+    SpatialColumnBuilder, TableInfo, TriggerInfo,
 };
 use futures::{FutureExt, TryStreamExt};
-use sqlparser::ast::{Expr, Ident, SelectItem, SetExpr, Statement};
+use sqlparser::ast::{Expr, Ident, ObjectNamePart, OrderByKind, SelectItem, SetExpr, Statement, TableFactor, Value};
 use sqlparser::dialect::MsSqlDialect;
 use sqlparser::parser::Parser;
 use std::borrow::Cow;
@@ -90,6 +90,56 @@ pub struct SqlServerColumnMetadata {
     pub is_computed: bool,
     pub is_hidden: bool,
     pub generated_always_type: i32,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct SqlServerCompletionContext {
+    pub default_schema: String,
+    pub supports_session_database_switch: bool,
+}
+
+const SQLSERVER_COMPLETION_CONTEXT_SQL: &str = "\
+    SELECT COALESCE(\
+        (SELECT default_schema.name \
+         FROM sys.schemas default_schema \
+         WHERE default_schema.name = SCHEMA_NAME()), \
+        N'dbo'\
+    ) AS default_schema, \
+    CONVERT(int, SERVERPROPERTY(N'EngineEdition')) AS engine_edition";
+
+fn sqlserver_supports_session_database_switch(engine_edition: i32) -> bool {
+    // Only known boxed SQL Server, Managed Instance, and SQL Edge editions are
+    // allowed to switch databases. Cloud single-database endpoints and future
+    // editions default to opening a connection directly to the target database.
+    matches!(engine_edition, 1 | 2 | 3 | 4 | 8 | 9)
+}
+
+fn sqlserver_completion_context(
+    default_schema: Option<&str>,
+    engine_edition: Option<i32>,
+) -> Result<SqlServerCompletionContext, String> {
+    let default_schema = default_schema.map(str::trim).filter(|schema| !schema.is_empty()).unwrap_or("dbo");
+    let engine_edition = engine_edition.ok_or_else(|| "SQL Server EngineEdition is unavailable".to_string())?;
+    Ok(SqlServerCompletionContext {
+        default_schema: default_schema.to_string(),
+        supports_session_database_switch: sqlserver_supports_session_database_switch(engine_edition),
+    })
+}
+
+pub fn completion_context_sql() -> &'static str {
+    SQLSERVER_COMPLETION_CONTEXT_SQL
+}
+
+pub fn completion_context_from_query_result(result: QueryResult) -> Result<SqlServerCompletionContext, String> {
+    let row = result.rows.first().ok_or_else(|| "SQL Server completion context query returned no rows".to_string())?;
+    let default_schema = row.first().and_then(serde_json::Value::as_str);
+    let engine_edition = row.get(1).and_then(|value| {
+        value
+            .as_i64()
+            .and_then(|value| i32::try_from(value).ok())
+            .or_else(|| value.as_str()?.trim().parse::<i32>().ok())
+    });
+    sqlserver_completion_context(default_schema, engine_edition)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -248,6 +298,62 @@ fn row_to_json(row: &tiberius::Row) -> Vec<serde_json::Value> {
     row.cells().map(|(_, cell)| sqlserver_cell_to_json(cell)).collect()
 }
 
+fn sqlserver_spatial_marker(value: serde_json::Value) -> (serde_json::Value, Option<u32>) {
+    let serde_json::Value::String(text) = value else {
+        return (value, None);
+    };
+    let Some(rest) = text.strip_prefix("SRID=") else {
+        return (serde_json::Value::String(text), None);
+    };
+    let Some((srid, wkt)) = rest.split_once(';') else {
+        return (serde_json::Value::String(text), None);
+    };
+    let Ok(srid) = srid.parse::<i64>() else {
+        return (serde_json::Value::String(wkt.to_string()), None);
+    };
+    let srid = u32::try_from(srid).ok().filter(|value| *value != 0);
+    (serde_json::Value::String(wkt.to_string()), srid)
+}
+
+fn row_to_json_with_spatial_metadata(
+    row: &tiberius::Row,
+    spatial_columns: &[SqlServerSpatialColumn],
+    on_srid: impl FnMut(usize, Option<u32>),
+) -> (Vec<serde_json::Value>, Vec<Option<u32>>) {
+    let mut values = row_to_json(row);
+    let srids = decode_sqlserver_spatial_values(&mut values, spatial_columns, on_srid);
+    (values, srids)
+}
+
+/// Decode `SRID=n;WKT` markers into plain WKT, returning the per-cell SRIDs
+/// (`None` for non-spatial cells or unknown SRIDs). Every geometry value keeps
+/// its own SRID so mixed-SRID columns stay correct.
+fn decode_sqlserver_spatial_values(
+    values: &mut [serde_json::Value],
+    spatial_columns: &[SqlServerSpatialColumn],
+    mut on_srid: impl FnMut(usize, Option<u32>),
+) -> Vec<Option<u32>> {
+    let mut srids = vec![None; values.len()];
+    for spatial_column in spatial_columns {
+        let Some(value) = values.get_mut(spatial_column.column_index) else {
+            continue;
+        };
+        let (wkt, srid) = sqlserver_spatial_marker(std::mem::take(value));
+        *value = wkt;
+        srids[spatial_column.column_index] = srid;
+        on_srid(spatial_column.column_index, srid);
+    }
+    srids
+}
+
+fn restore_sqlserver_spatial_column_types(column_types: &mut [String], spatial_columns: &[SqlServerSpatialColumn]) {
+    for spatial_column in spatial_columns {
+        if let Some(column_type) = column_types.get_mut(spatial_column.column_index) {
+            column_type.clone_from(&spatial_column.column_type);
+        }
+    }
+}
+
 fn columns_from_metadata(metadata: &tiberius::ResultMetadata) -> Vec<String> {
     metadata.columns().iter().map(|c| c.name().to_string()).collect()
 }
@@ -268,34 +374,59 @@ fn column_types_from_metadata(metadata: &tiberius::ResultMetadata) -> Vec<String
 
 const SQLSERVER_MESSAGE_COLUMN: &str = "Message";
 // Tiberius 0.12.3 emits both user-visible INFO tokens and internal ENVCHANGE
-// tokens at the same tracing target/level. Keep only the TokenInfo callsite;
-// update this guard together with the pinned driver when Tiberius is upgraded.
+// tokens at the same tracing target/level. DONE tokens are also consumed before
+// QueryStream yields its next public item. Keep these callsite guards in sync
+// with the pinned driver when Tiberius is upgraded.
 const TIBERIUS_INFO_TOKEN_EVENT_LINE: u32 = 194;
+const TIBERIUS_DONE_TOKEN_EVENT_LINE: u32 = 153;
+const TIBERIUS_DONE_PROC_TOKEN_EVENT_LINE: u32 = 159;
+const TIBERIUS_DONE_IN_PROC_TOKEN_EVENT_LINE: u32 = 165;
 
-#[derive(Clone, Default)]
-struct SqlServerMessageLayer {
-    messages: StdArc<StdMutex<Vec<String>>>,
+#[derive(Debug, Clone)]
+pub(crate) struct SqlServerBatchResult {
+    pub result: QueryResult,
+    pub server_message: bool,
 }
 
-impl<S> Layer<S> for SqlServerMessageLayer
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SqlServerTdsEvent {
+    Message(String),
+    Done(Option<u64>),
+}
+
+#[derive(Clone, Default)]
+struct SqlServerTdsEventLayer {
+    events: StdArc<StdMutex<Vec<SqlServerTdsEvent>>>,
+}
+
+impl SqlServerTdsEventLayer {
+    fn take_events(&self) -> Vec<SqlServerTdsEvent> {
+        self.events.lock().map(|mut events| std::mem::take(&mut *events)).unwrap_or_default()
+    }
+}
+
+impl<S> Layer<S> for SqlServerTdsEventLayer
 where
     S: Subscriber,
 {
     fn on_event(&self, event: &Event<'_>, _ctx: LayerContext<'_, S>) {
         let metadata = event.metadata();
-        if metadata.level() != &Level::INFO
-            || metadata.target() != "tiberius::tds::stream::token"
-            || metadata.line() != Some(TIBERIUS_INFO_TOKEN_EVENT_LINE)
-        {
+        if metadata.target() != "tiberius::tds::stream::token" {
             return;
         }
 
         let mut visitor = SqlServerMessageVisitor::default();
         event.record(&mut visitor);
-        if let Some(message) = visitor.message.filter(|message| !message.trim().is_empty()) {
-            if let Ok(mut messages) = self.messages.lock() {
-                messages.push(message);
-            }
+        let Some(message) = visitor.message.filter(|message| !message.trim().is_empty()) else {
+            return;
+        };
+        let captured = match (metadata.level(), metadata.line()) {
+            (&Level::INFO, Some(TIBERIUS_INFO_TOKEN_EVENT_LINE)) => Some(SqlServerTdsEvent::Message(message)),
+            (&Level::TRACE, Some(line)) => sqlserver_done_trace_event(line, &message),
+            _ => None,
+        };
+        if let (Some(captured), Ok(mut events)) = (captured, self.events.lock()) {
+            events.push(captured);
         }
     }
 }
@@ -313,40 +444,101 @@ impl tracing::field::Visit for SqlServerMessageVisitor {
     }
 }
 
+fn sqlserver_done_trace_event(line: u32, message: &str) -> Option<SqlServerTdsEvent> {
+    if !matches!(
+        line,
+        TIBERIUS_DONE_TOKEN_EVENT_LINE | TIBERIUS_DONE_PROC_TOKEN_EVENT_LINE | TIBERIUS_DONE_IN_PROC_TOKEN_EVENT_LINE
+    ) {
+        return None;
+    }
+    if line == TIBERIUS_DONE_PROC_TOKEN_EVENT_LINE && message.contains("BitFlags<DoneStatus>(0b0)") {
+        return None;
+    }
+    let rows = if !message.contains("Count") {
+        None
+    } else if message.ends_with("(1 row left)") {
+        Some(1)
+    } else if let Some(prefix) = message.strip_suffix(" rows left)") {
+        Some(prefix.rsplit_once('(').and_then(|(_, rows)| rows.parse::<u64>().ok()).unwrap_or(0))
+    } else {
+        Some(0)
+    };
+    Some(SqlServerTdsEvent::Done(rows))
+}
+
 async fn capture_sqlserver_messages<F, T>(future: F) -> (T, Vec<String>)
 where
     F: Future<Output = T>,
 {
-    let layer = SqlServerMessageLayer::default();
-    let messages = layer.messages.clone();
+    let layer = SqlServerTdsEventLayer::default();
+    let captured = layer.clone();
     // Tiberius consumes TDS INFO tokens internally and exposes them only as
     // tracing events. Scope collection to this future to isolate connections.
     let output = future.with_subscriber(tracing_subscriber::registry().with(layer)).await;
-    let messages = messages.lock().map(|messages| messages.clone()).unwrap_or_default();
+    let messages = captured
+        .take_events()
+        .into_iter()
+        .filter_map(|event| match event {
+            SqlServerTdsEvent::Message(message) => Some(message),
+            SqlServerTdsEvent::Done(_) => None,
+        })
+        .collect();
     (output, messages)
 }
 
-fn query_result_with_server_messages(mut result: QueryResult, messages: Vec<String>) -> QueryResult {
-    if messages.is_empty() || !result.columns.is_empty() || !result.rows.is_empty() {
-        return result;
+/// Map captured tiberius INFO-token texts to generic query messages. Tiberius
+/// exposes only the message text in its tracing event, so severity is always
+/// `INFO` and no code/detail/hint is available.
+fn sqlserver_query_messages(messages: &[String]) -> Vec<QueryMessage> {
+    messages
+        .iter()
+        .map(|message| QueryMessage {
+            severity: "INFO".to_string(),
+            message: message.clone(),
+            code: None,
+            detail: None,
+            hint: None,
+        })
+        .collect()
+}
+
+fn query_result_with_server_messages(result: QueryResult, messages: Vec<String>) -> QueryResult {
+    query_result_with_server_messages_metadata(result, messages).result
+}
+
+fn query_result_with_server_messages_metadata(mut result: QueryResult, messages: Vec<String>) -> SqlServerBatchResult {
+    if messages.is_empty() {
+        return SqlServerBatchResult { result, server_message: false };
+    }
+    if !result.columns.is_empty() || !result.rows.is_empty() {
+        // Tabular results keep their shape and additionally carry the
+        // messages; only the empty-result synthesis below leaves
+        // `messages` empty so consumers do not render the same text twice.
+        result.messages = sqlserver_query_messages(&messages);
+        return SqlServerBatchResult { result, server_message: false };
     }
 
+    // Empty results synthesize the legacy single-"Message"-column grid; the
+    // text lives only there, so `messages` stays empty to avoid consumers
+    // rendering the same text twice.
     result.columns = vec![SQLSERVER_MESSAGE_COLUMN.to_string()];
     result.column_types = vec!["nvarchar".to_string()];
     result.rows = messages.into_iter().map(|message| vec![serde_json::Value::String(message)]).collect();
-    result
+    SqlServerBatchResult { result, server_message: true }
 }
 
-fn server_messages_query_result(messages: Vec<String>, start: Instant) -> Option<QueryResult> {
+fn server_messages_query_result(messages: Vec<String>, start: Instant) -> Option<SqlServerBatchResult> {
     if messages.is_empty() {
         return None;
     }
 
-    Some(query_result_with_server_messages(
+    Some(query_result_with_server_messages_metadata(
         QueryResult {
             columns: vec![],
             column_types: vec![],
             column_sortables: vec![],
+            spatial_columns: vec![],
+            spatial_values: vec![],
             rows: vec![],
             affected_rows: 0,
             execution_time_ms: start.elapsed().as_millis(),
@@ -354,6 +546,7 @@ fn server_messages_query_result(messages: Vec<String>, start: Instant) -> Option
             session_id: None,
             has_more: false,
             elasticsearch_raw_body: None,
+            messages: Vec::new(),
         },
         messages,
     ))
@@ -363,11 +556,17 @@ async fn collect_first_result_limited(
     mut stream: QueryStream<'_>,
     start: Instant,
     max_rows: Option<usize>,
+    result_offset: usize,
+    spatial_columns: &[SqlServerSpatialColumn],
 ) -> Result<QueryResult, String> {
     let row_limit = query_result_row_limit(max_rows);
+    let mut remaining_offset = result_offset;
     let mut columns: Vec<String> = vec![];
     let mut column_types: Vec<String> = vec![];
     let mut rows: Vec<Vec<serde_json::Value>> = Vec::new();
+    let mut spatial_values: Vec<Vec<Option<u32>>> = Vec::new();
+    let mut spatial_values_builder =
+        SpatialColumnBuilder::new(spatial_columns.iter().map(|column| column.column_index));
     let mut truncated = false;
 
     while let Some(item) = stream.try_next().await.map_err(|e| e.to_string())? {
@@ -375,11 +574,21 @@ async fn collect_first_result_limited(
             QueryItem::Metadata(metadata) if metadata.result_index() == 0 => {
                 columns = columns_from_metadata(&metadata);
                 column_types = column_types_from_metadata(&metadata);
+                restore_sqlserver_spatial_column_types(&mut column_types, spatial_columns);
             }
             QueryItem::Metadata(_) => {}
             QueryItem::Row(row) if row.result_index() == 0 => {
+                if remaining_offset > 0 {
+                    remaining_offset -= 1;
+                    continue;
+                }
                 if rows.len() < row_limit {
-                    rows.push(row_to_json(&row));
+                    let (values, srids) =
+                        row_to_json_with_spatial_metadata(&row, spatial_columns, |column_index, srid| {
+                            spatial_values_builder.observe(column_index, srid);
+                        });
+                    rows.push(values);
+                    spatial_values.push(srids);
                 } else {
                     truncated = true;
                 }
@@ -388,10 +597,14 @@ async fn collect_first_result_limited(
         }
     }
 
+    restore_sqlserver_spatial_column_types(&mut column_types, spatial_columns);
+
     Ok(QueryResult {
         columns,
         column_types,
         column_sortables: vec![],
+        spatial_columns: spatial_values_builder.finish(),
+        spatial_values,
         rows,
         affected_rows: 0,
         execution_time_ms: start.elapsed().as_millis(),
@@ -399,6 +612,7 @@ async fn collect_first_result_limited(
         session_id: None,
         has_more: false,
         elasticsearch_raw_body: None,
+        messages: Vec::new(),
     })
 }
 
@@ -407,6 +621,7 @@ struct SqlServerResultSet {
     column_types: Vec<String>,
     rows: Vec<Vec<serde_json::Value>>,
     truncated: bool,
+    remaining_offset: usize,
 }
 
 pub struct SqlServerStreamExportSummary {
@@ -425,6 +640,24 @@ struct SqlServerDescribedColumn {
     system_type_name: Option<String>,
     user_type_schema: Option<String>,
     user_type_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SqlServerSpatialColumn {
+    column_index: usize,
+    column_type: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SqlServerUnsafeTypeQuery {
+    sql: String,
+    spatial_columns: Vec<SqlServerSpatialColumn>,
+}
+
+impl SqlServerUnsafeTypeQuery {
+    fn plain(sql: &str) -> Self {
+        Self { sql: sql.to_string(), spatial_columns: Vec::new() }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -494,7 +727,15 @@ async fn describe_sqlserver_result_set_with_mode(
         let item = match sqlserver_driver_result(stream.try_next()).await {
             Ok(item) => item,
             Err(error) if uses_describe_dmv == Some(false) => {
-                return Err(format!("{SQLSERVER_UNSAFE_PROBE_BLOCK_ERROR_PREFIX} {error}"));
+                let error = format!("{SQLSERVER_UNSAFE_PROBE_BLOCK_ERROR_PREFIX} {error}");
+                if is_sqlserver_legacy_duplicate_probe_error(&error) {
+                    let Some(metadata_sql) = sqlserver_legacy_wildcard_metadata_query(sql) else {
+                        return Err(error);
+                    };
+                    drop(stream);
+                    return describe_sqlserver_legacy_wildcard_result_set(client, &metadata_sql).await;
+                }
+                return Err(error);
             }
             Err(error) => return Err(error),
         };
@@ -520,6 +761,114 @@ async fn describe_sqlserver_result_set_with_mode(
         restore_sqlserver_legacy_probe_output_names(&mut columns, legacy_probe);
     }
     Ok(columns)
+}
+
+fn is_sqlserver_legacy_duplicate_probe_error(error: &str) -> bool {
+    error.starts_with(SQLSERVER_UNSAFE_PROBE_BLOCK_ERROR_PREFIX)
+        && error.to_ascii_lowercase().contains("dbx_probe_source")
+}
+
+async fn describe_sqlserver_legacy_wildcard_result_set(
+    client: &mut SqlServerClient,
+    metadata_sql: &str,
+) -> Result<Vec<SqlServerDescribedColumn>, String> {
+    let rows = sqlserver_driver_result(client.query(metadata_sql, &[]))
+        .await
+        .map_err(|error| format!("{SQLSERVER_UNSAFE_PROBE_BLOCK_ERROR_PREFIX} {error}"))?
+        .into_first_result()
+        .await
+        .map_err(|error| format!("{SQLSERVER_UNSAFE_PROBE_BLOCK_ERROR_PREFIX} {error}"))?;
+    if rows.is_empty() {
+        return Err(format!(
+            "{SQLSERVER_UNSAFE_PROBE_BLOCK_ERROR_PREFIX} legacy wildcard metadata capture returned no columns"
+        ));
+    }
+    Ok(rows.iter().map(sqlserver_described_column_from_row).collect())
+}
+
+fn sqlserver_legacy_wildcard_metadata_query(sql: &str) -> Option<String> {
+    let statement = normalized_sqlserver_select_statement(sql)?;
+    let statements = Parser::parse_sql(&MsSqlDialect {}, &statement.inner).ok()?;
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return None;
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+    if !matches!(select.projection.as_slice(), [SelectItem::Wildcard(_)]) {
+        return None;
+    }
+
+    let mut relations = Vec::new();
+    for source in &select.from {
+        relations.push(sqlserver_legacy_wildcard_relation(&source.relation)?);
+        for join in &source.joins {
+            relations.push(sqlserver_legacy_wildcard_relation(&join.relation)?);
+        }
+    }
+    if relations.is_empty() {
+        return None;
+    }
+
+    let checks = relations
+        .iter()
+        .map(|relation| {
+            format!(
+                "IF OBJECT_ID({}) IS NULL RAISERROR(N'Unable to inspect wildcard source metadata', 16, 1);",
+                sqlserver_nstring_literal(&relation.object_name)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let selects = relations
+        .iter()
+        .enumerate()
+        .map(|(index, relation)| {
+            let catalog = relation.catalog_prefix;
+            format!(
+                "SELECT {} AS dbx_source_ordinal, c.column_id AS dbx_column_ordinal, c.name, \
+                 TYPE_NAME(c.system_type_id) AS system_type_name, s.name AS user_type_schema, t.name AS user_type_name \
+                 FROM {catalog}sys.columns c \
+                 JOIN {catalog}sys.types t ON c.user_type_id = t.user_type_id \
+                 JOIN {catalog}sys.schemas s ON t.schema_id = s.schema_id \
+                 WHERE c.object_id = OBJECT_ID({})",
+                index + 1,
+                sqlserver_nstring_literal(&relation.object_name)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ");
+    Some(format!(
+        "{checks} SELECT name, system_type_name, user_type_schema, user_type_name \
+         FROM ({selects}) AS dbx_wildcard_metadata \
+         ORDER BY dbx_source_ordinal, dbx_column_ordinal"
+    ))
+}
+
+struct SqlServerLegacyWildcardRelation {
+    catalog_prefix: &'static str,
+    object_name: String,
+}
+
+fn sqlserver_legacy_wildcard_relation(relation: &TableFactor) -> Option<SqlServerLegacyWildcardRelation> {
+    let TableFactor::Table { name, args, .. } = relation else {
+        return None;
+    };
+    if args.is_some() {
+        return None;
+    }
+    let identifiers = name.0.iter().map(ObjectNamePart::as_ident).collect::<Option<Vec<_>>>()?;
+    match identifiers.as_slice() {
+        [table] if table.value.starts_with('#') => Some(SqlServerLegacyWildcardRelation {
+            catalog_prefix: "tempdb.",
+            object_name: format!("tempdb..{}", table.value),
+        }),
+        [_table] => Some(SqlServerLegacyWildcardRelation { catalog_prefix: "", object_name: name.to_string() }),
+        [_schema, _table] => {
+            Some(SqlServerLegacyWildcardRelation { catalog_prefix: "", object_name: name.to_string() })
+        }
+        _ => None,
+    }
 }
 
 fn restore_sqlserver_legacy_probe_output_names(
@@ -559,7 +908,10 @@ fn is_blocking_sqlserver_unsafe_probe_error(error: &str) -> bool {
     error.starts_with(SQLSERVER_UNSAFE_PROBE_BLOCK_ERROR_PREFIX)
 }
 
-async fn sqlserver_unsafe_type_query(client: &mut SqlServerClient, sql: &str) -> Result<Option<String>, String> {
+async fn sqlserver_unsafe_type_query(
+    client: &mut SqlServerClient,
+    sql: &str,
+) -> Result<Option<SqlServerUnsafeTypeQuery>, String> {
     if !is_single_sqlserver_select(sql) {
         return Ok(None);
     }
@@ -577,7 +929,7 @@ fn sqlserver_legacy_probe(sql: &str) -> Option<SqlServerLegacyProbe> {
 
 fn sqlserver_legacy_probe_with_nonce(sql: &str, nonce: &str) -> Option<SqlServerLegacyProbe> {
     let statement = normalized_sqlserver_select_statement(sql)?;
-    let output_names = sqlserver_projection_output_names(&statement);
+    let output_names = sqlserver_projection_output_names(&statement.inner);
     let source_alias = quote_sqlserver_identifier("dbx_probe_source");
     let (source_sql, output_name_overrides) = if let Some(names) = &output_names {
         let aliases = (0..names.len())
@@ -585,11 +937,11 @@ fn sqlserver_legacy_probe_with_nonce(sql: &str, nonce: &str) -> Option<SqlServer
             .map(|name| quote_sqlserver_identifier(&name))
             .collect::<Vec<_>>()
             .join(", ");
-        (format!("({statement}) AS {source_alias}({aliases})"), Vec::new())
-    } else if let Some(wildcard_probe) = sqlserver_wildcard_projection_probe(&statement, nonce) {
+        (format!("({}) AS {source_alias}({aliases})", statement.inner), Vec::new())
+    } else if let Some(wildcard_probe) = sqlserver_wildcard_projection_probe(&statement.inner, nonce) {
         (format!("({}) AS {source_alias}", wildcard_probe.statement), wildcard_probe.output_name_overrides)
     } else {
-        (format!("({statement}) AS {source_alias}"), Vec::new())
+        (format!("({}) AS {source_alias}", statement.inner), Vec::new())
     };
     Some(SqlServerLegacyProbe { source_sql, output_names, output_name_overrides })
 }
@@ -656,7 +1008,10 @@ fn sqlserver_wildcard_projection_probe(statement: &str, nonce: &str) -> Option<S
     Some(SqlServerWildcardProjectionProbe { statement: query.to_string(), output_name_overrides })
 }
 
-fn build_sqlserver_unsafe_type_query(sql: &str, columns: &[SqlServerDescribedColumn]) -> Option<String> {
+fn build_sqlserver_unsafe_type_query(
+    sql: &str,
+    columns: &[SqlServerDescribedColumn],
+) -> Option<SqlServerUnsafeTypeQuery> {
     if columns.is_empty() || !columns.iter().any(is_sqlserver_unsafe_column) {
         return None;
     }
@@ -674,7 +1029,9 @@ fn build_sqlserver_unsafe_type_query(sql: &str, columns: &[SqlServerDescribedCol
             let source_column = quote_sqlserver_identifier(&source_columns[index]);
             let value_ref = format!("{source_alias}.{source_column}");
             if is_sqlserver_spatial_column(column) {
-                format!("{quoted_output} = CASE WHEN {value_ref} IS NULL THEN NULL ELSE {value_ref}.STAsText() END")
+                format!(
+                    "{quoted_output} = CASE WHEN {value_ref} IS NULL THEN NULL ELSE N'SRID=' + CONVERT(nvarchar(20), {value_ref}.STSrid) + N';' + {value_ref}.AsTextZM() END"
+                )
             } else if is_sqlserver_variant_column(column) {
                 format!("{quoted_output} = CAST({value_ref} AS NVARCHAR(MAX))")
             } else {
@@ -684,7 +1041,34 @@ fn build_sqlserver_unsafe_type_query(sql: &str, columns: &[SqlServerDescribedCol
         .collect::<Vec<_>>()
         .join(", ");
 
-    Some(format!("SELECT {select_list} FROM ({statement}) AS {source_alias}({source_alias_list})"))
+    let spatial_columns = columns
+        .iter()
+        .enumerate()
+        .filter_map(|(column_index, column)| {
+            sqlserver_spatial_column_type(column)
+                .map(|column_type| SqlServerSpatialColumn { column_index, column_type: column_type.to_string() })
+        })
+        .collect();
+
+    // Re-apply the original ORDER BY / OFFSET / FETCH on the outer query so
+    // ordering and pagination survive the derived-table rewrite. When the sort
+    // keys cannot be safely migrated, refuse the rewrite rather than silently
+    // dropping order semantics (callers fall back to the plain statement).
+    let order_by = match &statement.order_by {
+        Some(order_by) => {
+            let outer_order_by = sqlserver_outer_order_by(order_by, columns)?;
+            format!(" {outer_order_by}")
+        }
+        None => String::new(),
+    };
+
+    Some(SqlServerUnsafeTypeQuery {
+        sql: format!(
+            "SELECT {select_list} FROM ({}) AS {source_alias}({source_alias_list}){order_by}",
+            statement.inner
+        ),
+        spatial_columns,
+    })
 }
 
 fn is_sqlserver_unsafe_column(column: &SqlServerDescribedColumn) -> bool {
@@ -692,12 +1076,19 @@ fn is_sqlserver_unsafe_column(column: &SqlServerDescribedColumn) -> bool {
 }
 
 fn is_sqlserver_spatial_column(column: &SqlServerDescribedColumn) -> bool {
-    [&column.system_type_name, &column.user_type_name].into_iter().flatten().any(|name| {
+    sqlserver_spatial_column_type(column).is_some()
+}
+
+fn sqlserver_spatial_column_type(column: &SqlServerDescribedColumn) -> Option<&'static str> {
+    [&column.system_type_name, &column.user_type_name].into_iter().flatten().find_map(|name| {
         let normalized = name.trim().trim_matches(['[', ']']).to_ascii_lowercase();
-        normalized == "geometry"
-            || normalized == "geography"
-            || normalized.ends_with(".geometry")
-            || normalized.ends_with(".geography")
+        if normalized == "geometry" || normalized.ends_with(".geometry") {
+            Some("geometry")
+        } else if normalized == "geography" || normalized.ends_with(".geography") {
+            Some("geography")
+        } else {
+            None
+        }
     })
 }
 
@@ -708,7 +1099,16 @@ fn is_sqlserver_variant_column(column: &SqlServerDescribedColumn) -> bool {
     })
 }
 
-fn normalized_sqlserver_select_statement(sql: &str) -> Option<String> {
+struct SqlServerNormalizedStatement {
+    /// Statement with the trailing ORDER BY (and any OFFSET/FETCH) removed so it
+    /// can be used as a derived table subquery.
+    inner: String,
+    /// The removed trailing ORDER BY clause verbatim, including any
+    /// `OFFSET ... ROWS [FETCH NEXT ... ROWS ONLY]` tail, if the query had one.
+    order_by: Option<String>,
+}
+
+fn normalized_sqlserver_select_statement(sql: &str) -> Option<SqlServerNormalizedStatement> {
     let statement = trim_sqlserver_statement(sql);
     let trimmed = statement.trim_start();
     if trimmed.is_empty() || !trimmed.get(..6).is_some_and(|prefix| prefix.eq_ignore_ascii_case("SELECT")) {
@@ -718,19 +1118,110 @@ fn normalized_sqlserver_select_statement(sql: &str) -> Option<String> {
         return None;
     }
 
-    // Strip trailing ORDER BY so the statement can be used as a derived table
-    // subquery. SQL Server requires TOP / OFFSET / FOR XML alongside ORDER BY
-    // in subqueries, none of which are version-safe across 2008–2022.
-    let mut statement = trimmed.to_string();
-    let tokens = top_level_sqlserver_tokens(&statement);
-    for index in (0..tokens.len().saturating_sub(1)).rev() {
-        if tokens[index].text == "ORDER" && tokens.get(index + 1).is_some_and(|token| token.text == "BY") {
-            statement.truncate(tokens[index].start);
-            statement = statement.trim_end().to_string();
-            break;
-        }
+    // SQL Server rejects ORDER BY inside a derived table subquery (it requires
+    // TOP / OFFSET / FOR XML alongside it, none of which are version-safe across
+    // 2008–2022). Move the trailing ORDER BY out of the inner statement so the
+    // outer rewrite can re-apply it (see `sqlserver_outer_order_by`). When a
+    // top-level TOP is present the ORDER BY also drives row selection, so it must
+    // stay inside the derived table too (TOP makes ORDER BY legal in subqueries
+    // on every SQL Server version) while the outer rewrite re-applies it for the
+    // final result order.
+    let tokens = top_level_sqlserver_tokens(trimmed);
+    let order_index = (0..tokens.len().saturating_sub(1))
+        .rev()
+        .find(|index| tokens[*index].text == "ORDER" && tokens.get(index + 1).is_some_and(|token| token.text == "BY"));
+    let Some(order_index) = order_index else {
+        return Some(SqlServerNormalizedStatement { inner: trimmed.to_string(), order_by: None });
+    };
+    let order_by = trimmed[tokens[order_index].start..].trim().to_string();
+    if has_top_level_top(trimmed) {
+        return Some(SqlServerNormalizedStatement { inner: trimmed.to_string(), order_by: Some(order_by) });
     }
-    Some(statement)
+    let inner = trimmed[..tokens[order_index].start].trim_end().to_string();
+    Some(SqlServerNormalizedStatement { inner, order_by: Some(order_by) })
+}
+
+/// Translate the original trailing ORDER BY clause (with optional OFFSET/FETCH)
+/// into an equivalent clause for the outer rewrite, or return `None` when the
+/// ordering cannot be guaranteed on the outer query. `None` covers ORDER BY keys
+/// that reference columns absent from the projection, non-trivial expressions,
+/// and keys targeting columns the rewrite transforms (spatial/variant); callers
+/// must then fall back to executing the plain statement rather than silently
+/// dropping order and pagination semantics.
+fn sqlserver_outer_order_by(order_by: &str, columns: &[SqlServerDescribedColumn]) -> Option<String> {
+    // OFFSET/FETCH carry no column references, so keep that tail verbatim and
+    // rebuild only the sort-key list against the outer projection.
+    let tokens = top_level_sqlserver_tokens(order_by);
+    let offset_start = tokens.iter().find(|token| token.text == "OFFSET").map(|token| token.start);
+    let (order_exprs_text, offset_tail) = match offset_start {
+        Some(start) => (&order_by[..start], order_by[start..].trim()),
+        None => (order_by, ""),
+    };
+
+    let wrapped = format!("SELECT 1 {order_exprs_text}");
+    let statements = Parser::parse_sql(&MsSqlDialect {}, &wrapped).ok()?;
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return None;
+    };
+    let order_by = query.order_by.as_ref()?;
+    let OrderByKind::Expressions(order_exprs) = &order_by.kind else {
+        return None;
+    };
+    if order_exprs.is_empty() {
+        return None;
+    }
+
+    let mut parts = Vec::with_capacity(order_exprs.len());
+    for order_expr in order_exprs {
+        let output_name = sqlserver_order_by_output_name(columns, &order_expr.expr)?;
+        let mut part = quote_sqlserver_identifier(&output_name);
+        if order_expr.options.asc == Some(false) {
+            part.push_str(" DESC");
+        }
+        if let Some(nulls_first) = order_expr.options.nulls_first {
+            part.push_str(if nulls_first { " NULLS FIRST" } else { " NULLS LAST" });
+        }
+        parts.push(part);
+    }
+
+    let mut outer = format!("ORDER BY {}", parts.join(", "));
+    if !offset_tail.is_empty() {
+        outer.push(' ');
+        outer.push_str(offset_tail);
+    }
+    Some(outer)
+}
+
+/// Map an ORDER BY sort key to the outer rewrite's output column name. Returns
+/// `None` for keys that do not resolve to a projection column, keys targeting a
+/// column the rewrite transforms (spatial/variant), and any non-trivial
+/// expression, none of which can be safely re-applied on the outer query.
+fn sqlserver_order_by_output_name(columns: &[SqlServerDescribedColumn], expr: &Expr) -> Option<String> {
+    let index = match expr {
+        Expr::Identifier(identifier) => sqlserver_projection_column_index(columns, &identifier.value)?,
+        Expr::CompoundIdentifier(identifiers) => {
+            sqlserver_projection_column_index(columns, identifiers.last()?.value.as_str())?
+        }
+        Expr::Value(value_with_span) => {
+            if let Value::Number(ordinal, _) = &value_with_span.value {
+                ordinal.parse::<usize>().ok()?.checked_sub(1)?
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+    let column = columns.get(index)?;
+    if is_sqlserver_unsafe_column(column) {
+        return None;
+    }
+    Some(sqlserver_output_column_name(column, index))
+}
+
+fn sqlserver_projection_column_index(columns: &[SqlServerDescribedColumn], name: &str) -> Option<usize> {
+    columns.iter().position(|column| {
+        column.name.as_deref().map(str::trim).is_some_and(|output_name| output_name.eq_ignore_ascii_case(name))
+    })
 }
 
 fn trim_sqlserver_statement(sql: &str) -> String {
@@ -850,6 +1341,20 @@ fn has_top_level_select_into(sql: &str) -> bool {
     tokens[select_index + 1..from_index].iter().any(|token| token.text == "INTO")
 }
 
+fn has_top_level_top(sql: &str) -> bool {
+    let tokens = top_level_sqlserver_tokens(sql);
+    let Some(select_index) = tokens.iter().position(|token| token.text == "SELECT") else {
+        return false;
+    };
+    let from_index = tokens
+        .iter()
+        .enumerate()
+        .find(|(index, token)| *index > select_index && token.text == "FROM")
+        .map(|(index, _)| index)
+        .unwrap_or(tokens.len());
+    tokens[select_index + 1..from_index].iter().any(|token| token.text == "TOP")
+}
+
 fn skip_sqlserver_quoted(sql: &str, pos: usize, quote: char) -> usize {
     let mut i = pos + quote.len_utf8();
     while i < sql.len() {
@@ -913,6 +1418,8 @@ fn push_sqlserver_result_set(results: &mut Vec<QueryResult>, result: Option<SqlS
             columns: result.columns,
             column_types: result.column_types,
             column_sortables: vec![],
+            spatial_columns: vec![],
+            spatial_values: vec![],
             rows: result.rows,
             affected_rows: 0,
             execution_time_ms: start.elapsed().as_millis(),
@@ -920,28 +1427,105 @@ fn push_sqlserver_result_set(results: &mut Vec<QueryResult>, result: Option<SqlS
             session_id: None,
             has_more: false,
             elasticsearch_raw_body: None,
+            messages: Vec::new(),
         });
     }
 }
 
-async fn collect_result_sets_limited(
+fn push_sqlserver_ordered_result_set(
+    results: &mut Vec<SqlServerBatchResult>,
+    result: Option<SqlServerResultSet>,
+    start: Instant,
+) {
+    let mut query_results = Vec::with_capacity(1);
+    push_sqlserver_result_set(&mut query_results, result, start);
+    results.extend(query_results.into_iter().map(|result| SqlServerBatchResult { result, server_message: false }));
+}
+
+fn push_sqlserver_ordered_events(
+    results: &mut Vec<SqlServerBatchResult>,
+    current: &mut Option<SqlServerResultSet>,
+    events: Vec<SqlServerTdsEvent>,
+    start: Instant,
+) {
+    if events.is_empty() {
+        return;
+    }
+    // The first DONE after an active result set closes that SELECT. Its row
+    // count is not a standalone DML result.
+    let mut result_set_done_pending = current.is_some();
+    push_sqlserver_ordered_result_set(results, current.take(), start);
+
+    let mut messages = Vec::new();
+    for event in events {
+        match event {
+            SqlServerTdsEvent::Message(message) => messages.push(message),
+            SqlServerTdsEvent::Done(affected_rows) => {
+                if result_set_done_pending {
+                    result_set_done_pending = false;
+                    continue;
+                }
+                let Some(affected_rows) = affected_rows else {
+                    continue;
+                };
+                if let Some(message_result) = server_messages_query_result(std::mem::take(&mut messages), start) {
+                    results.push(message_result);
+                }
+                results.push(SqlServerBatchResult {
+                    result: QueryResult {
+                        columns: vec![],
+                        column_types: vec![],
+                        column_sortables: vec![],
+                        spatial_columns: vec![],
+                        spatial_values: vec![],
+                        rows: vec![],
+                        affected_rows,
+                        execution_time_ms: start.elapsed().as_millis(),
+                        truncated: false,
+                        session_id: None,
+                        has_more: false,
+                        elasticsearch_raw_body: None,
+                        messages: Vec::new(),
+                    },
+                    server_message: false,
+                });
+            }
+        }
+    }
+    if let Some(message_result) = server_messages_query_result(messages, start) {
+        results.push(message_result);
+    }
+}
+
+async fn collect_ordered_result_sets_limited(
     mut stream: QueryStream<'_>,
     start: Instant,
     max_rows: Option<usize>,
-) -> Result<Vec<QueryResult>, String> {
+    result_offset: usize,
+    event_layer: SqlServerTdsEventLayer,
+) -> Result<Vec<SqlServerBatchResult>, String> {
     let row_limit = query_result_row_limit(max_rows);
     let mut results = Vec::new();
     let mut current: Option<SqlServerResultSet> = None;
+    let mut saw_result_set = false;
 
-    while let Some(item) = stream.try_next().await.map_err(|e| e.to_string())? {
+    loop {
+        let item = stream.try_next().await.map_err(|e| e.to_string())?;
+        push_sqlserver_ordered_events(&mut results, &mut current, event_layer.take_events(), start);
+        let Some(item) = item else {
+            break;
+        };
         match item {
             QueryItem::Metadata(metadata) => {
-                push_sqlserver_result_set(&mut results, current.take(), start);
+                push_sqlserver_ordered_result_set(&mut results, current.take(), start);
+                let remaining_offset = if saw_result_set { 0 } else { result_offset };
+                saw_result_set = true;
                 current = Some(SqlServerResultSet {
                     columns: columns_from_metadata(&metadata),
                     column_types: column_types_from_metadata(&metadata),
                     rows: Vec::new(),
                     truncated: false,
+                    remaining_offset,
                 });
             }
             QueryItem::Row(row) => {
@@ -950,7 +1534,13 @@ async fn collect_result_sets_limited(
                     column_types: row.columns().iter().map(sqlserver_column_type_name).collect(),
                     rows: Vec::new(),
                     truncated: false,
+                    remaining_offset: if saw_result_set { 0 } else { result_offset },
                 });
+                saw_result_set = true;
+                if result.remaining_offset > 0 {
+                    result.remaining_offset -= 1;
+                    continue;
+                }
                 if result.rows.len() < row_limit {
                     result.rows.push(row_to_json(&row));
                 } else {
@@ -960,7 +1550,7 @@ async fn collect_result_sets_limited(
         }
     }
 
-    push_sqlserver_result_set(&mut results, current, start);
+    push_sqlserver_ordered_result_set(&mut results, current, start);
     Ok(results)
 }
 
@@ -971,13 +1561,13 @@ pub async fn stream_first_result_set(
     cancel_token: Option<CancellationToken>,
     mut on_item: impl for<'a> FnMut(SqlServerStreamItem<'a>) -> Result<(), String>,
 ) -> Result<SqlServerStreamExportSummary, String> {
-    let query_sql = match sqlserver_unsafe_type_query(client, sql).await {
-        Ok(Some(sql)) => sql,
-        Ok(None) => sql.to_string(),
+    let query = match sqlserver_unsafe_type_query(client, sql).await {
+        Ok(Some(query)) => query,
+        Ok(None) => SqlServerUnsafeTypeQuery::plain(sql),
         Err(error) if is_blocking_sqlserver_unsafe_probe_error(&error) => return Err(error),
-        Err(_) => sql.to_string(),
+        Err(_) => SqlServerUnsafeTypeQuery::plain(sql),
     };
-    let mut stream = sqlserver_driver_result(client.query(query_sql.as_str(), &[])).await?;
+    let mut stream = sqlserver_driver_result(client.query(query.sql.as_str(), &[])).await?;
     let mut active_result_index: Option<usize> = None;
     let mut columns: Vec<String> = Vec::new();
     let mut column_types: Vec<String> = Vec::new();
@@ -1007,6 +1597,7 @@ pub async fn stream_first_result_set(
                     active_result_index = Some(metadata.result_index());
                     columns = columns_from_metadata(&metadata);
                     column_types = column_types_from_metadata(&metadata);
+                    restore_sqlserver_spatial_column_types(&mut column_types, &query.spatial_columns);
                     on_item(SqlServerStreamItem::Columns { columns: &columns, column_types: &column_types })?;
                     columns_emitted = true;
                 }
@@ -1016,6 +1607,7 @@ pub async fn stream_first_result_set(
                     active_result_index = Some(row.result_index());
                     columns = row.columns().iter().map(|c| c.name().to_string()).collect();
                     column_types = row.columns().iter().map(sqlserver_column_type_name).collect();
+                    restore_sqlserver_spatial_column_types(&mut column_types, &query.spatial_columns);
                     on_item(SqlServerStreamItem::Columns { columns: &columns, column_types: &column_types })?;
                     columns_emitted = true;
                 }
@@ -1025,7 +1617,7 @@ pub async fn stream_first_result_set(
                 if row_limit.is_some_and(|limit| rows_exported as usize >= limit) {
                     break;
                 }
-                let values = row_to_json(&row);
+                let (values, _) = row_to_json_with_spatial_metadata(&row, &query.spatial_columns, |_, _| {});
                 on_item(SqlServerStreamItem::Row(&values))?;
                 rows_exported += 1;
             }
@@ -1131,6 +1723,15 @@ pub async fn list_databases(client: &mut SqlServerClient) -> Result<Vec<Database
         .map_err(|e| e.to_string())?;
     let rows = stream.into_first_result().await.map_err(|e| e.to_string())?;
     Ok(rows.iter().map(|row| DatabaseInfo { name: row.get::<&str, _>(0).unwrap_or("").to_string() }).collect())
+}
+
+pub async fn get_completion_context(client: &mut SqlServerClient) -> Result<SqlServerCompletionContext, String> {
+    let stream = client.query(SQLSERVER_COMPLETION_CONTEXT_SQL, &[]).await.map_err(|e| e.to_string())?;
+    let rows = stream.into_first_result().await.map_err(|e| e.to_string())?;
+    let row = rows.first().ok_or_else(|| "SQL Server completion context query returned no rows".to_string())?;
+    let default_schema = row.try_get::<&str, _>(0).map_err(|e| e.to_string())?;
+    let engine_edition = row.try_get::<i32, _>(1).map_err(|e| e.to_string())?;
+    sqlserver_completion_context(default_schema, engine_edition)
 }
 
 pub async fn test_connection(client: &mut SqlServerClient) -> Result<(), String> {
@@ -1462,6 +2063,8 @@ fn sqlserver_completion_assistant_sql(request: &crate::types::CompletionAssistan
         .filter(|schema| !schema.trim().is_empty())
         .map(|schema| format!(" AND s.name = '{}' ", schema.replace('\'', "''")))
         .unwrap_or_default();
+    let columns_only = object_kinds.len() == 1
+        && matches!(object_kinds.first(), Some(crate::types::CompletionAssistantObjectKind::Column));
 
     let mut queries = Vec::new();
     if (mask.starts_with('#') || mask.starts_with("%#"))
@@ -1544,12 +2147,15 @@ fn sqlserver_completion_assistant_sql(request: &crate::types::CompletionAssistan
              FROM sys.columns c \
              JOIN sys.objects o ON o.object_id = c.object_id \
              JOIN sys.schemas s ON s.schema_id = o.schema_id \
-             WHERE o.type IN ('U','V') AND {object_visibility} {schema_filter} {parent_table_filter} {column_like}"
+             WHERE o.type IN ('U','V') AND {object_visibility} {schema_filter} {parent_table_filter} {column_like} ORDER BY c.column_id"
         ));
     }
 
     if queries.is_empty() {
         "SELECT TOP (0) CAST('' AS NVARCHAR(128)) AS name, CAST('' AS NVARCHAR(128)) AS schema_name, CAST('' AS NVARCHAR(60)) AS object_type, CAST(NULL AS NVARCHAR(128)) AS parent_schema, CAST(NULL AS NVARCHAR(128)) AS parent_name, CAST(NULL AS NVARCHAR(MAX)) AS object_comment, CAST(NULL AS NVARCHAR(128)) AS data_type".to_string()
+    } else if columns_only && queries.len() == 1 {
+        // Preserve sys.columns.column_id order for SELECT * expansion.
+        queries.remove(0)
     } else if queries.len() == 1 {
         format!("SELECT * FROM ({}) AS dbx_completion ORDER BY name", queries.remove(0))
     } else {
@@ -1655,6 +2261,27 @@ fn sqlserver_schema_name_predicate(schema: &str, schema_name_expression: &str) -
     format!("{schema_name_expression} = N'{}'", schema.replace('\'', "''"))
 }
 
+fn sqlserver_object_id_expression(schema: &str, table: &str) -> String {
+    let table = table.replace('\'', "''");
+    if schema.trim().is_empty() {
+        return format!("OBJECT_ID(QUOTENAME(N'{table}'))");
+    }
+
+    let schema = schema.replace('\'', "''");
+    format!("OBJECT_ID(QUOTENAME(N'{schema}') + N'.' + QUOTENAME(N'{table}'))")
+}
+
+fn sqlserver_object_schema_name_predicate(schema: &str, table: &str, schema_name_expression: &str) -> String {
+    if schema.trim().is_empty() {
+        return format!(
+            "{schema_name_expression} = OBJECT_SCHEMA_NAME({})",
+            sqlserver_object_id_expression(schema, table)
+        );
+    }
+
+    sqlserver_schema_name_predicate(schema, schema_name_expression)
+}
+
 fn escape_like_literal(value: &str) -> String {
     value.replace('\\', "\\\\").replace('\'', "''").replace('%', "\\%").replace('_', "\\_").replace('[', "\\[")
 }
@@ -1692,11 +2319,15 @@ pub async fn list_objects(client: &mut SqlServerClient, schema: &str) -> Result<
             schema: Some(schema.to_string()),
             valid: None,
             signature: None,
+            custom_type_kind: None,
+            has_members: None,
             comment: row.get::<&str, _>(4).filter(|s: &&str| !s.is_empty()).map(|s: &str| s.to_string()),
             created_at: row.get::<chrono::NaiveDateTime, _>(2).map(|value| value.to_string()),
             updated_at: row.get::<chrono::NaiveDateTime, _>(3).map(|value| value.to_string()),
             parent_schema: None,
             parent_name: None,
+            trigger: None,
+            xugu_type_members_expandable: None,
         })
         .collect())
 }
@@ -1870,7 +2501,7 @@ fn sqlserver_column_metadata_from_row(row: &Row) -> SqlServerColumnMetadata {
 
 fn sqlserver_columns_sql(schema: &str, table: &str) -> String {
     let t = table.replace('\'', "''");
-    let schema_filter = sqlserver_schema_name_predicate(schema, "s.name");
+    let schema_filter = sqlserver_object_schema_name_predicate(schema, table, "s.name");
     // COLUMNPROPERTY keeps hidden/generated flags separate and returns NULL on
     // SQL Server versions that do not expose a newer property.
     format!(
@@ -1974,6 +2605,7 @@ fn sqlserver_indexes_sql_with_filter_definition(schema: &str, table: &str, inclu
     } else {
         "CAST(NULL AS NVARCHAR(MAX)) AS filter_definition"
     };
+    let object_id = sqlserver_object_id_expression(schema, table);
     format!(
         "SELECT i.name, \
          STUFF((SELECT ',' + c2.name \
@@ -1993,10 +2625,8 @@ fn sqlserver_indexes_sql_with_filter_definition(schema: &str, table: &str, inclu
          ep.value AS index_comment \
          FROM sys.indexes i \
          OUTER APPLY (SELECT CAST(ep.value AS NVARCHAR(MAX)) AS value FROM sys.extended_properties ep WHERE ep.major_id = i.object_id AND ep.minor_id = i.index_id AND ep.name = N'MS_Description' AND ep.class = 7) ep \
-         WHERE i.object_id = OBJECT_ID('{s}.{t}') AND i.name IS NOT NULL \
+         WHERE i.object_id = {object_id} AND i.name IS NOT NULL \
          ORDER BY i.name",
-        s = schema.replace('\'', "''"),
-        t = table.replace('\'', "''")
     )
 }
 
@@ -2061,15 +2691,7 @@ pub async fn list_triggers(
     schema: &str,
     table: &str,
 ) -> Result<Vec<TriggerInfo>, String> {
-    let sql = format!(
-        "SELECT t.name, te.type_desc, CASE WHEN t.is_instead_of_trigger = 1 THEN 'INSTEAD OF' ELSE 'AFTER' END \
-         FROM sys.triggers t \
-         JOIN sys.trigger_events te ON t.object_id = te.object_id \
-         WHERE t.parent_id = OBJECT_ID('{s}.{t}') \
-         ORDER BY t.name",
-        s = schema.replace('\'', "''"),
-        t = table.replace('\'', "''")
-    );
+    let sql = sqlserver_triggers_sql(schema, table);
     let stream = client.query(&*sql, &[]).await.map_err(|e| e.to_string())?;
     let rows = stream.into_first_result().await.map_err(|e| e.to_string())?;
     Ok(rows
@@ -2078,9 +2700,29 @@ pub async fn list_triggers(
             name: row.get::<&str, _>(0).unwrap_or("").to_string(),
             event: row.get::<&str, _>(1).unwrap_or("").to_string(),
             timing: row.get::<&str, _>(2).unwrap_or("AFTER").to_string(),
-            statement: None,
+            level: None,
+            condition: None,
+            language: None,
+            enabled: None,
+            valid: None,
+            comment: None,
+            created_at: None,
+            statement: row.get::<&str, _>(3).map(str::to_string),
         })
         .collect())
+}
+
+fn sqlserver_triggers_sql(schema: &str, table: &str) -> String {
+    format!(
+        "SELECT t.name, te.type_desc, CASE WHEN t.is_instead_of_trigger = 1 THEN 'INSTEAD OF' ELSE 'AFTER' END, \
+         OBJECT_DEFINITION(t.object_id) \
+         FROM sys.triggers t \
+         JOIN sys.trigger_events te ON t.object_id = te.object_id \
+         WHERE t.parent_id = OBJECT_ID('{s}.{t}') \
+         ORDER BY t.name",
+        s = schema.replace('\'', "''"),
+        t = table.replace('\'', "''")
+    )
 }
 
 pub async fn execute_query(client: &mut SqlServerClient, sql: &str) -> Result<QueryResult, String> {
@@ -2144,44 +2786,34 @@ pub async fn execute_query_with_max_rows(
     max_rows: Option<usize>,
 ) -> Result<QueryResult, String> {
     let start = Instant::now();
+    let result_offset = crate::query_result_sql::sqlserver_result_offset(sql);
 
-    if starts_with_executable_sql_keyword(sql, &["SELECT", "EXEC", "WITH", "TABLE"]) {
-        let query_sql = match sqlserver_unsafe_type_query(client, sql).await {
-            Ok(Some(sql)) => sql,
-            Ok(None) => sql.to_string(),
+    if starts_with_executable_sql_keyword(sql, &["SELECT", "EXEC", "WITH", "TABLE"])
+        || sqlserver_dml_output_returns_rows(sql)
+    {
+        let query = match sqlserver_unsafe_type_query(client, sql).await {
+            Ok(Some(query)) => query,
+            Ok(None) => SqlServerUnsafeTypeQuery::plain(sql),
             Err(error) if is_blocking_sqlserver_unsafe_probe_error(&error) => return Err(error),
-            Err(_) => sql.to_string(),
+            Err(_) => SqlServerUnsafeTypeQuery::plain(sql),
         };
         let (result, messages) = capture_sqlserver_messages(async {
-            let stream = sqlserver_driver_result(client.query(query_sql.as_str(), &[])).await?;
-            sqlserver_driver_result(collect_first_result_limited(stream, start, max_rows)).await
+            let stream = sqlserver_driver_result(client.query(query.sql.as_str(), &[])).await?;
+            sqlserver_driver_result(collect_first_result_limited(
+                stream,
+                start,
+                max_rows,
+                result_offset,
+                &query.spatial_columns,
+            ))
+            .await
         })
         .await;
         let mut result = query_result_with_server_messages(result?, messages);
         strip_dbx_sqlserver_row_number_column(&mut result, sql);
         Ok(result)
-    } else if requires_simple_query_batch(sql) || contains_transaction_control(sql) {
-        let (result, messages) = capture_sqlserver_messages(async {
-            let stream = sqlserver_driver_result(client.simple_query(sql)).await?;
-            sqlserver_driver_result(collect_result_sets_limited(stream, start, max_rows)).await
-        })
-        .await;
-        let _ = result?;
-        Ok(query_result_with_server_messages(
-            QueryResult {
-                columns: vec![],
-                column_types: Vec::new(),
-                column_sortables: vec![],
-                rows: vec![],
-                affected_rows: 0,
-                execution_time_ms: start.elapsed().as_millis(),
-                truncated: false,
-                session_id: None,
-                has_more: false,
-                elasticsearch_raw_body: None,
-            },
-            messages,
-        ))
+    } else if !sqlserver_batch_can_use_execute(sql) {
+        execute_simple_batch_first_result_with_max_rows(client, sql, max_rows).await
     } else {
         let (result, messages) = capture_sqlserver_messages(sqlserver_driver_result(client.execute(sql, &[]))).await;
         let result = result?;
@@ -2190,6 +2822,8 @@ pub async fn execute_query_with_max_rows(
                 columns: vec![],
                 column_types: Vec::new(),
                 column_sortables: vec![],
+                spatial_columns: vec![],
+                spatial_values: vec![],
                 rows: vec![],
                 affected_rows: result.rows_affected().iter().sum::<u64>(),
                 execution_time_ms: start.elapsed().as_millis(),
@@ -2197,6 +2831,7 @@ pub async fn execute_query_with_max_rows(
                 session_id: None,
                 has_more: false,
                 elasticsearch_raw_body: None,
+                messages: Vec::new(),
             },
             messages,
         ))
@@ -2212,15 +2847,28 @@ pub async fn execute_batch_with_max_rows(
     sql: &str,
     max_rows: Option<usize>,
 ) -> Result<Vec<QueryResult>, String> {
+    execute_batch_with_max_rows_metadata(client, sql, max_rows)
+        .await
+        .map(|results| results.into_iter().map(|result| result.result).collect())
+}
+
+pub(crate) async fn execute_batch_with_max_rows_metadata(
+    client: &mut SqlServerClient,
+    sql: &str,
+    max_rows: Option<usize>,
+) -> Result<Vec<SqlServerBatchResult>, String> {
     let start = Instant::now();
+    let result_offset = crate::query_result_sql::sqlserver_result_offset(sql);
     if sqlserver_batch_can_use_execute(sql) {
         let (result, messages) = capture_sqlserver_messages(sqlserver_driver_result(client.execute(sql, &[]))).await;
         let result = result?;
-        return Ok(vec![query_result_with_server_messages(
+        return Ok(vec![query_result_with_server_messages_metadata(
             QueryResult {
                 columns: vec![],
                 column_types: Vec::new(),
                 column_sortables: vec![],
+                spatial_columns: vec![],
+                spatial_values: vec![],
                 rows: vec![],
                 affected_rows: result.rows_affected().iter().sum::<u64>(),
                 execution_time_ms: start.elapsed().as_millis(),
@@ -2228,6 +2876,7 @@ pub async fn execute_batch_with_max_rows(
                 session_id: None,
                 has_more: false,
                 elasticsearch_raw_body: None,
+                messages: Vec::new(),
             },
             messages,
         )]);
@@ -2235,15 +2884,22 @@ pub async fn execute_batch_with_max_rows(
 
     if is_single_sqlserver_select(sql) {
         match sqlserver_unsafe_type_query(client, sql).await {
-            Ok(Some(query_sql)) => {
+            Ok(Some(query)) => {
                 let (result, messages) = capture_sqlserver_messages(async {
-                    let stream = sqlserver_driver_result(client.query(query_sql.as_str(), &[])).await?;
-                    sqlserver_driver_result(collect_first_result_limited(stream, start, max_rows)).await
+                    let stream = sqlserver_driver_result(client.query(query.sql.as_str(), &[])).await?;
+                    sqlserver_driver_result(collect_first_result_limited(
+                        stream,
+                        start,
+                        max_rows,
+                        result_offset,
+                        &query.spatial_columns,
+                    ))
+                    .await
                 })
                 .await;
                 return result.map(|result| {
-                    let mut result = query_result_with_server_messages(result, messages);
-                    strip_dbx_sqlserver_row_number_column(&mut result, sql);
+                    let mut result = query_result_with_server_messages_metadata(result, messages);
+                    strip_dbx_sqlserver_row_number_column(&mut result.result, sql);
                     vec![result]
                 });
             }
@@ -2251,48 +2907,84 @@ pub async fn execute_batch_with_max_rows(
             Ok(None) | Err(_) => {}
         }
     }
-    execute_simple_batch_with_max_rows(client, sql, max_rows).await
+    execute_simple_batch_with_max_rows_metadata(client, sql, max_rows).await
 }
 
 /// Execute a SQL Server batch directly through TDS simple-query mode.
 ///
 /// This intentionally bypasses result-set type probing and SQL rewriting. It is
-/// required while `SHOWPLAN_XML` is enabled because any probe issued on the same
-/// session is itself affected by SHOWPLAN state.
+/// required while `SHOWPLAN_XML` or `STATISTICS XML` is enabled because any probe
+/// issued on the same session is itself affected by the plan-capture state.
 pub async fn execute_simple_batch_with_max_rows(
     client: &mut SqlServerClient,
     sql: &str,
     max_rows: Option<usize>,
 ) -> Result<Vec<QueryResult>, String> {
+    execute_simple_batch_with_max_rows_metadata(client, sql, max_rows)
+        .await
+        .map(|results| results.into_iter().map(|result| result.result).collect())
+}
+
+pub(crate) async fn execute_simple_batch_with_max_rows_metadata(
+    client: &mut SqlServerClient,
+    sql: &str,
+    max_rows: Option<usize>,
+) -> Result<Vec<SqlServerBatchResult>, String> {
     let start = Instant::now();
-    let (results, messages) = capture_sqlserver_messages(async {
+    let result_offset = crate::query_result_sql::sqlserver_result_offset(sql);
+    let layer = SqlServerTdsEventLayer::default();
+    let captured = layer.clone();
+    let results = async {
         let stream = sqlserver_driver_result(client.simple_query(sql)).await?;
-        sqlserver_driver_result(collect_result_sets_limited(stream, start, max_rows)).await
-    })
+        sqlserver_driver_result(collect_ordered_result_sets_limited(stream, start, max_rows, result_offset, captured))
+            .await
+    }
+    .with_subscriber(tracing_subscriber::registry().with(layer))
     .await;
     let mut results = results?;
     for result in &mut results {
-        strip_dbx_sqlserver_row_number_column(result, sql);
+        strip_dbx_sqlserver_row_number_column(&mut result.result, sql);
     }
 
-    if let Some(message_result) = server_messages_query_result(messages, start) {
-        results.push(message_result);
-    } else if results.is_empty() {
-        results.push(QueryResult {
-            columns: vec![],
-            column_types: Vec::new(),
-            column_sortables: vec![],
-            rows: vec![],
-            affected_rows: 0,
-            execution_time_ms: start.elapsed().as_millis(),
-            truncated: false,
-            session_id: None,
-            has_more: false,
-            elasticsearch_raw_body: None,
+    if results.is_empty() {
+        results.push(SqlServerBatchResult {
+            result: QueryResult {
+                columns: vec![],
+                column_types: Vec::new(),
+                column_sortables: vec![],
+                spatial_columns: vec![],
+                spatial_values: vec![],
+                rows: vec![],
+                affected_rows: 0,
+                execution_time_ms: start.elapsed().as_millis(),
+                truncated: false,
+                session_id: None,
+                has_more: false,
+                elasticsearch_raw_body: None,
+                messages: Vec::new(),
+            },
+            server_message: false,
         });
     }
 
     Ok(results)
+}
+
+async fn execute_simple_batch_first_result_with_max_rows(
+    client: &mut SqlServerClient,
+    sql: &str,
+    max_rows: Option<usize>,
+) -> Result<QueryResult, String> {
+    let start = Instant::now();
+    let result_offset = crate::query_result_sql::sqlserver_result_offset(sql);
+    let (result, messages) = capture_sqlserver_messages(async {
+        let stream = sqlserver_driver_result(client.simple_query(sql)).await?;
+        sqlserver_driver_result(collect_first_result_limited(stream, start, max_rows, result_offset, &[])).await
+    })
+    .await;
+    let mut result = query_result_with_server_messages(result?, messages);
+    strip_dbx_sqlserver_row_number_column(&mut result, sql);
+    Ok(result)
 }
 
 fn strip_dbx_sqlserver_row_number_column(result: &mut QueryResult, sql: &str) {
@@ -2325,23 +3017,72 @@ fn is_dbx_sqlserver_row_number_page_sql(sql: &str) -> bool {
 }
 
 fn sqlserver_batch_can_use_execute(sql: &str) -> bool {
+    let contains_transaction_control = contains_transaction_control(sql);
     !requires_simple_query_batch(sql)
+        && !sqlserver_batch_may_emit_info_messages(sql)
         // Tiberius executes this path through an RPC. SQL Server rejects an RPC
         // that changes @@TRANCOUNT with error 266, while a regular batch is allowed
         // to leave an explicit transaction open for a later COMMIT or ROLLBACK.
-        && !contains_transaction_control(sql)
+        && (!contains_transaction_control || sqlserver_balanced_transaction_batch_can_use_execute(sql))
         && !sqlserver_batch_may_return_result_set(sql)
         && !sqlserver_dml_output_returns_rows(sql)
 }
 
-fn sqlserver_batch_may_return_result_set(sql: &str) -> bool {
+fn sqlserver_batch_may_emit_info_messages(sql: &str) -> bool {
+    top_level_sqlserver_tokens(sql).iter().any(|token| matches!(token.text.as_str(), "PRINT" | "RAISERROR" | "DBCC"))
+}
+
+fn sqlserver_balanced_transaction_batch_can_use_execute(sql: &str) -> bool {
     let tokens = top_level_sqlserver_tokens(sql);
-    let starts_with_cte_dml = tokens.first().is_some_and(|token| token.text == "WITH")
-        && tokens.iter().any(|token| matches!(token.text.as_str(), "INSERT" | "UPDATE" | "DELETE" | "MERGE"))
-        && crate::sql::split_sql_statements(sql).len() == 1;
-    tokens.iter().any(|token| {
-        matches!(token.text.as_str(), "SELECT" | "EXEC" | "EXECUTE" | "TABLE")
-            || (token.text == "WITH" && !starts_with_cte_dml)
+    if tokens.iter().any(|token| {
+        matches!(token.text.as_str(), "IF" | "ELSE" | "WHILE" | "TRY" | "CATCH" | "GOTO" | "RETURN" | "ROLLBACK")
+    }) {
+        return false;
+    }
+
+    let mut transaction_depth = 0usize;
+    let mut saw_begin = false;
+    let mut saw_commit = false;
+
+    for (index, token) in tokens.iter().enumerate() {
+        if token.text == "SET" && tokens.get(index + 1).is_some_and(|next| next.text == "IMPLICIT_TRANSACTIONS") {
+            return false;
+        }
+
+        if token.text == "BEGIN" {
+            if tokens.get(index + 1).is_some_and(|next| next.text == "DISTRIBUTED") {
+                return false;
+            }
+            if tokens.get(index + 1).is_some_and(|next| matches!(next.text.as_str(), "TRANSACTION" | "TRAN")) {
+                transaction_depth += 1;
+                saw_begin = true;
+            }
+        } else if token.text == "COMMIT" {
+            if transaction_depth == 0 {
+                return false;
+            }
+            transaction_depth -= 1;
+            saw_commit = true;
+        }
+    }
+
+    saw_begin && saw_commit && transaction_depth == 0
+}
+
+fn sqlserver_batch_may_return_result_set(sql: &str) -> bool {
+    crate::sql::split_sql_statements(sql).iter().any(|statement| {
+        let tokens = top_level_sqlserver_tokens(statement);
+        let starts_with_dml = starts_with_executable_sql_keyword(statement, &["INSERT", "UPDATE", "DELETE", "MERGE"]);
+        if starts_with_dml {
+            return false;
+        }
+        let starts_with_cte_dml = tokens.first().is_some_and(|token| token.text == "WITH")
+            && tokens.iter().any(|token| matches!(token.text.as_str(), "INSERT" | "UPDATE" | "DELETE" | "MERGE"));
+        tokens.first().is_some_and(|token| token.text == "TABLE")
+            || tokens.iter().any(|token| {
+                matches!(token.text.as_str(), "SELECT" | "EXEC" | "EXECUTE")
+                    || (token.text == "WITH" && !starts_with_cte_dml)
+            })
     })
 }
 
@@ -2396,6 +3137,13 @@ fn requires_simple_query_batch(sql: &str) -> bool {
 
     let tokens = first_sql_tokens(sql, 4);
     if tokens.len() >= 2 && tokens[0].eq_ignore_ascii_case("SET") && tokens[1].eq_ignore_ascii_case("SHOWPLAN_XML") {
+        return true;
+    }
+    if tokens.len() >= 3
+        && tokens[0].eq_ignore_ascii_case("SET")
+        && tokens[1].eq_ignore_ascii_case("STATISTICS")
+        && tokens[2].eq_ignore_ascii_case("XML")
+    {
         return true;
     }
     if tokens.len() >= 2 && tokens[0].eq_ignore_ascii_case("CREATE") && tokens[1].eq_ignore_ascii_case("SCHEMA") {
@@ -2478,20 +3226,26 @@ fn first_sql_tokens(sql: &str, limit: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_sqlserver_unsafe_type_query, capture_sqlserver_messages, format_sqlserver_numeric,
-        is_blocking_sqlserver_unsafe_probe_error, is_sqlserver_spatial_column, is_sqlserver_variant_column,
-        query_result_with_server_messages, requires_simple_query_batch, restore_sqlserver_legacy_probe_output_names,
-        sqlserver_batch_can_use_execute, sqlserver_bulk_token_row, sqlserver_cell_to_json, sqlserver_columns_sql,
-        sqlserver_completion_assistant_sql, sqlserver_dml_output_returns_rows, sqlserver_filter_definition_error,
+        build_sqlserver_unsafe_type_query, capture_sqlserver_messages, completion_context_from_query_result,
+        decode_sqlserver_spatial_values, format_sqlserver_numeric, is_blocking_sqlserver_unsafe_probe_error,
+        is_sqlserver_legacy_duplicate_probe_error, is_sqlserver_spatial_column, is_sqlserver_variant_column,
+        push_sqlserver_ordered_events, query_result_with_server_messages, query_result_with_server_messages_metadata,
+        requires_simple_query_batch, restore_sqlserver_legacy_probe_output_names,
+        restore_sqlserver_spatial_column_types, server_messages_query_result, sqlserver_batch_can_use_execute,
+        sqlserver_bulk_token_row, sqlserver_cell_to_json, sqlserver_columns_sql, sqlserver_completion_assistant_sql,
+        sqlserver_dml_output_returns_rows, sqlserver_done_trace_event, sqlserver_filter_definition_error,
         sqlserver_hidden_schema_names, sqlserver_indexes_sql, sqlserver_legacy_indexes_sql, sqlserver_legacy_probe,
-        sqlserver_legacy_probe_with_nonce, sqlserver_list_objects_sql, sqlserver_list_schemas_sql,
-        sqlserver_list_tables_sql, sqlserver_probe_explicit_alias, sqlserver_schema_name_predicate,
-        sqlserver_table_comment_sql, sqlserver_visible_object_predicate, strip_dbx_sqlserver_row_number_column,
-        SqlServerDescribedColumn, SqlServerProbeOutputNameOverride, SqlServerResultSet,
-        SQLSERVER_RESULT_TYPE_PROBE_SQL,
+        sqlserver_legacy_probe_with_nonce, sqlserver_legacy_wildcard_metadata_query, sqlserver_list_objects_sql,
+        sqlserver_list_schemas_sql, sqlserver_list_tables_sql, sqlserver_probe_explicit_alias,
+        sqlserver_query_messages, sqlserver_schema_name_predicate, sqlserver_spatial_marker,
+        sqlserver_supports_session_database_switch, sqlserver_table_comment_sql, sqlserver_triggers_sql,
+        sqlserver_visible_object_predicate, strip_dbx_sqlserver_row_number_column, SqlServerDescribedColumn,
+        SqlServerProbeOutputNameOverride, SqlServerResultSet, SqlServerSpatialColumn, SqlServerTdsEvent,
+        SQLSERVER_COMPLETION_CONTEXT_SQL, SQLSERVER_RESULT_TYPE_PROBE_SQL,
     };
     use crate::types::{
         CompletionAssistantMatchMode, CompletionAssistantObjectKind, CompletionAssistantRequest, QueryResult,
+        SpatialColumn,
     };
     use chrono::NaiveDate;
     use std::{borrow::Cow, time::Instant};
@@ -2523,6 +3277,8 @@ mod tests {
             columns: vec![],
             column_types: vec![],
             column_sortables: vec![],
+            spatial_columns: vec![],
+            spatial_values: vec![],
             rows: vec![],
             affected_rows: 0,
             execution_time_ms: 1,
@@ -2530,15 +3286,42 @@ mod tests {
             session_id: None,
             has_more: false,
             elasticsearch_raw_body: None,
+            messages: Vec::new(),
         };
         let result = query_result_with_server_messages(empty, vec!["DBCC execution completed".to_string()]);
         assert_eq!(result.columns, vec!["Message"]);
+        assert_eq!(result.column_types, vec!["nvarchar"]);
         assert_eq!(result.rows, vec![vec![serde_json::json!("DBCC execution completed")]]);
+        // The synthesized grid already carries the text; `messages` stays
+        // empty so consumers do not render the same text twice.
+        assert!(result.messages.is_empty());
+
+        let message = query_result_with_server_messages_metadata(
+            QueryResult {
+                columns: vec![],
+                column_types: vec![],
+                column_sortables: vec![],
+                spatial_columns: vec![],
+                spatial_values: vec![],
+                rows: vec![],
+                affected_rows: 0,
+                execution_time_ms: 1,
+                truncated: false,
+                session_id: None,
+                has_more: false,
+                elasticsearch_raw_body: None,
+                messages: Vec::new(),
+            },
+            vec!["PRINT output".to_string()],
+        );
+        assert!(message.server_message);
 
         let select = QueryResult {
             columns: vec!["id".to_string()],
             column_types: vec!["int".to_string()],
             column_sortables: vec![],
+            spatial_columns: vec![],
+            spatial_values: vec![],
             rows: vec![vec![serde_json::json!(1)]],
             affected_rows: 0,
             execution_time_ms: 1,
@@ -2546,10 +3329,186 @@ mod tests {
             session_id: None,
             has_more: false,
             elasticsearch_raw_body: None,
+            messages: Vec::new(),
         };
-        let result = query_result_with_server_messages(select, vec!["informational".to_string()]);
-        assert_eq!(result.columns, vec!["id"]);
-        assert_eq!(result.rows, vec![vec![serde_json::json!(1)]]);
+        let result = query_result_with_server_messages_metadata(select, vec!["informational".to_string()]);
+        assert!(!result.server_message);
+        assert_eq!(result.result.columns, vec!["id"]);
+        assert_eq!(result.result.rows, vec![vec![serde_json::json!(1)]]);
+        // Non-empty results keep their shape but still carry the server messages.
+        assert_eq!(result.result.messages.len(), 1);
+        assert_eq!(result.result.messages[0].severity, "INFO");
+        assert_eq!(result.result.messages[0].message, "informational");
+    }
+
+    #[test]
+    fn sqlserver_done_trace_events_keep_statement_boundaries_and_counts() {
+        assert_eq!(
+            sqlserver_done_trace_event(
+                super::TIBERIUS_DONE_TOKEN_EVENT_LINE,
+                "Done with status BitFlags<DoneStatus>(0b10001, More | Count) (2 rows left)",
+            ),
+            Some(SqlServerTdsEvent::Done(Some(2)))
+        );
+        assert_eq!(
+            sqlserver_done_trace_event(
+                super::TIBERIUS_DONE_IN_PROC_TOKEN_EVENT_LINE,
+                "Done with status BitFlags<DoneStatus>(0b10000, Count)",
+            ),
+            Some(SqlServerTdsEvent::Done(Some(0)))
+        );
+        assert_eq!(
+            sqlserver_done_trace_event(
+                super::TIBERIUS_DONE_PROC_TOKEN_EVENT_LINE,
+                "Done with status BitFlags<DoneStatus>(0b0)",
+            ),
+            None
+        );
+        assert_eq!(
+            sqlserver_done_trace_event(
+                super::TIBERIUS_DONE_TOKEN_EVENT_LINE,
+                "Done with status BitFlags<DoneStatus>(0b1, More)",
+            ),
+            Some(SqlServerTdsEvent::Done(None))
+        );
+    }
+
+    #[test]
+    fn sqlserver_ordered_events_preserve_message_result_and_count_order() {
+        let start = Instant::now();
+        let mut results = Vec::new();
+        let mut current = None;
+
+        push_sqlserver_ordered_events(
+            &mut results,
+            &mut current,
+            vec![SqlServerTdsEvent::Message("before".to_string())],
+            start,
+        );
+        current = Some(SqlServerResultSet {
+            columns: vec!["first".to_string()],
+            column_types: vec!["int".to_string()],
+            rows: vec![vec![serde_json::json!(1)]],
+            truncated: false,
+            remaining_offset: 0,
+        });
+        push_sqlserver_ordered_events(
+            &mut results,
+            &mut current,
+            vec![SqlServerTdsEvent::Done(Some(1)), SqlServerTdsEvent::Message("between".to_string())],
+            start,
+        );
+        current = Some(SqlServerResultSet {
+            columns: vec!["second".to_string()],
+            column_types: vec!["int".to_string()],
+            rows: vec![vec![serde_json::json!(2)]],
+            truncated: false,
+            remaining_offset: 0,
+        });
+        push_sqlserver_ordered_events(
+            &mut results,
+            &mut current,
+            vec![
+                SqlServerTdsEvent::Done(Some(1)),
+                SqlServerTdsEvent::Message("after one".to_string()),
+                SqlServerTdsEvent::Message("after two".to_string()),
+                SqlServerTdsEvent::Done(Some(3)),
+            ],
+            start,
+        );
+
+        assert_eq!(results.len(), 6);
+        assert!(results[0].server_message);
+        assert_eq!(results[0].result.rows, vec![vec![serde_json::json!("before")]]);
+        assert_eq!(results[1].result.columns, vec!["first"]);
+        assert!(results[2].server_message);
+        assert_eq!(results[2].result.rows, vec![vec![serde_json::json!("between")]]);
+        assert_eq!(results[3].result.columns, vec!["second"]);
+        assert!(results[4].server_message);
+        assert_eq!(
+            results[4].result.rows,
+            vec![vec![serde_json::json!("after one")], vec![serde_json::json!("after two")]]
+        );
+        assert_eq!(results[5].result.affected_rows, 3);
+        assert!(!results[5].server_message);
+    }
+
+    #[test]
+    fn sqlserver_ordered_events_drop_select_counts_and_keep_following_dml_counts() {
+        let start = Instant::now();
+        let mut results = Vec::new();
+        let mut current = Some(SqlServerResultSet {
+            columns: vec!["selected".to_string()],
+            column_types: vec!["int".to_string()],
+            rows: vec![vec![serde_json::json!(1)]],
+            truncated: false,
+            remaining_offset: 0,
+        });
+
+        push_sqlserver_ordered_events(
+            &mut results,
+            &mut current,
+            vec![SqlServerTdsEvent::Done(Some(1)), SqlServerTdsEvent::Done(Some(2))],
+            start,
+        );
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].result.columns, vec!["selected"]);
+        assert_eq!(results[1].result.affected_rows, 2);
+    }
+
+    #[test]
+    fn sqlserver_ordered_events_use_no_count_done_to_close_select_result() {
+        let start = Instant::now();
+        let mut results = Vec::new();
+        let mut current = Some(SqlServerResultSet {
+            columns: vec!["selected".to_string()],
+            column_types: vec!["int".to_string()],
+            rows: vec![vec![serde_json::json!(1)]],
+            truncated: false,
+            remaining_offset: 0,
+        });
+
+        push_sqlserver_ordered_events(
+            &mut results,
+            &mut current,
+            vec![SqlServerTdsEvent::Done(None), SqlServerTdsEvent::Done(Some(2))],
+            start,
+        );
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].result.columns, vec!["selected"]);
+        assert_eq!(results[1].result.affected_rows, 2);
+    }
+
+    #[test]
+    fn sqlserver_query_messages_map_info_severity() {
+        let messages = sqlserver_query_messages(&["first".to_string(), "second".to_string()]);
+        assert_eq!(messages.len(), 2);
+        for (message, expected) in messages.iter().zip(["first", "second"]) {
+            assert_eq!(message.severity, "INFO");
+            assert_eq!(message.message, expected);
+            assert!(message.code.is_none());
+            assert!(message.detail.is_none());
+            assert!(message.hint.is_none());
+        }
+
+        assert!(sqlserver_query_messages(&[]).is_empty());
+    }
+
+    #[test]
+    fn sqlserver_server_messages_query_result_synthesizes_grid() {
+        assert!(server_messages_query_result(vec![], Instant::now()).is_none());
+
+        let result = server_messages_query_result(vec!["print output".to_string()], Instant::now())
+            .expect("non-empty messages yield a result");
+        assert!(result.server_message);
+        assert_eq!(result.result.columns, vec!["Message"]);
+        assert_eq!(result.result.column_types, vec!["nvarchar"]);
+        assert_eq!(result.result.rows, vec![vec![serde_json::json!("print output")]]);
+        // The synthesized grid already carries the text; `messages` stays
+        // empty so consumers do not render the same text twice.
+        assert!(result.result.messages.is_empty());
     }
 
     #[test]
@@ -2654,6 +3613,9 @@ mod tests {
     fn sqlserver_module_definitions_require_simple_query_batch() {
         assert!(requires_simple_query_batch("SET SHOWPLAN_XML ON;"));
         assert!(requires_simple_query_batch("SET SHOWPLAN_XML OFF;"));
+        assert!(requires_simple_query_batch("SET STATISTICS XML ON;"));
+        assert!(requires_simple_query_batch("SET STATISTICS XML OFF;"));
+        assert!(!requires_simple_query_batch("SET STATISTICS IO ON;"));
         assert!(requires_simple_query_batch("CREATE SCHEMA [analytics];"));
         assert!(requires_simple_query_batch("CREATE FUNCTION dbo.fn_demo() RETURNS INT AS BEGIN RETURN 1; END;"));
         assert!(requires_simple_query_batch("ALTER PROCEDURE dbo.usp_demo AS SELECT 1;"));
@@ -2685,9 +3647,56 @@ mod tests {
     fn sqlserver_cud_batches_use_execute_for_affected_rows() {
         assert!(sqlserver_batch_can_use_execute("UPDATE dbo.users SET active = 0 WHERE id = 1;"));
         assert!(sqlserver_batch_can_use_execute("INSERT INTO dbo.users(id) VALUES (1);"));
+        assert!(sqlserver_batch_can_use_execute(
+            "INSERT INTO dbo.user_archive(id, name) SELECT id, name FROM dbo.users WHERE active = 0;"
+        ));
+        assert!(sqlserver_batch_can_use_execute(
+            "DECLARE @target TABLE (id INT); INSERT INTO @target(id) SELECT id FROM (VALUES (1), (2), (3)) AS source(id);"
+        ));
+        assert!(!sqlserver_batch_can_use_execute(
+            "INSERT INTO dbo.user_archive(id) SELECT id FROM dbo.users; SELECT COUNT(*) FROM dbo.user_archive;"
+        ));
+        assert!(!sqlserver_batch_can_use_execute(
+            "DECLARE @target TABLE (id INT); INSERT INTO @target(id) VALUES (1); SELECT id FROM @target;"
+        ));
         assert!(sqlserver_batch_can_use_execute("DELETE FROM dbo.users WHERE id = 1;"));
         assert!(sqlserver_batch_can_use_execute(
             "MERGE dbo.t AS t USING dbo.s AS s ON t.id = s.id WHEN MATCHED THEN UPDATE SET name = s.name;"
+        ));
+        assert!(!sqlserver_batch_can_use_execute(
+            "PRINT N'before'; UPDATE dbo.users SET active = 0 WHERE id = 1; PRINT N'after';"
+        ));
+        assert!(!sqlserver_batch_can_use_execute("DBCC CHECKIDENT ('dbo.users', NORESEED);"));
+        assert!(!sqlserver_batch_can_use_execute("RAISERROR(N'progress', 0, 1) WITH NOWAIT;"));
+    }
+
+    #[test]
+    fn sqlserver_balanced_transaction_dml_batches_use_execute_for_affected_rows() {
+        assert!(sqlserver_batch_can_use_execute(
+            "BEGIN TRANSACTION; UPDATE dbo.users SET active = 0 WHERE id = 1; COMMIT TRANSACTION;"
+        ));
+        assert!(sqlserver_batch_can_use_execute(
+            "BEGIN TRAN; UPDATE dbo.users SET active = 0 WHERE id = 1; DELETE dbo.audit WHERE user_id = 1; COMMIT;"
+        ));
+        assert!(sqlserver_batch_can_use_execute(
+            "BEGIN TRAN outer_tx; BEGIN TRAN inner_tx; UPDATE dbo.users SET active = 0; COMMIT TRAN inner_tx; COMMIT TRAN outer_tx;"
+        ));
+
+        assert!(!sqlserver_batch_can_use_execute("BEGIN TRAN; UPDATE dbo.users SET active = 0;"));
+        assert!(!sqlserver_batch_can_use_execute("UPDATE dbo.users SET active = 0; COMMIT TRAN;"));
+        assert!(!sqlserver_batch_can_use_execute("BEGIN TRAN; UPDATE dbo.users SET active = 0; ROLLBACK TRAN;"));
+        assert!(!sqlserver_batch_can_use_execute("BEGIN TRAN; IF @should_commit = 1 COMMIT TRAN;"));
+        assert!(!sqlserver_batch_can_use_execute(
+            "BEGIN TRY; BEGIN TRAN; UPDATE dbo.users SET active = 0; COMMIT TRAN; END TRY; BEGIN CATCH; ROLLBACK TRAN; END CATCH;"
+        ));
+        assert!(!sqlserver_batch_can_use_execute(
+            "BEGIN DISTRIBUTED TRAN; UPDATE dbo.users SET active = 0; COMMIT TRAN;"
+        ));
+        assert!(!sqlserver_batch_can_use_execute(
+            "SET IMPLICIT_TRANSACTIONS ON; UPDATE dbo.users SET active = 0; COMMIT TRAN;"
+        ));
+        assert!(!sqlserver_batch_can_use_execute(
+            "BEGIN TRAN; UPDATE dbo.users SET active = 0; COMMIT TRAN; SELECT 1;"
         ));
     }
 
@@ -2778,6 +3787,9 @@ mod tests {
         assert!(!sqlserver_batch_can_use_execute("EXEC dbo.list_users;"));
         assert!(!sqlserver_batch_can_use_execute("DECLARE @id INT = 1; EXEC dbo.list_users @id;"));
         assert!(!sqlserver_batch_can_use_execute(
+            "SET NOCOUNT OFF; DECLARE @rows TABLE (id INT); INSERT INTO @rows VALUES (1), (2); SELECT id FROM @rows;"
+        ));
+        assert!(!sqlserver_batch_can_use_execute(
             "DECLARE @id INT = 1; CREATE TABLE #t(id INT); INSERT INTO #t VALUES (@id); SELECT id FROM #t;"
         ));
         assert!(!sqlserver_batch_can_use_execute("WITH cte AS (SELECT 1 AS id) SELECT * FROM cte;"));
@@ -2798,6 +3810,48 @@ mod tests {
             "DECLARE @id INT = 1; UPDATE dbo.users SET active = 0 WHERE id = @id;"
         ));
         assert!(sqlserver_dml_output_returns_rows("DELETE FROM dbo.users OUTPUT deleted.id WHERE id = 1;"));
+    }
+
+    #[test]
+    fn sqlserver_dml_output_detection_distinguishes_client_rows_from_output_into() {
+        assert!(sqlserver_dml_output_returns_rows(
+            "INSERT INTO dbo.users(name) OUTPUT inserted.id, inserted.name VALUES (N'Ada')"
+        ));
+        assert!(sqlserver_dml_output_returns_rows("UPDATE dbo.users SET active = 1 OUTPUT inserted.id WHERE id = 1"));
+        assert!(sqlserver_dml_output_returns_rows("DELETE FROM dbo.users OUTPUT deleted.id WHERE id = 1"));
+        assert!(!sqlserver_dml_output_returns_rows(
+            "INSERT INTO dbo.audit OUTPUT inserted.id INTO dbo.audit_ids VALUES (1)"
+        ));
+        assert!(!sqlserver_dml_output_returns_rows(
+            "UPDATE dbo.users SET note = N'OUTPUT inserted.id' WHERE id = 1 -- OUTPUT deleted.id"
+        ));
+        assert!(!sqlserver_dml_output_returns_rows("SELECT N'OUTPUT inserted.id'"));
+    }
+
+    #[test]
+    fn sqlserver_dml_output_uses_the_result_set_execution_path() {
+        let source = include_str!("sqlserver.rs");
+        let execute_query = source.split("pub async fn execute_query_with_max_rows").nth(1).unwrap();
+        let execute_query = execute_query.split("pub async fn execute_batch").next().unwrap();
+
+        assert!(execute_query.contains("sqlserver_dml_output_returns_rows(sql)"));
+        assert!(execute_query.contains("client.query(query.sql.as_str(), &[])"));
+    }
+
+    #[test]
+    fn sqlserver_single_result_entrypoint_keeps_result_returning_batches() {
+        let source = include_str!("sqlserver.rs");
+        let execute_query = source.split("pub async fn execute_query_with_max_rows").nth(1).unwrap();
+        let execute_query = execute_query.split("pub async fn execute_batch").next().unwrap();
+
+        assert!(execute_query.contains("!sqlserver_batch_can_use_execute(sql)"));
+        assert!(execute_query.contains("execute_simple_batch_first_result_with_max_rows(client, sql, max_rows)"));
+        assert!(!execute_query.contains("execute_simple_batch_with_max_rows(client, sql, max_rows)"));
+
+        let first_result = source.split("async fn execute_simple_batch_first_result_with_max_rows").nth(1).unwrap();
+        let first_result = first_result.split("fn strip_dbx_sqlserver_row_number_column").next().unwrap();
+        assert!(first_result.contains("collect_first_result_limited(stream, start, max_rows, result_offset, &[])"));
+        assert!(!first_result.contains("collect_result_sets_limited"));
     }
 
     #[test]
@@ -2829,7 +3883,7 @@ mod tests {
 
         assert!(!sql.contains("STRING_AGG"));
         assert!(sql.contains("FOR XML PATH"));
-        assert!(sql.contains("OBJECT_ID('dbo.DF_Rule')"));
+        assert!(sql.contains("OBJECT_ID(QUOTENAME(N'dbo') + N'.' + QUOTENAME(N'DF_Rule'))"));
     }
 
     #[test]
@@ -2905,6 +3959,17 @@ mod tests {
     }
 
     #[test]
+    fn sqlserver_triggers_sql_includes_definition_for_legacy_versions() {
+        let sql = sqlserver_triggers_sql("d'bo", "t'able");
+
+        assert!(sql.contains("OBJECT_DEFINITION(t.object_id)"));
+        assert!(sql.contains("JOIN sys.trigger_events te ON t.object_id = te.object_id"));
+        assert!(sql.contains("OBJECT_ID('d''bo.t''able')"));
+        assert!(sql.contains("ORDER BY t.name"));
+        assert!(!sql.contains("STRING_AGG"));
+    }
+
+    #[test]
     fn sqlserver_metadata_sql_escapes_literals() {
         let columns_sql = sqlserver_columns_sql("d'bo", "t'able");
         let indexes_sql = sqlserver_indexes_sql("d'bo", "t'able");
@@ -2912,7 +3977,7 @@ mod tests {
         assert!(columns_sql.contains("s.name = N'd''bo'"));
         assert!(columns_sql.contains("o.name = 't''able'"));
         assert!(columns_sql.contains("sys.identity_columns"));
-        assert!(indexes_sql.contains("OBJECT_ID('d''bo.t''able')"));
+        assert!(indexes_sql.contains("OBJECT_ID(QUOTENAME(N'd''bo') + N'.' + QUOTENAME(N't''able'))"));
     }
 
     #[test]
@@ -2924,7 +3989,52 @@ mod tests {
             "s.name = COALESCE((SELECT default_schema.name FROM sys.schemas default_schema WHERE default_schema.name = SCHEMA_NAME()), N'dbo')"
         );
         assert!(sqlserver_list_tables_sql("", None, None, None).contains(&predicate));
-        assert!(sqlserver_columns_sql("\t", "orders").contains(&predicate));
+        assert!(sqlserver_columns_sql("\t", "orders")
+            .contains("s.name = OBJECT_SCHEMA_NAME(OBJECT_ID(QUOTENAME(N'orders')))"),);
+        assert!(sqlserver_indexes_sql("", "orders").contains("OBJECT_ID(QUOTENAME(N'orders'))"));
+    }
+
+    #[test]
+    fn sqlserver_completion_context_uses_the_database_user_default_schema() {
+        assert!(SQLSERVER_COMPLETION_CONTEXT_SQL.contains("SCHEMA_NAME()"));
+        assert!(SQLSERVER_COMPLETION_CONTEXT_SQL.contains("sys.schemas"));
+        assert!(SQLSERVER_COMPLETION_CONTEXT_SQL.contains("N'dbo'"));
+        assert!(SQLSERVER_COMPLETION_CONTEXT_SQL.contains("EngineEdition"));
+    }
+
+    #[test]
+    fn sqlserver_completion_context_disables_use_for_azure_database_endpoints() {
+        assert!(!sqlserver_supports_session_database_switch(5));
+        assert!(!sqlserver_supports_session_database_switch(6));
+        assert!(!sqlserver_supports_session_database_switch(11));
+        assert!(!sqlserver_supports_session_database_switch(12));
+        assert!(!sqlserver_supports_session_database_switch(99));
+        assert!(sqlserver_supports_session_database_switch(3));
+        assert!(sqlserver_supports_session_database_switch(8));
+        assert!(sqlserver_supports_session_database_switch(9));
+    }
+
+    #[test]
+    fn sqlserver_completion_context_parses_agent_query_results() {
+        let context = completion_context_from_query_result(QueryResult {
+            columns: vec!["default_schema".to_string(), "engine_edition".to_string()],
+            column_types: vec![],
+            column_sortables: vec![],
+            spatial_columns: vec![],
+            spatial_values: vec![],
+            rows: vec![vec![serde_json::json!("app_user"), serde_json::json!("8")]],
+            affected_rows: 0,
+            execution_time_ms: 0,
+            truncated: false,
+            session_id: None,
+            has_more: false,
+            elasticsearch_raw_body: None,
+            messages: Vec::new(),
+        })
+        .unwrap();
+
+        assert_eq!(context.default_schema, "app_user");
+        assert!(context.supports_session_database_switch);
     }
 
     #[test]
@@ -3054,6 +4164,8 @@ mod tests {
         assert!(sql.contains("o.name = 'Users'"));
         assert!(sql.contains("LOWER(c.name) LIKE LOWER('%id%') ESCAPE '\\'"));
         assert!(sql.contains("CAST(NULL AS NVARCHAR(MAX)) AS object_comment"));
+        assert!(sql.contains("ORDER BY c.column_id"));
+        assert!(!sql.contains("AS dbx_completion ORDER BY name"));
     }
 
     #[test]
@@ -3253,6 +4365,8 @@ mod tests {
             columns: vec!["id".to_string(), "__dbx_row_num".to_string()],
             column_types: vec!["int".to_string(), "bigint".to_string()],
             column_sortables: vec![],
+            spatial_columns: vec![],
+            spatial_values: vec![],
             rows: vec![vec![serde_json::json!(42), serde_json::json!(101)]],
             affected_rows: 0,
             execution_time_ms: 1,
@@ -3260,6 +4374,7 @@ mod tests {
             session_id: None,
             has_more: false,
             elasticsearch_raw_body: None,
+            messages: Vec::new(),
         };
 
         strip_dbx_sqlserver_row_number_column(&mut result, sql);
@@ -3313,9 +4428,118 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            rewritten,
-            "SELECT [landId] = [dbx_unsafe_source].[dbx_col_1], [polygon] = CASE WHEN [dbx_unsafe_source].[dbx_col_2] IS NULL THEN NULL ELSE [dbx_unsafe_source].[dbx_col_2].STAsText() END FROM (SELECT * FROM dbo.tLandPolygon) AS [dbx_unsafe_source]([dbx_col_1], [dbx_col_2])"
+            rewritten.sql,
+            "SELECT [landId] = [dbx_unsafe_source].[dbx_col_1], [polygon] = CASE WHEN [dbx_unsafe_source].[dbx_col_2] IS NULL THEN NULL ELSE N'SRID=' + CONVERT(nvarchar(20), [dbx_unsafe_source].[dbx_col_2].STSrid) + N';' + [dbx_unsafe_source].[dbx_col_2].AsTextZM() END FROM (SELECT * FROM dbo.tLandPolygon) AS [dbx_unsafe_source]([dbx_col_1], [dbx_col_2])"
         );
+        assert_eq!(
+            rewritten.spatial_columns,
+            vec![SqlServerSpatialColumn { column_index: 1, column_type: "geometry".to_string() }]
+        );
+    }
+
+    #[test]
+    fn sqlserver_spatial_marker_keeps_wkt_and_extracts_srid() {
+        let (value, srid) = sqlserver_spatial_marker(serde_json::json!("SRID=3857;POINT(1 2)"));
+        assert_eq!(value, serde_json::json!("POINT(1 2)"));
+        assert_eq!(srid, Some(3857));
+    }
+
+    #[test]
+    fn sqlserver_spatial_marker_treats_non_positive_srid_as_unknown_without_leaking_ewkt() {
+        for marker in ["SRID=0;POINT(1 2)", "SRID=-1;POINT(1 2)"] {
+            let (value, srid) = sqlserver_spatial_marker(serde_json::json!(marker));
+            assert_eq!(value, serde_json::json!("POINT(1 2)"));
+            assert_eq!(srid, None);
+        }
+    }
+
+    #[test]
+    fn sqlserver_only_decodes_described_spatial_columns() {
+        let mut values = vec![serde_json::json!("SRID=4326;POINT(1 2)"), serde_json::json!("SRID=3857;POINT(3 4)")];
+        let mut srids = Vec::new();
+        let per_cell = decode_sqlserver_spatial_values(
+            &mut values,
+            &[SqlServerSpatialColumn { column_index: 1, column_type: "geography".to_string() }],
+            |column_index, srid| srids.push((column_index, srid)),
+        );
+
+        assert_eq!(values[0], serde_json::json!("SRID=4326;POINT(1 2)"));
+        assert_eq!(values[1], serde_json::json!("POINT(3 4)"));
+        assert_eq!(srids, vec![(1, Some(3857))]);
+        assert_eq!(per_cell, vec![None, Some(3857)]);
+    }
+
+    #[test]
+    fn sqlserver_spatial_values_keep_per_cell_srids_for_multiple_geometry_columns() {
+        // Two geometry columns with different SRIDs in the same row must each
+        // keep their own SRID instead of collapsing to a single column-level one.
+        let mut values = vec![
+            serde_json::json!(1),
+            serde_json::json!("SRID=4326;POINT(1 2)"),
+            serde_json::json!("SRID=3857;POINT(3 4)"),
+        ];
+        let spatial_columns = [
+            SqlServerSpatialColumn { column_index: 1, column_type: "geometry".to_string() },
+            SqlServerSpatialColumn { column_index: 2, column_type: "geometry".to_string() },
+        ];
+        let per_cell = decode_sqlserver_spatial_values(&mut values, &spatial_columns, |_, _| {});
+
+        assert_eq!(values[1], serde_json::json!("POINT(1 2)"));
+        assert_eq!(values[2], serde_json::json!("POINT(3 4)"));
+        assert_eq!(per_cell, vec![None, Some(4326), Some(3857)]);
+    }
+
+    #[test]
+    fn sqlserver_marker_preserves_zm_wkt_and_extracts_srid() {
+        let (value, srid) = sqlserver_spatial_marker(serde_json::json!("SRID=4326;POINT ZM (1 2 3 4)"));
+        assert_eq!(value, serde_json::json!("POINT ZM (1 2 3 4)"));
+        assert_eq!(srid, Some(4326));
+
+        let (line_value, line_srid) =
+            sqlserver_spatial_marker(serde_json::json!("SRID=4326;LINESTRING ZM (1 2 3 4, 5 6 7 8)"));
+        assert_eq!(line_value, serde_json::json!("LINESTRING ZM (1 2 3 4, 5 6 7 8)"));
+        assert_eq!(line_srid, Some(4326));
+    }
+
+    #[test]
+    fn sqlserver_decodes_zm_geometry_for_query_and_export_paths() {
+        // `decode_sqlserver_spatial_values` backs both `collect_first_result_limited`
+        // (query results) and `stream_first_result_set` (export): Z/M values must
+        // survive decoding once the rewrite uses AsTextZM() instead of STAsText().
+        let mut values = vec![
+            serde_json::json!(1),
+            serde_json::json!("SRID=4326;POINT ZM (1 2 3 4)"),
+            serde_json::json!("SRID=4326;LINESTRING ZM (1 2 3 4, 5 6 7 8)"),
+        ];
+        let mut srids = Vec::new();
+        decode_sqlserver_spatial_values(
+            &mut values,
+            &[
+                SqlServerSpatialColumn { column_index: 1, column_type: "geometry".to_string() },
+                SqlServerSpatialColumn { column_index: 2, column_type: "geometry".to_string() },
+            ],
+            |column_index, srid| srids.push((column_index, srid)),
+        );
+
+        assert_eq!(values[1], serde_json::json!("POINT ZM (1 2 3 4)"));
+        assert_eq!(values[2], serde_json::json!("LINESTRING ZM (1 2 3 4, 5 6 7 8)"));
+        assert_eq!(srids, vec![(1, Some(4326)), (2, Some(4326))]);
+    }
+
+    #[test]
+    fn sqlserver_restores_geography_type_even_when_all_values_are_null() {
+        let spatial_columns = vec![SqlServerSpatialColumn { column_index: 1, column_type: "geography".to_string() }];
+        let mut column_types = vec!["int".to_string(), "nvarchar".to_string()];
+        restore_sqlserver_spatial_column_types(&mut column_types, &spatial_columns);
+
+        assert_eq!(column_types, vec!["int", "geography"]);
+        let mut values = vec![serde_json::json!(1), serde_json::Value::Null];
+        let mut srids = Vec::new();
+        decode_sqlserver_spatial_values(&mut values, &spatial_columns, |column_index, srid| {
+            srids.push((column_index, srid));
+        });
+        assert_eq!(srids, vec![(1, None)]);
+        assert_eq!(values[1], serde_json::Value::Null);
     }
 
     #[test]
@@ -3355,11 +4579,161 @@ mod tests {
         )
         .unwrap();
 
-        // ORDER BY is stripped from the inner query so it can be used as a
-        // derived table subquery across all SQL Server versions (2008–2022).
-        assert!(!rewritten.contains("ORDER BY"));
-        assert!(rewritten.contains("FROM dbo.tLandPolygon"));
-        assert!(rewritten.contains(".STAsText()"));
+        // SQL Server rejects ORDER BY inside the derived table subquery, so the
+        // inner statement must stay bare while the outer rewrite re-applies the
+        // original sort so row order survives the wrap.
+        assert!(rewritten.sql.contains("FROM (SELECT landId, polygon FROM dbo.tLandPolygon) AS [dbx_unsafe_source]"));
+        assert!(rewritten.sql.ends_with("ORDER BY [landId] DESC"));
+        assert!(rewritten.sql.contains(".AsTextZM()"));
+    }
+
+    #[test]
+    fn sqlserver_migrates_order_by_ordinals_and_offset_fetch_to_outer_query() {
+        let rewritten = build_sqlserver_unsafe_type_query(
+            "SELECT id, landId, polygon FROM dbo.t ORDER BY 2 DESC, id OFFSET 5 ROWS FETCH NEXT 10 ROWS ONLY",
+            &[
+                SqlServerDescribedColumn {
+                    name: Some("id".to_string()),
+                    system_type_name: Some("int".to_string()),
+                    user_type_schema: None,
+                    user_type_name: None,
+                },
+                SqlServerDescribedColumn {
+                    name: Some("landId".to_string()),
+                    system_type_name: Some("varchar(30)".to_string()),
+                    user_type_schema: None,
+                    user_type_name: None,
+                },
+                SqlServerDescribedColumn {
+                    name: Some("polygon".to_string()),
+                    system_type_name: Some("geometry".to_string()),
+                    user_type_schema: Some("sys".to_string()),
+                    user_type_name: Some("geometry".to_string()),
+                },
+            ],
+        )
+        .unwrap();
+
+        assert!(rewritten.sql.contains("FROM (SELECT id, landId, polygon FROM dbo.t) AS [dbx_unsafe_source]"));
+        assert!(rewritten.sql.ends_with(" ORDER BY [landId] DESC, [id] OFFSET 5 ROWS FETCH NEXT 10 ROWS ONLY"));
+    }
+
+    #[test]
+    fn sqlserver_migrates_qualified_and_bracketed_order_by_columns() {
+        let rewritten = build_sqlserver_unsafe_type_query(
+            "SELECT [id], polygon FROM dbo.t ORDER BY dbo.t.[id] ASC",
+            &[
+                SqlServerDescribedColumn {
+                    name: Some("id".to_string()),
+                    system_type_name: Some("int".to_string()),
+                    user_type_schema: None,
+                    user_type_name: None,
+                },
+                SqlServerDescribedColumn {
+                    name: Some("polygon".to_string()),
+                    system_type_name: Some("geometry".to_string()),
+                    user_type_schema: Some("sys".to_string()),
+                    user_type_name: Some("geometry".to_string()),
+                },
+            ],
+        )
+        .unwrap();
+
+        assert!(rewritten.sql.ends_with(" ORDER BY [id]"));
+    }
+
+    #[test]
+    fn sqlserver_keeps_order_by_inside_for_top_queries_and_reapplies_outside() {
+        // With TOP the ORDER BY also selects which rows TOP returns, so it must
+        // stay inside the derived table (legal there once TOP is present) while
+        // the outer rewrite re-applies it for the guaranteed final order.
+        let rewritten = build_sqlserver_unsafe_type_query(
+            "SELECT TOP 10 id, polygon FROM dbo.t ORDER BY id",
+            &[
+                SqlServerDescribedColumn {
+                    name: Some("id".to_string()),
+                    system_type_name: Some("int".to_string()),
+                    user_type_schema: None,
+                    user_type_name: None,
+                },
+                SqlServerDescribedColumn {
+                    name: Some("polygon".to_string()),
+                    system_type_name: Some("geometry".to_string()),
+                    user_type_schema: Some("sys".to_string()),
+                    user_type_name: Some("geometry".to_string()),
+                },
+            ],
+        )
+        .unwrap();
+
+        assert!(rewritten
+            .sql
+            .contains("FROM (SELECT TOP 10 id, polygon FROM dbo.t ORDER BY id) AS [dbx_unsafe_source]"));
+        assert!(rewritten.sql.ends_with(" ORDER BY [id]"));
+    }
+
+    #[test]
+    fn sqlserver_falls_back_when_order_by_cannot_be_migrated() {
+        // ORDER BY references a column absent from the projection: cannot be
+        // re-applied on the outer query, so the rewrite must be refused rather
+        // than silently dropping order semantics.
+        assert_eq!(
+            build_sqlserver_unsafe_type_query(
+                "SELECT polygon FROM dbo.t ORDER BY landId",
+                &[SqlServerDescribedColumn {
+                    name: Some("polygon".to_string()),
+                    system_type_name: Some("geometry".to_string()),
+                    user_type_schema: Some("sys".to_string()),
+                    user_type_name: Some("geometry".to_string()),
+                }],
+            ),
+            None
+        );
+
+        // Non-trivial ORDER BY expression: cannot be re-applied safely.
+        assert_eq!(
+            build_sqlserver_unsafe_type_query(
+                "SELECT id, polygon FROM dbo.t ORDER BY UPPER(id)",
+                &[
+                    SqlServerDescribedColumn {
+                        name: Some("id".to_string()),
+                        system_type_name: Some("int".to_string()),
+                        user_type_schema: None,
+                        user_type_name: None,
+                    },
+                    SqlServerDescribedColumn {
+                        name: Some("polygon".to_string()),
+                        system_type_name: Some("geometry".to_string()),
+                        user_type_schema: Some("sys".to_string()),
+                        user_type_name: Some("geometry".to_string()),
+                    },
+                ],
+            ),
+            None
+        );
+
+        // ORDER BY targeting a rewritten geometry column would order by the WKT
+        // string instead of the geometry value: refuse rather than change semantics.
+        assert_eq!(
+            build_sqlserver_unsafe_type_query(
+                "SELECT id, polygon FROM dbo.t ORDER BY polygon",
+                &[
+                    SqlServerDescribedColumn {
+                        name: Some("id".to_string()),
+                        system_type_name: Some("int".to_string()),
+                        user_type_schema: None,
+                        user_type_name: None,
+                    },
+                    SqlServerDescribedColumn {
+                        name: Some("polygon".to_string()),
+                        system_type_name: Some("geometry".to_string()),
+                        user_type_schema: Some("sys".to_string()),
+                        user_type_name: Some("geometry".to_string()),
+                    },
+                ],
+            ),
+            None
+        );
     }
 
     #[test]
@@ -3372,6 +4746,7 @@ mod tests {
                 column_types: vec![],
                 rows: vec![],
                 truncated: false,
+                remaining_offset: 0,
             }),
             Instant::now(),
         );
@@ -3386,7 +4761,13 @@ mod tests {
         let mut results = Vec::new();
         super::push_sqlserver_result_set(
             &mut results,
-            Some(SqlServerResultSet { columns: vec![], column_types: vec![], rows: vec![], truncated: false }),
+            Some(SqlServerResultSet {
+                columns: vec![],
+                column_types: vec![],
+                rows: vec![],
+                truncated: false,
+                remaining_offset: 0,
+            }),
             Instant::now(),
         );
 
@@ -3424,6 +4805,33 @@ mod tests {
         assert!(SQLSERVER_RESULT_TYPE_PROBE_SQL.contains("FROM tempdb.sys.columns"));
         assert!(!SQLSERVER_RESULT_TYPE_PROBE_SQL.contains("FMTONLY"));
         assert_eq!(SQLSERVER_RESULT_TYPE_PROBE_SQL.matches("SELECT @dbx_use_describe_dmv").count(), 1);
+    }
+
+    #[test]
+    fn sqlserver_legacy_duplicate_probe_uses_bounded_metadata_recovery() {
+        assert!(is_sqlserver_legacy_duplicate_probe_error(
+            "SQL Server unsafe result type: The column 'usergrp' was specified multiple times for 'dbx_probe_source'."
+        ));
+        assert!(!is_sqlserver_legacy_duplicate_probe_error(
+            "SQL Server unsafe result type: Invalid object name 'missing'."
+        ));
+        let query = sqlserver_legacy_wildcard_metadata_query(
+            "SELECT * FROM dbo.purctl a JOIN dbo.deptctl b ON a.id = b.id JOIN whctl c ON b.id = c.id",
+        )
+        .unwrap();
+        assert_eq!(query.matches("OBJECT_ID").count(), 6);
+        assert_eq!(query.matches("UNION ALL").count(), 2);
+        assert!(query.contains("ORDER BY dbx_source_ordinal, dbx_column_ordinal"));
+        assert!(sqlserver_legacy_wildcard_metadata_query("SELECT a.* FROM dbo.purctl a").is_none());
+    }
+
+    #[test]
+    fn sqlserver_legacy_wildcard_metadata_limits_supported_sources() {
+        assert!(sqlserver_legacy_wildcard_metadata_query("SELECT * FROM #left l JOIN #right r ON l.id = r.id")
+            .unwrap()
+            .contains("tempdb.sys.columns"));
+        assert!(sqlserver_legacy_wildcard_metadata_query("SELECT * FROM (SELECT 1 AS id) x").is_none());
+        assert!(sqlserver_legacy_wildcard_metadata_query("SELECT * FROM db.dbo.t").is_none());
     }
 
     #[test]
@@ -3589,11 +4997,11 @@ mod tests {
         )
         .unwrap();
 
-        assert!(rewritten.contains("CAST("));
-        assert!(rewritten.contains("AS NVARCHAR(MAX))"));
-        assert!(rewritten.contains("FROM sys.extended_properties"));
+        assert!(rewritten.sql.contains("CAST("));
+        assert!(rewritten.sql.contains("AS NVARCHAR(MAX))"));
+        assert!(rewritten.sql.contains("FROM sys.extended_properties"));
         // The name column should not be cast
-        assert_eq!(rewritten.matches("CAST(").count(), 1);
+        assert_eq!(rewritten.sql.matches("CAST(").count(), 1);
     }
 
     #[test]
@@ -3639,10 +5047,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(rewritten.contains(".STAsText()"));
-        assert!(rewritten.contains("CAST("));
-        assert!(rewritten.contains("AS NVARCHAR(MAX))"));
-        assert!(rewritten.contains("FROM dbo.t"));
+        assert!(rewritten.sql.contains(".AsTextZM()"));
+        assert!(rewritten.sql.contains("CAST("));
+        assert!(rewritten.sql.contains("AS NVARCHAR(MAX))"));
+        assert!(rewritten.sql.contains("FROM dbo.t"));
     }
 
     #[tokio::test]
@@ -3662,11 +5070,14 @@ mod tests {
 
         let setup = "\
             IF OBJECT_ID('tempdb..#dbx_issue_4002') IS NOT NULL DROP TABLE #dbx_issue_4002; \
+            IF OBJECT_ID('tempdb..#dbx_issue_5606_extra') IS NOT NULL DROP TABLE #dbx_issue_5606_extra; \
             CREATE TABLE #dbx_issue_4002 (\
                 id int NOT NULL, ybbz int NULL, cytzrq date NULL, jzrq datetime NULL, payload sql_variant NULL\
             ); \
+            CREATE TABLE #dbx_issue_5606_extra (id int NOT NULL); \
             INSERT INTO #dbx_issue_4002 (id, ybbz, cytzrq, jzrq, payload) \
-            VALUES (1, 2, '2026-07-28', '2026-07-28T12:34:56', CAST(N'legacy' AS nvarchar(20)))";
+            VALUES (1, 2, '2026-07-28', '2026-07-28T12:34:56', CAST(N'legacy' AS nvarchar(20))); \
+            INSERT INTO #dbx_issue_5606_extra VALUES (2)";
         client.simple_query(setup).await.unwrap().into_results().await.unwrap();
 
         let sql = "SELECT id, payload FROM #dbx_issue_4002";
@@ -3684,7 +5095,7 @@ mod tests {
         assert!(is_sqlserver_variant_column(&legacy_columns[1]));
 
         let rewritten = build_sqlserver_unsafe_type_query(sql, &legacy_columns).unwrap();
-        let legacy_rows = client.query(rewritten, &[]).await.unwrap().into_first_result().await.unwrap();
+        let legacy_rows = client.query(rewritten.sql.as_str(), &[]).await.unwrap().into_first_result().await.unwrap();
         assert_eq!(legacy_rows[0].get::<i32, _>(0), Some(1));
         assert_eq!(legacy_rows[0].get::<&str, _>(1), Some("legacy"));
 
@@ -3705,7 +5116,8 @@ mod tests {
         assert!(is_sqlserver_variant_column(&duplicate_columns[1]));
 
         let duplicate_rewritten = build_sqlserver_unsafe_type_query(duplicate_sql, &duplicate_columns).unwrap();
-        let duplicate_rows = client.query(duplicate_rewritten, &[]).await.unwrap().into_first_result().await.unwrap();
+        let duplicate_rows =
+            client.query(duplicate_rewritten.sql.as_str(), &[]).await.unwrap().into_first_result().await.unwrap();
         assert_eq!(duplicate_rows[0].columns()[0].name(), "HJRQ");
         assert_eq!(duplicate_rows[0].columns()[1].name(), "HJRQ");
         assert_eq!(duplicate_rows[0].get::<i32, _>(0), Some(1));
@@ -3738,15 +5150,256 @@ mod tests {
         assert!(is_sqlserver_variant_column(&wildcard_columns[7]));
 
         let wildcard_rewritten = build_sqlserver_unsafe_type_query(wildcard_sql, &wildcard_columns).unwrap();
-        let wildcard_rows = client.query(wildcard_rewritten, &[]).await.unwrap().into_first_result().await.unwrap();
+        let wildcard_rows =
+            client.query(wildcard_rewritten.sql.as_str(), &[]).await.unwrap().into_first_result().await.unwrap();
         assert_eq!(wildcard_rows.len(), 1);
         assert_eq!(wildcard_rows[0].columns()[0].name(), "ybbz");
         assert_eq!(wildcard_rows[0].columns()[4].name(), "ybbz");
         assert_eq!(wildcard_rows[0].get::<&str, _>(7), Some("legacy"));
 
+        let issue_setup = "\
+            CREATE TABLE #purctl (Ref_id nvarchar(32) NOT NULL, Vnd_id nvarchar(32) NULL, usergrp nvarchar(32) NULL); \
+            CREATE TABLE #deptctl (tvnd_id nvarchar(32) NULL, usergrp nvarchar(32) NULL); \
+            CREATE TABLE #whctl (stru_id nvarchar(32) NULL, usergrp nvarchar(32) NULL); \
+            INSERT INTO #purctl VALUES (N'RPM012608060005', N'V1', N'P'); \
+            INSERT INTO #deptctl VALUES (N'V1', N'W1'); \
+            INSERT INTO #whctl VALUES (N'W1', N'W')";
+        client.simple_query(issue_setup).await.unwrap().into_results().await.unwrap();
+        let issue_sql = "\
+            SELECT * FROM #purctl a \
+            JOIN #deptctl b ON COALESCE(a.Vnd_id, N'') = COALESCE(b.tvnd_id, N'') \
+            JOIN #whctl c ON b.usergrp = c.stru_id \
+            WHERE a.Ref_id = N'RPM012608060005'";
+        let issue_probe = super::sqlserver_legacy_probe(issue_sql).unwrap();
+        let issue_columns =
+            super::describe_sqlserver_result_set_with_mode(&mut client, issue_sql, &issue_probe, true).await.unwrap();
+        assert_eq!(issue_columns.len(), 7);
+        assert_eq!(issue_columns.iter().filter(|column| column.name.as_deref() == Some("usergrp")).count(), 3);
+        assert!(build_sqlserver_unsafe_type_query(issue_sql, &issue_columns).is_none());
+        let issue_rows = client.query(issue_sql, &[]).await.unwrap().into_first_result().await.unwrap();
+        assert_eq!(issue_rows.len(), 1);
+
+        let pure_wildcard_variant_sql = "SELECT * FROM #dbx_issue_4002 AS a CROSS JOIN #dbx_issue_5606_extra AS b";
+        let pure_wildcard_variant_probe = super::sqlserver_legacy_probe(pure_wildcard_variant_sql).unwrap();
+        let pure_wildcard_variant_columns = super::describe_sqlserver_result_set_with_mode(
+            &mut client,
+            pure_wildcard_variant_sql,
+            &pure_wildcard_variant_probe,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(pure_wildcard_variant_columns.len(), 6);
+        assert!(is_sqlserver_variant_column(&pure_wildcard_variant_columns[4]));
+        let pure_wildcard_variant_rewritten =
+            build_sqlserver_unsafe_type_query(pure_wildcard_variant_sql, &pure_wildcard_variant_columns).unwrap();
+        let pure_wildcard_variant_rows = client
+            .query(pure_wildcard_variant_rewritten.sql.as_str(), &[])
+            .await
+            .unwrap()
+            .into_first_result()
+            .await
+            .unwrap();
+        assert_eq!(pure_wildcard_variant_rows[0].columns()[0].name(), "id");
+        assert_eq!(pure_wildcard_variant_rows[0].columns()[5].name(), "id");
+        assert_eq!(pure_wildcard_variant_rows[0].get::<&str, _>(4), Some("legacy"));
+
         let continued = super::execute_query(&mut client, "SELECT CAST(7 AS int) AS still_connected").await.unwrap();
         assert_eq!(continued.rows, vec![vec![serde_json::json!(7)]]);
 
-        client.simple_query("DROP TABLE #dbx_issue_4002").await.unwrap().into_results().await.unwrap();
+        client
+            .simple_query(
+                "DROP TABLE #purctl; DROP TABLE #deptctl; DROP TABLE #whctl; \
+                 DROP TABLE #dbx_issue_5606_extra; DROP TABLE #dbx_issue_4002",
+            )
+            .await
+            .unwrap()
+            .into_results()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DBX_LIVE_SQLSERVER_HOST/PORT/USER/PASSWORD"]
+    async fn live_sqlserver_point_zm_query_and_export_preserve_z_and_m() {
+        let host = std::env::var("DBX_LIVE_SQLSERVER_HOST").expect("DBX_LIVE_SQLSERVER_HOST");
+        let port = std::env::var("DBX_LIVE_SQLSERVER_PORT")
+            .expect("DBX_LIVE_SQLSERVER_PORT")
+            .parse::<u16>()
+            .expect("valid DBX_LIVE_SQLSERVER_PORT");
+        let user = std::env::var("DBX_LIVE_SQLSERVER_USER").expect("DBX_LIVE_SQLSERVER_USER");
+        let password = std::env::var("DBX_LIVE_SQLSERVER_PASSWORD").expect("DBX_LIVE_SQLSERVER_PASSWORD");
+
+        let mut client =
+            super::connect(&host, port, &user, &password, Some("tempdb"), None, std::time::Duration::from_secs(10))
+                .await
+                .unwrap();
+
+        let setup = "\
+            IF OBJECT_ID('tempdb..#dbx_point_zm') IS NOT NULL DROP TABLE #dbx_point_zm; \
+            CREATE TABLE #dbx_point_zm (id int NOT NULL, geom geometry NOT NULL); \
+            INSERT INTO #dbx_point_zm (id, geom) VALUES \
+            (1, geometry::STGeomFromText('POINT (1 2 3 4)', 4326)), \
+            (2, geometry::STGeomFromText('LINESTRING ZM (1 2 3 4, 5 6 7 8)', 4326))";
+        client.simple_query(setup).await.unwrap().into_results().await.unwrap();
+
+        // Query path: the rewrite must use AsTextZM() so Z/M survive STAsText's 2D-only output.
+        let sql = "SELECT id, geom FROM #dbx_point_zm ORDER BY id";
+        let result = super::execute_query(&mut client, sql).await.unwrap();
+        assert_eq!(result.rows.len(), 2);
+        let mut point_wkt: Option<&str> = None;
+        let mut line_wkt: Option<&str> = None;
+        for row in &result.rows {
+            let wkt = row[1].as_str().expect("geometry cell decodes to WKT string");
+            if wkt.starts_with("POINT") {
+                point_wkt = Some(wkt);
+            } else if wkt.starts_with("LINESTRING") {
+                line_wkt = Some(wkt);
+            }
+        }
+        let point_wkt = point_wkt.expect("POINT row present");
+        assert!(point_wkt.contains("1 2 3 4"), "POINT must retain Z/M via AsTextZM, got: {point_wkt}");
+        let line_wkt = line_wkt.expect("LINESTRING row present");
+        assert!(
+            line_wkt.contains("1 2 3 4") && line_wkt.contains("5 6 7 8"),
+            "LINESTRING must retain Z/M via AsTextZM, got: {line_wkt}"
+        );
+        assert_eq!(result.spatial_columns, vec![SpatialColumn { column_index: 1, srid: Some(4326) }]);
+
+        // Export path: stream_first_result_set decodes the same AsTextZM() markers.
+        let mut exported = Vec::new();
+        let summary = super::stream_first_result_set(&mut client, sql, Some(10), None, |item| {
+            if let super::SqlServerStreamItem::Row(values) = item {
+                exported.push(values.to_vec());
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(summary.rows_exported, 2);
+        let exported_point = exported.iter().find_map(|row| row[1].as_str().filter(|wkt| wkt.starts_with("POINT")));
+        let exported_point = exported_point.expect("exported POINT row present");
+        assert!(
+            exported_point.contains("1 2 3 4"),
+            "exported POINT must retain Z/M via AsTextZM, got: {exported_point}"
+        );
+
+        client.simple_query("DROP TABLE #dbx_point_zm").await.unwrap().into_results().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DBX_LIVE_SQLSERVER_HOST/PORT/USER/PASSWORD"]
+    async fn live_sqlserver_geometry_order_and_pagination_are_preserved() {
+        let host = std::env::var("DBX_LIVE_SQLSERVER_HOST").expect("DBX_LIVE_SQLSERVER_HOST");
+        let port = std::env::var("DBX_LIVE_SQLSERVER_PORT")
+            .expect("DBX_LIVE_SQLSERVER_PORT")
+            .parse::<u16>()
+            .expect("valid DBX_LIVE_SQLSERVER_PORT");
+        let user = std::env::var("DBX_LIVE_SQLSERVER_USER").expect("DBX_LIVE_SQLSERVER_USER");
+        let password = std::env::var("DBX_LIVE_SQLSERVER_PASSWORD").expect("DBX_LIVE_SQLSERVER_PASSWORD");
+
+        let mut client =
+            super::connect(&host, port, &user, &password, Some("tempdb"), None, std::time::Duration::from_secs(10))
+                .await
+                .unwrap();
+
+        let setup = "\
+            IF OBJECT_ID('tempdb..#dbx_geometry_order') IS NOT NULL DROP TABLE #dbx_geometry_order; \
+            CREATE TABLE #dbx_geometry_order (id int NOT NULL, name varchar(20) NOT NULL, geom geometry NOT NULL); \
+            INSERT INTO #dbx_geometry_order (id, name, geom) VALUES \
+            (3, 'c', geometry::STGeomFromText('POINT (3 3)', 4326)), \
+            (1, 'a', geometry::STGeomFromText('POINT (1 1)', 4326)), \
+            (2, 'b', geometry::STGeomFromText('POINT (2 2)', 4326))";
+        client.simple_query(setup).await.unwrap().into_results().await.unwrap();
+
+        let ids = |result: &crate::types::QueryResult| -> Vec<i64> {
+            result.rows.iter().map(|row| row[0].as_i64().expect("id cell is an integer")).collect()
+        };
+
+        // The derived-table rewrite must not lose ORDER BY: rows come back in id
+        // order even though the table was inserted out of order.
+        let ordered = super::execute_query(&mut client, "SELECT id, name, geom FROM #dbx_geometry_order ORDER BY id")
+            .await
+            .unwrap();
+        assert_eq!(ids(&ordered), vec![1, 2, 3]);
+
+        // OFFSET/FETCH pagination must survive the rewrite: second page = id 2.
+        let page = super::execute_query(
+            &mut client,
+            "SELECT id, name, geom FROM #dbx_geometry_order ORDER BY id OFFSET 1 ROWS FETCH NEXT 1 ROWS ONLY",
+        )
+        .await
+        .unwrap();
+        assert_eq!(ids(&page), vec![2]);
+
+        // A page past the end returns no rows, not the whole table.
+        let beyond = super::execute_query(
+            &mut client,
+            "SELECT id, name, geom FROM #dbx_geometry_order ORDER BY id OFFSET 10 ROWS",
+        )
+        .await
+        .unwrap();
+        assert!(beyond.rows.is_empty());
+
+        // DESC ordering is preserved too.
+        let descending =
+            super::execute_query(&mut client, "SELECT id, name, geom FROM #dbx_geometry_order ORDER BY id DESC")
+                .await
+                .unwrap();
+        assert_eq!(ids(&descending), vec![3, 2, 1]);
+
+        // TOP + ORDER BY keeps the sort inside the derived table (it drives row
+        // selection) and re-applies it outside for the guaranteed final order.
+        let top = super::execute_query(&mut client, "SELECT TOP 2 id, name, geom FROM #dbx_geometry_order ORDER BY id")
+            .await
+            .unwrap();
+        assert_eq!(ids(&top), vec![1, 2]);
+
+        client.simple_query("DROP TABLE #dbx_geometry_order").await.unwrap().into_results().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DBX_LIVE_SQLSERVER_HOST/PORT/USER/PASSWORD"]
+    async fn live_sqlserver_mixed_srid_columns_keep_per_cell_srids() {
+        let host = std::env::var("DBX_LIVE_SQLSERVER_HOST").expect("DBX_LIVE_SQLSERVER_HOST");
+        let port = std::env::var("DBX_LIVE_SQLSERVER_PORT")
+            .expect("DBX_LIVE_SQLSERVER_PORT")
+            .parse::<u16>()
+            .expect("valid DBX_LIVE_SQLSERVER_PORT");
+        let user = std::env::var("DBX_LIVE_SQLSERVER_USER").expect("DBX_LIVE_SQLSERVER_USER");
+        let password = std::env::var("DBX_LIVE_SQLSERVER_PASSWORD").expect("DBX_LIVE_SQLSERVER_PASSWORD");
+
+        let mut client =
+            super::connect(&host, port, &user, &password, Some("tempdb"), None, std::time::Duration::from_secs(10))
+                .await
+                .unwrap();
+
+        let setup = "\
+            IF OBJECT_ID('tempdb..#dbx_mixed_srid') IS NOT NULL DROP TABLE #dbx_mixed_srid; \
+            CREATE TABLE #dbx_mixed_srid (id int NOT NULL, geom_a geometry NOT NULL, geom_b geometry NOT NULL); \
+            INSERT INTO #dbx_mixed_srid (id, geom_a, geom_b) VALUES \
+            (1, geometry::STGeomFromText('POINT (1 1)', 4326), geometry::STGeomFromText('POINT (11 11)', 3857)), \
+            (2, geometry::STGeomFromText('POINT (2 2)', 3857), geometry::STGeomFromText('POINT (12 12)', 4326))";
+        client.simple_query(setup).await.unwrap().into_results().await.unwrap();
+
+        let result = super::execute_query(&mut client, "SELECT id, geom_a, geom_b FROM #dbx_mixed_srid ORDER BY id")
+            .await
+            .unwrap();
+        // Every cell keeps its own SRID: row 1 is (4326, 3857), row 2 is (3857,
+        // 4326) — the same column mixes SRIDs across rows without collapsing.
+        assert_eq!(
+            result.spatial_values,
+            vec![vec![None, Some(4326), Some(3857)], vec![None, Some(3857), Some(4326)],]
+        );
+        // The column-level hint still reports the first non-null SRID per column.
+        assert_eq!(
+            result.spatial_columns,
+            vec![
+                SpatialColumn { column_index: 1, srid: Some(4326) },
+                SpatialColumn { column_index: 2, srid: Some(3857) },
+            ]
+        );
+
+        client.simple_query("DROP TABLE #dbx_mixed_srid").await.unwrap().into_results().await.unwrap();
     }
 }

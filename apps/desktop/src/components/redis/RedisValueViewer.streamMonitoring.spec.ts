@@ -37,6 +37,11 @@ vi.mock("@/lib/common/shikiJsonHighlighter", () => ({
   createShikiJsonHighlighter: vi.fn().mockResolvedValue(() => ""),
 }));
 
+vi.mock("@/lib/redis/redisCompression", () => ({
+  decompressRedisValue: vi.fn().mockResolvedValue({ ok: false, reason: "corrupt" }),
+  isGzipMagic: vi.fn().mockReturnValue(false),
+}));
+
 vi.mock("vue-virtual-scroller", async () => {
   const { defineComponent, h } = await import("vue");
   const DynamicScroller = defineComponent({
@@ -51,8 +56,13 @@ vi.mock("vue-virtual-scroller", async () => {
     },
   });
   const RecycleScroller = defineComponent({
-    setup(_, { slots }) {
-      return () => h("div", slots.default?.());
+    props: { items: { type: Array, default: () => [] } },
+    setup(props, { slots }) {
+      return () =>
+        h(
+          "div",
+          (props.items as unknown[]).flatMap((item, index) => slots.default?.({ item, index }) ?? []),
+        );
     },
   });
 
@@ -96,8 +106,22 @@ function streamValue(entries = [] as ReturnType<typeof streamEntry>[], nextCurso
   };
 }
 
-function blob(raw_base64: string) {
-  return { raw_base64, encoding: "utf8" as const };
+function blob(raw_base64: string, encoding: "utf8" | "binary" = "utf8") {
+  return { raw_base64, encoding };
+}
+
+function zsetValue() {
+  return {
+    key_display: "scores",
+    key_raw: "c2NvcmVz",
+    ttl: -1,
+    redis_type: "zset",
+    data: {
+      kind: "zset" as const,
+      items: [{ score: "1", member: blob("AP8=", "binary") }],
+      total: 1,
+    },
+  };
 }
 
 function deferred<T>() {
@@ -157,6 +181,11 @@ function mountViewer() {
 
 function openGroups(host: HTMLElement) {
   host.querySelector<HTMLButtonElement>("[data-redis-stream-groups-tab]")!.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, button: 0 }));
+}
+
+async function refreshValue(host: HTMLElement) {
+  host.querySelector<HTMLButtonElement>("[data-redis-value-refresh]")!.click();
+  await settle();
 }
 
 describe("RedisValueViewer stream monitoring", () => {
@@ -347,8 +376,7 @@ describe("RedisValueViewer stream monitoring", () => {
     host.querySelector<HTMLButtonElement>("[data-redis-stream-consumer-row]")!.click();
     await settle();
 
-    host.querySelector<HTMLButtonElement>("[data-redis-value-refresh]")!.click();
-    await settle();
+    await refreshValue(host);
 
     expect(mocks.redisGetValue).toHaveBeenCalledTimes(2);
     expect(mocks.redisGetStreamGroups).toHaveBeenCalledTimes(2);
@@ -372,8 +400,7 @@ describe("RedisValueViewer stream monitoring", () => {
     host.querySelector<HTMLButtonElement>("[data-redis-stream-consumer-row]")!.click();
     await settle();
 
-    host.querySelector<HTMLButtonElement>("[data-redis-value-refresh]")!.click();
-    await settle();
+    await refreshValue(host);
 
     expect(mocks.redisGetStreamConsumers).toHaveBeenCalledTimes(2);
     expect(host.querySelector("[data-redis-stream-consumer-crumb]")).toBeNull();
@@ -399,8 +426,7 @@ describe("RedisValueViewer stream monitoring", () => {
     host.querySelector<HTMLElement>("[data-redis-stream-group-row]")!.click();
     await settle();
 
-    host.querySelector<HTMLButtonElement>("[data-redis-value-refresh]")!.click();
-    await settle();
+    await refreshValue(host);
 
     expect(mocks.redisGetStreamGroups).toHaveBeenCalledTimes(2);
     expect(host.querySelector("[data-redis-stream-group-detail]")).toBeNull();
@@ -439,5 +465,23 @@ describe("RedisValueViewer stream monitoring", () => {
 
     expect(mocks.redisGetStreamPending).toHaveBeenCalledTimes(2);
     expect(host.querySelector("[data-redis-stream-pending]")?.textContent).toContain("1714470000000-0");
+  });
+});
+
+describe("RedisValueViewer ZSet member details", () => {
+  it("opens the full detail dialog for a binary ZSet member", async () => {
+    mocks.redisGetValue.mockResolvedValue(zsetValue());
+    const host = mountViewer();
+    await settle();
+
+    const viewMember = host.querySelector<HTMLButtonElement>("[data-redis-zset-view-member]");
+    expect(viewMember).not.toBeNull();
+
+    viewMember!.click();
+    await settle();
+
+    const detail = document.querySelector<HTMLElement>("[data-redis-member-detail]");
+    expect(detail).not.toBeNull();
+    expect(detail!.textContent).toContain("Base64");
   });
 });

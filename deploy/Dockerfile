@@ -34,7 +34,9 @@ COPY crates/dbx-web/Cargo.toml crates/dbx-web/
 COPY crates/dbx-mcp/Cargo.toml crates/dbx-mcp/
 COPY crates/dbx-cli/Cargo.toml crates/dbx-cli/
 COPY src-tauri/Cargo.toml src-tauri/
-COPY vendor/ctor/ vendor/ctor/
+# Copy every vendored crate: root Cargo.toml [patch.crates-io] points at
+# vendor/{ctor,rumqttc,dirs-sys,pageant,wry}; omitting any breaks the offline build.
+COPY vendor/ vendor/
 RUN mkdir -p crates/dbx-core/src && echo '' > crates/dbx-core/src/lib.rs \
     && mkdir -p crates/dbx-web/src && echo 'fn main() {}' > crates/dbx-web/src/main.rs \
     && mkdir -p crates/dbx-mcp/src && echo '' > crates/dbx-mcp/src/lib.rs && echo 'fn main() {}' > crates/dbx-mcp/src/main.rs \
@@ -86,10 +88,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-dejavu-core \
     libfreetype6 \
     libssl3 \
+    openjdk-17-jre-headless \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=backend /out/${TARGETPLATFORM}/dbx-web /usr/local/bin/
 COPY --from=frontend /app/dist /app/static
 ENV DBX_STATIC_DIR=/app/static
 ENV DBX_DATA_DIR=/app/data
+ENV DBX_JAVA_BIN=/usr/bin/java
 EXPOSE 4224
 CMD ["dbx-web"]

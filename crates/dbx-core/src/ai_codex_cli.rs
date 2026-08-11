@@ -25,8 +25,11 @@ const DEFAULT_CODEX_MODELS: &[&str] = &["default", "gpt-5.5", "gpt-5.4-mini"];
 const CODEX_MODEL_SUCCESS_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const CODEX_MODEL_COMPATIBILITY_CACHE_TTL: Duration = Duration::from_secs(30);
 const CODEX_MODEL_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(10);
-const CODEX_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
-const CODEX_MODEL_COMPATIBILITY_TIMEOUT: Duration = Duration::from_secs(2);
+// Codex app-server and npm-installed CLI can take several seconds to cold-start,
+// especially on Windows. Keep discovery bounded while allowing capability metadata
+// to be returned before falling back to the static catalog.
+const CODEX_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
+const CODEX_MODEL_COMPATIBILITY_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(not(windows))]
 const CODEX_PATH_MARKER: &str = "__DBX_CODEX_PATH__";
 
@@ -970,6 +973,7 @@ pub async fn run_codex_agent(
         CliAgentProcessSpec {
             command,
             env,
+            env_remove: Vec::new(),
             current_dir: None,
             stdin: Some(prompt.to_string()),
             dialect: CliAgentJsonlDialect::CodexExec,
@@ -984,6 +988,7 @@ pub async fn run_codex_agent(
 
 #[cfg(test)]
 mod tests {
+    use super::codex_process_env_with_system_proxy;
     #[cfg(not(windows))]
     use super::shell_quote;
     use super::{
@@ -996,7 +1001,7 @@ mod tests {
         DEFAULT_CODEX_MODELS,
     };
     #[cfg(not(windows))]
-    use super::{codex_process_env, codex_process_env_with_system_proxy, common_executable_dirs, merged_path_with_dir};
+    use super::{codex_process_env, common_executable_dirs, merged_path_with_dir};
     #[cfg(windows)]
     use super::{
         direct_program_path, first_windows_program_path, program_path_candidates, resolve_codex_command,
@@ -1036,6 +1041,14 @@ mod tests {
             claude_code_cli_env: Default::default(),
             pi_agent_cli_path: None,
             pi_agent_cli_env: Default::default(),
+            opencode_cli_path: None,
+            opencode_cli_env: Default::default(),
+            cursor_cli_path: None,
+            cursor_cli_env: Default::default(),
+            grok_cli_path: None,
+            grok_cli_env: Default::default(),
+            codebuddy_cli_path: None,
+            codebuddy_cli_env: Default::default(),
         }
     }
 
@@ -1044,6 +1057,7 @@ mod tests {
             connection_id: "conn-1".to_string(),
             connection_name: "local".to_string(),
             database: "demo".to_string(),
+            schema: None,
             agent_mode: true,
             allow_writes: false,
             allow_dangerous: false,
@@ -1503,8 +1517,8 @@ mod tests {
 
     #[test]
     fn model_cache_uses_bounded_success_fallback_and_negative_ttls() {
-        assert_eq!(CODEX_MODEL_DISCOVERY_TIMEOUT, Duration::from_secs(3));
-        assert_eq!(CODEX_MODEL_COMPATIBILITY_TIMEOUT, Duration::from_secs(2));
+        assert_eq!(CODEX_MODEL_DISCOVERY_TIMEOUT, Duration::from_secs(15));
+        assert_eq!(CODEX_MODEL_COMPATIBILITY_TIMEOUT, Duration::from_secs(10));
         assert_eq!(CODEX_MODEL_SUCCESS_CACHE_TTL, Duration::from_secs(5 * 60));
         assert_eq!(CODEX_MODEL_COMPATIBILITY_CACHE_TTL, Duration::from_secs(30));
         assert_eq!(CODEX_MODEL_NEGATIVE_CACHE_TTL, Duration::from_secs(10));

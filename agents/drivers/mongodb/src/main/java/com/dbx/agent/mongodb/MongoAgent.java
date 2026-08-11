@@ -3,6 +3,7 @@ package com.dbx.agent.mongodb;
 import com.dbx.agent.AgentProtocol;
 import com.dbx.agent.IndexInfo;
 import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonNull;
@@ -12,15 +13,26 @@ import com.mongodb.ConnectionString;
 import com.mongodb.MongoCredential;
 import com.mongodb.MongoClientSettings;
 import com.mongodb.ServerAddress;
+import com.mongodb.client.AggregateIterable;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
+import com.mongodb.client.MongoCursor;
+import com.mongodb.client.MongoDatabase;
+import com.mongodb.client.model.Collation;
+import com.mongodb.client.model.CollationAlternate;
+import com.mongodb.client.model.CollationCaseFirst;
+import com.mongodb.client.model.CollationMaxVariable;
+import com.mongodb.client.model.CollationStrength;
+import com.mongodb.client.model.CountOptions;
+import com.mongodb.client.model.InsertManyOptions;
 import com.mongodb.client.model.UpdateOptions;
 import com.mongodb.client.result.UpdateResult;
 import java.io.BufferedReader;
 import java.io.FileInputStream;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.math.BigDecimal;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -48,6 +60,8 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 import javax.net.ssl.KeyManager;
 import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
@@ -56,16 +70,19 @@ import javax.net.ssl.TrustManagerFactory;
 import org.bson.Document;
 import org.bson.json.JsonMode;
 import org.bson.json.JsonWriterSettings;
+import org.bson.types.Decimal128;
 import org.bson.types.ObjectId;
 
 public final class MongoAgent {
-    private static final Gson GSON = new Gson();
+    private static final Gson GSON = new GsonBuilder().serializeNulls().create();
     private static final DateTimeFormatter DATE_FORMAT = DateTimeFormatter.ISO_INSTANT.withZone(ZoneOffset.UTC);
     private static final long JS_MAX_SAFE_INTEGER = 9_007_199_254_740_991L;
     private static final JsonWriterSettings EXTENDED_JSON_SETTINGS = JsonWriterSettings.builder()
         .outputMode(JsonMode.RELAXED)
         .build();
     private static final String LEGACY_SESSION_ID = "__legacy__";
+    private static final String DEFAULT_ID_INDEX_NAME = "_id_";
+    private static final int CLONE_INSERT_BATCH_SIZE = 1_000;
     private static final int MAX_SESSIONS = 256;
     private static final ThreadLocal<MongoClient> CURRENT_CLIENT = new ThreadLocal<>();
     private static MongoClient legacyClient;
@@ -321,11 +338,51 @@ public final class MongoAgent {
     private static Object listCollections(JsonObject params) {
         MongoClient c = requireClient();
         String database = params.get("database").getAsString();
+        List<Document> specifications = collectionSpecifications(c.getDatabase(database));
+        boolean includeTypes = params.has("include_types")
+            && !params.get("include_types").isJsonNull()
+            && params.get("include_types").getAsBoolean();
+        // Older DBX clients expect a simple string array. Opt into collection
+        // metadata so this RPC remains compatible with already-installed agents.
+        if (includeTypes) {
+            List<Map<String, String>> result = new ArrayList<>();
+            for (Document spec : specifications) {
+                String name = spec.getString("name");
+                // Collection identifiers are passed through verbatim elsewhere;
+                // only an impossible empty listCollections name is discarded.
+                if (name == null || name.isEmpty()) {
+                    continue;
+                }
+                result.add(collectionSpec(name, spec.getString("type")));
+            }
+            return result;
+        }
+
         List<String> result = new ArrayList<>();
-        for (String name : c.getDatabase(database).listCollectionNames()) {
-            result.add(name);
+        for (Document specification : specifications) {
+            String name = specification.getString("name");
+            if (name != null && !name.isEmpty()) {
+                result.add(name);
+            }
         }
         return result;
+    }
+
+    static Map<String, String> collectionSpec(String name, String type) {
+        Map<String, String> result = new LinkedHashMap<>();
+        result.put("name", name);
+        result.put("kind", collectionKind(type));
+        return result;
+    }
+
+    static String collectionKind(String type) {
+        if ("view".equalsIgnoreCase(type)) {
+            return "view";
+        }
+        if ("timeseries".equalsIgnoreCase(type)) {
+            return "timeseries";
+        }
+        return "collection";
     }
 
     private static Object listIndexes(JsonObject params) {
@@ -333,7 +390,12 @@ public final class MongoAgent {
         String database = params.get("database").getAsString();
         String collection = params.get("table").getAsString();
         List<IndexInfo> result = new ArrayList<>();
-        for (Document index : c.getDatabase(database).getCollection(collection).listIndexes()) {
+        MongoDatabase mongoDatabase = c.getDatabase(database);
+        for (Document index : collectionIndexDefinitions(
+            mongoDatabase,
+            mongoDatabase.getCollection(collection),
+            collection
+        )) {
             result.add(indexInfoFromDocument(index));
         }
         return result;
@@ -383,12 +445,13 @@ public final class MongoAgent {
         Document filterDoc = documentOrNull(params, "filter");
         Document projectionDoc = documentOrNull(params, "projection");
         Document sortDoc = documentOrNull(params, "sort");
+        Collation collation = collationOrNull(documentOrNull(params, "collation"));
 
         var col = c.getDatabase(database).getCollection(collection);
         if (filterDoc == null) {
             filterDoc = new Document();
         }
-        CollectionTotal total = collectionTotal(col, filterDoc);
+        CollectionTotal total = collectionTotal(col, filterDoc, collation);
 
         var iterable = col.find(filterDoc).skip((int) skip).limit(limit);
         if (projectionDoc != null) {
@@ -397,12 +460,308 @@ public final class MongoAgent {
         if (sortDoc != null) {
             iterable = iterable.sort(sortDoc);
         }
+        if (collation != null) {
+            iterable = iterable.collation(collation);
+        }
 
         List<Map<String, Object>> documents = new ArrayList<>();
         for (Document document : iterable) {
             documents.add(bsonToJson(document));
         }
         return documentQueryResult(documents, total);
+    }
+
+    private static Object explainFind(JsonObject params) {
+        MongoClient c = requireClient();
+        String database = params.get("database").getAsString();
+        Document result = c.getDatabase(database).runCommand(buildFindExplainCommand(params));
+        return bsonToExtendedJson(result);
+    }
+
+    private static Object aggregateDocuments(JsonObject params) {
+        MongoClient c = requireClient();
+        String database = params.get("database").getAsString();
+        String collection = params.get("collection").getAsString();
+        List<Document> pipeline = aggregatePipeline(params);
+        Document options = aggregateOptions(params);
+
+        if (aggregateExplain(options)) {
+            Document plan = c.getDatabase(database).runCommand(buildAggregateCommand(collection, pipeline, options));
+            List<Map<String, Object>> documents = new ArrayList<>();
+            List<JsonObject> extendedDocuments = new ArrayList<>();
+            documents.add(bsonToJson(plan));
+            extendedDocuments.add(bsonToExtendedJson(plan));
+            return documentQueryResultWithExtended(documents, extendedDocuments, 1);
+        }
+
+        int maxRows = aggregateMaxRows(params);
+        AggregateIterable<Document> iterable = c.getDatabase(database).getCollection(collection).aggregate(pipeline);
+        iterable = applyAggregateOptions(iterable, options);
+        int fetchLimit = maxRows == Integer.MAX_VALUE ? Integer.MAX_VALUE : maxRows + 1;
+        List<Map<String, Object>> documents = new ArrayList<>();
+        List<JsonObject> extendedDocuments = new ArrayList<>();
+        try (MongoCursor<Document> cursor = iterable.iterator()) {
+            while (documents.size() < fetchLimit && cursor.hasNext()) {
+                Document document = cursor.next();
+                documents.add(bsonToJson(document));
+                extendedDocuments.add(bsonToExtendedJson(document));
+            }
+        }
+        long total = documents.size();
+        if (documents.size() > maxRows) {
+            documents.subList(maxRows, documents.size()).clear();
+            extendedDocuments.subList(maxRows, extendedDocuments.size()).clear();
+        }
+        return documentQueryResultWithExtended(documents, extendedDocuments, total);
+    }
+
+    static List<Document> aggregatePipeline(JsonObject params) {
+        String source = stringOrNull(params, "pipeline");
+        if (source == null || source.isBlank()) {
+            throw new IllegalArgumentException("MongoDB aggregate pipeline is required");
+        }
+        JsonElement parsed = JsonParser.parseString(source);
+        if (!parsed.isJsonArray()) {
+            throw new IllegalArgumentException("MongoDB aggregate pipeline must be a JSON array");
+        }
+        List<Document> pipeline = new ArrayList<>();
+        for (JsonElement stage : parsed.getAsJsonArray()) {
+            if (!stage.isJsonObject()) {
+                throw new IllegalArgumentException("Each MongoDB aggregate pipeline stage must be an object");
+            }
+            pipeline.add(Document.parse(stage.toString()));
+        }
+        return pipeline;
+    }
+
+    static Document aggregateOptions(JsonObject params) {
+        Document options = documentOrNull(params, "options");
+        return options == null ? new Document() : options;
+    }
+
+    static boolean aggregateExplain(Document options) {
+        Object explain = options.get("explain");
+        if (explain == null) {
+            return false;
+        }
+        if (!(explain instanceof Boolean)) {
+            throw new IllegalArgumentException("MongoDB aggregate option explain must be a boolean");
+        }
+        return (Boolean) explain;
+    }
+
+    static Document buildAggregateCommand(String collection, List<Document> pipeline, Document options) {
+        validateAggregateOptions(options);
+        Document command = new Document("aggregate", collection).append("pipeline", pipeline);
+        for (Map.Entry<String, Object> entry : options.entrySet()) {
+            command.append(entry.getKey(), entry.getValue());
+        }
+        if (!aggregateExplain(options) && !command.containsKey("cursor")) {
+            command.append("cursor", new Document());
+        }
+        return command;
+    }
+
+    private static AggregateIterable<Document> applyAggregateOptions(
+        AggregateIterable<Document> iterable,
+        Document options
+    ) {
+        validateAggregateOptions(options);
+        if (options.containsKey("allowDiskUse")) {
+            iterable = iterable.allowDiskUse(aggregateBoolean(options, "allowDiskUse"));
+        }
+        if (options.containsKey("cursor")) {
+            Object rawCursor = options.get("cursor");
+            if (!(rawCursor instanceof Document cursor)) {
+                throw new IllegalArgumentException("MongoDB aggregate option cursor must be an object");
+            }
+            for (String key : cursor.keySet()) {
+                if (!"batchSize".equals(key)) {
+                    throw new IllegalArgumentException("Unsupported MongoDB aggregate cursor option: " + key);
+                }
+            }
+            if (cursor.containsKey("batchSize")) {
+                iterable = iterable.batchSize(aggregateNonNegativeInt(cursor, "batchSize"));
+            }
+        }
+        if (options.containsKey("maxTimeMS")) {
+            iterable = iterable.maxTime(aggregateNonNegativeLong(options, "maxTimeMS"), TimeUnit.MILLISECONDS);
+        }
+        if (options.containsKey("maxAwaitTimeMS")) {
+            iterable = iterable.maxAwaitTime(
+                aggregateNonNegativeLong(options, "maxAwaitTimeMS"),
+                TimeUnit.MILLISECONDS
+            );
+        }
+        if (options.containsKey("bypassDocumentValidation")) {
+            iterable = iterable.bypassDocumentValidation(aggregateBoolean(options, "bypassDocumentValidation"));
+        }
+        if (options.containsKey("collation")) {
+            Object rawCollation = options.get("collation");
+            if (!(rawCollation instanceof Document collation)) {
+                throw new IllegalArgumentException("MongoDB aggregate option collation must be an object");
+            }
+            iterable = iterable.collation(collationOrNull(collation));
+        }
+        if (options.containsKey("comment")) {
+            Object comment = options.get("comment");
+            if (!(comment instanceof String)) {
+                throw new IllegalArgumentException("MongoDB aggregate option comment must be a string");
+            }
+            iterable = iterable.comment((String) comment);
+        }
+        if (options.containsKey("hint")) {
+            Object hint = options.get("hint");
+            if (!(hint instanceof Document)) {
+                throw new IllegalArgumentException("MongoDB Legacy aggregate option hint must be an object");
+            }
+            iterable = iterable.hint((Document) hint);
+        }
+        if (options.containsKey("useCursor")) {
+            iterable = iterable.useCursor(aggregateBoolean(options, "useCursor"));
+        }
+        return iterable;
+    }
+
+    private static void validateAggregateOptions(Document options) {
+        Set<String> supported = Set.of(
+            "explain",
+            "allowDiskUse",
+            "cursor",
+            "maxTimeMS",
+            "maxAwaitTimeMS",
+            "bypassDocumentValidation",
+            "collation",
+            "comment",
+            "hint",
+            "useCursor"
+        );
+        for (String key : options.keySet()) {
+            if (!supported.contains(key)) {
+                throw new IllegalArgumentException("Unsupported MongoDB Legacy aggregate option: " + key);
+            }
+        }
+    }
+
+    private static int aggregateMaxRows(JsonObject params) {
+        long value = params.has("limit") ? params.get("limit").getAsLong() : 100;
+        if (value < 0 || value > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException("MongoDB aggregate limit must be between 0 and " + Integer.MAX_VALUE);
+        }
+        return (int) value;
+    }
+
+    private static boolean aggregateBoolean(Document options, String key) {
+        Object value = options.get(key);
+        if (!(value instanceof Boolean)) {
+            throw new IllegalArgumentException("MongoDB aggregate option " + key + " must be a boolean");
+        }
+        return (Boolean) value;
+    }
+
+    private static int aggregateNonNegativeInt(Document options, String key) {
+        long value = aggregateNonNegativeLong(options, key);
+        if (value > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException("MongoDB aggregate option " + key + " is too large");
+        }
+        return (int) value;
+    }
+
+    private static long aggregateNonNegativeLong(Document options, String key) {
+        Object value = options.get(key);
+        if (!(value instanceof Number number) || number.doubleValue() != Math.rint(number.doubleValue())) {
+            throw new IllegalArgumentException("MongoDB aggregate option " + key + " must be a non-negative integer");
+        }
+        long result = number.longValue();
+        if (result < 0) {
+            throw new IllegalArgumentException("MongoDB aggregate option " + key + " must be a non-negative integer");
+        }
+        return result;
+    }
+
+    static Document buildFindExplainCommand(JsonObject params) {
+        String collection = params.get("collection").getAsString();
+        Document find = new Document("find", collection);
+        Document filter = documentOrNull(params, "filter");
+        find.append("filter", filter == null ? new Document() : filter);
+
+        Document projection = documentOrNull(params, "projection");
+        if (projection != null) {
+            find.append("projection", projection);
+        }
+        Document sort = documentOrNull(params, "sort");
+        if (sort != null) {
+            find.append("sort", sort);
+        }
+        Document collation = documentOrNull(params, "collation");
+        if (collation != null) {
+            collationOrNull(collation);
+            find.append("collation", collation);
+        }
+
+        long skip = params.has("skip") ? params.get("skip").getAsLong() : 0;
+        if (skip > 0) {
+            find.append("skip", skip);
+        }
+        long limit = params.has("limit") ? params.get("limit").getAsLong() : 0;
+        if (limit > 0) {
+            find.append("limit", limit);
+        }
+        return new Document("explain", find)
+            .append("verbosity", findExplainVerbosity(params));
+    }
+
+    private static String findExplainVerbosity(JsonObject params) {
+        String verbosity = defaultString(stringOrNull(params, "verbosity"), "queryPlanner");
+        if (!Set.of("queryPlanner", "executionStats", "allPlansExecution").contains(verbosity)) {
+            throw new IllegalArgumentException(
+                "MongoDB explain verbosity must be queryPlanner, executionStats, or allPlansExecution");
+        }
+        return verbosity;
+    }
+
+    private static Object findOne(JsonObject params) {
+        MongoClient c = requireClient();
+        String database = params.get("database").getAsString();
+        String collection = params.get("collection").getAsString();
+        Document filter = documentOrNull(params, "filter");
+        Document projection = documentOrNull(params, "projection");
+        Document options = documentOrNull(params, "options");
+        Document sort = null;
+
+        if (options != null) {
+            for (String key : options.keySet()) {
+                if (!"sort".equals(key)) {
+                    throw new IllegalArgumentException("Unsupported findOne option: " + key);
+                }
+            }
+            Object rawSort = options.get("sort");
+            if (rawSort != null) {
+                if (!(rawSort instanceof Document sortDocument)) {
+                    throw new IllegalArgumentException("Invalid findOne option sort: expected an object");
+                }
+                sort = sortDocument;
+            }
+        }
+
+        var iterable = c.getDatabase(database).getCollection(collection).find(filter == null ? new Document() : filter);
+        if (projection != null) {
+            iterable = iterable.projection(projection);
+        }
+        if (sort != null) {
+            iterable = iterable.sort(sort);
+        }
+        Document document = iterable.limit(1).first();
+
+        List<Map<String, Object>> documents = new ArrayList<>();
+        List<JsonObject> extendedDocuments = new ArrayList<>();
+        if (document != null) {
+            documents.add(bsonToJson(document));
+            extendedDocuments.add(bsonToExtendedJson(document));
+        }
+        Map<String, Object> result = documentQueryResult(documents, new CollectionTotal(documents.size(), true));
+        result.put("extended_documents", extendedDocuments);
+        return result;
     }
 
     /**
@@ -418,12 +777,13 @@ public final class MongoAgent {
         Document filterDoc = documentOrNull(params, "filter");
         Document projectionDoc = documentOrNull(params, "projection");
         Document sortDoc = documentOrNull(params, "sort");
+        Collation collation = collationOrNull(documentOrNull(params, "collation"));
 
         var col = c.getDatabase(database).getCollection(collection);
         if (filterDoc == null) {
             filterDoc = new Document();
         }
-        CollectionTotal total = collectionTotal(col, filterDoc);
+        CollectionTotal total = collectionTotal(col, filterDoc, collation);
 
         var iterable = col.find(filterDoc).skip((int) skip).limit(limit);
         if (projectionDoc != null) {
@@ -431,6 +791,9 @@ public final class MongoAgent {
         }
         if (sortDoc != null) {
             iterable = iterable.sort(sortDoc);
+        }
+        if (collation != null) {
+            iterable = iterable.collation(collation);
         }
 
         List<JsonObject> documents = new ArrayList<>();
@@ -440,11 +803,89 @@ public final class MongoAgent {
         return documentQueryResult(documents, total);
     }
 
+    static Collation collationOrNull(Document document) {
+        if (document == null) {
+            return null;
+        }
+        Set<String> supported = Set.of(
+            "locale", "strength", "caseLevel", "caseFirst", "numericOrdering",
+            "alternate", "maxVariable", "normalization", "backwards"
+        );
+        for (String key : document.keySet()) {
+            if (!supported.contains(key)) {
+                throw new IllegalArgumentException("Unsupported collation option: " + key);
+            }
+        }
+        String locale = document.getString("locale");
+        if (locale == null || locale.isBlank()) {
+            throw new IllegalArgumentException("Invalid collation: locale must not be empty");
+        }
+
+        Collation.Builder builder = Collation.builder().locale(locale);
+        if (document.containsKey("strength")) {
+            Object strength = document.get("strength");
+            if (!(strength instanceof Number number) || number.doubleValue() != Math.rint(number.doubleValue())) {
+                throw new IllegalArgumentException("Invalid collation option strength: expected an integer from 1 to 5");
+            }
+            int strengthValue = number.intValue();
+            if (strengthValue < 1 || strengthValue > 5) {
+                throw new IllegalArgumentException("Invalid collation option strength: expected an integer from 1 to 5");
+            }
+            builder.collationStrength(CollationStrength.fromInt(strengthValue));
+        }
+        if (document.containsKey("caseLevel")) {
+            builder.caseLevel(collationBoolean(document, "caseLevel"));
+        }
+        if (document.containsKey("caseFirst")) {
+            builder.collationCaseFirst(CollationCaseFirst.fromString(collationString(document, "caseFirst")));
+        }
+        if (document.containsKey("numericOrdering")) {
+            builder.numericOrdering(collationBoolean(document, "numericOrdering"));
+        }
+        if (document.containsKey("alternate")) {
+            builder.collationAlternate(CollationAlternate.fromString(collationString(document, "alternate")));
+        }
+        if (document.containsKey("maxVariable")) {
+            builder.collationMaxVariable(CollationMaxVariable.fromString(collationString(document, "maxVariable")));
+        }
+        if (document.containsKey("normalization")) {
+            builder.normalization(collationBoolean(document, "normalization"));
+        }
+        if (document.containsKey("backwards")) {
+            builder.backwards(collationBoolean(document, "backwards"));
+        }
+        return builder.build();
+    }
+
+    private static boolean collationBoolean(Document document, String key) {
+        Object value = document.get(key);
+        if (value instanceof Boolean booleanValue) {
+            return booleanValue;
+        }
+        throw new IllegalArgumentException("Invalid collation option " + key + ": expected a boolean");
+    }
+
+    private static String collationString(Document document, String key) {
+        Object value = document.get(key);
+        if (value instanceof String stringValue) {
+            return stringValue;
+        }
+        throw new IllegalArgumentException("Invalid collation option " + key + ": expected a string");
+    }
+
     static CollectionTotal collectionTotal(MongoCollection<Document> collection, Document filter) {
+        return collectionTotal(collection, filter, null);
+    }
+
+    static CollectionTotal collectionTotal(MongoCollection<Document> collection, Document filter, Collation collation) {
         if (filter.isEmpty()) {
             return new CollectionTotal(collection.estimatedDocumentCount(), false);
         }
-        return new CollectionTotal(collection.countDocuments(filter), true);
+        CountOptions options = new CountOptions();
+        if (collation != null) {
+            options.collation(collation);
+        }
+        return new CollectionTotal(collection.countDocuments(filter, options), true);
     }
 
     static Map<String, Object> documentQueryResult(List<?> documents, CollectionTotal total) {
@@ -454,6 +895,16 @@ public final class MongoAgent {
         if (!total.exact()) {
             result.put("total_is_exact", false);
         }
+        return result;
+    }
+
+    private static Map<String, Object> documentQueryResultWithExtended(
+        List<Map<String, Object>> documents,
+        List<JsonObject> extendedDocuments,
+        long total
+    ) {
+        Map<String, Object> result = documentQueryResult(documents, new CollectionTotal(total, true));
+        result.put("extended_documents", extendedDocuments);
         return result;
     }
 
@@ -497,6 +948,37 @@ public final class MongoAgent {
         return version;
     }
 
+    static boolean serverVersionRequiresSerialDropIndexes(String version) {
+        if (version == null) {
+            return false;
+        }
+        int start = 0;
+        while (start < version.length() && !Character.isDigit(version.charAt(start))) {
+            start++;
+        }
+        String[] components = version.substring(start).split("\\.", 3);
+        if (components.length < 2) {
+            return false;
+        }
+        try {
+            int major = Integer.parseInt(components[0]);
+            int minor = Integer.parseInt(components[1]);
+            return major < 4 || (major == 4 && minor < 2);
+        } catch (NumberFormatException error) {
+            return false;
+        }
+    }
+
+    private static boolean serverRequiresSerialDropIndexes(MongoClient client, String database) {
+        try {
+            Document buildInfo = client.getDatabase(database).runCommand(new Document("buildInfo", 1));
+            return serverVersionRequiresSerialDropIndexes(serverVersionFromBuildInfo(buildInfo));
+        } catch (RuntimeException error) {
+            // Without an explicit old version, preserve MongoDB's single-command array semantics.
+            return false;
+        }
+    }
+
     private static Object createIndex(JsonObject params) {
         MongoClient c = requireClient();
         String database = params.get("database").getAsString();
@@ -509,12 +991,22 @@ public final class MongoAgent {
         Document index = new Document("key", keys);
         Document options = documentOrNull(params, "options_json");
         if (options != null) {
+            if (options.containsKey("key")) {
+                throw new IllegalArgumentException("Index options cannot contain \"key\"; specify index fields in keys JSON");
+            }
             index.putAll(options);
         }
-        String name = index.getString("name");
-        if (name == null || name.isBlank()) {
+        String name;
+        if (!index.containsKey("name")) {
             name = defaultIndexName(keys);
             index.put("name", name);
+        } else if (!(index.get("name") instanceof String)) {
+            throw new IllegalArgumentException("Index option \"name\" must be a non-empty string");
+        } else {
+            name = (String) index.get("name");
+            if (name.isBlank()) {
+                throw new IllegalArgumentException("Index option \"name\" must be a non-empty string");
+            }
         }
 
         c.getDatabase(database).runCommand(
@@ -522,6 +1014,32 @@ public final class MongoAgent {
                 .append("indexes", Collections.singletonList(index))
         );
         return Collections.singletonMap("name", name);
+    }
+
+    private static Object createUser(JsonObject params) {
+        MongoClient client = requireClient();
+        String database = params.get("database").getAsString();
+        client.getDatabase(database).runCommand(buildCreateUserCommand(params));
+        return Collections.singletonMap("affected_rows", 1);
+    }
+
+    static Document buildCreateUserCommand(JsonObject params) {
+        Document user = requiredDocument(params, "user_json", "User document");
+        Object username = user.remove("user");
+        if (!(username instanceof String) || ((String) username).isBlank()) {
+            throw new IllegalArgumentException("MongoDB createUser requires a non-empty user name");
+        }
+        if (user.containsKey("createUser") || user.containsKey("writeConcern")) {
+            throw new IllegalArgumentException("MongoDB createUser user document contains reserved command fields");
+        }
+
+        Document command = new Document("createUser", username);
+        command.putAll(user);
+        Document writeConcern = documentOrNull(params, "write_concern_json");
+        if (writeConcern != null) {
+            command.put("writeConcern", writeConcern);
+        }
+        return command;
     }
 
     private static Document requiredDocument(JsonObject params, String key, String label) {
@@ -532,12 +1050,22 @@ public final class MongoAgent {
         return document;
     }
 
-    private static String defaultIndexName(Document keys) {
+    static String defaultIndexName(Document keys) {
         List<String> parts = new ArrayList<>();
         for (Map.Entry<String, Object> entry : keys.entrySet()) {
-            parts.add(entry.getKey() + "_" + String.valueOf(entry.getValue()));
+            parts.add(entry.getKey() + "_" + defaultIndexNameValue(entry.getValue()));
         }
         return String.join("_", parts);
+    }
+
+    private static String defaultIndexNameValue(Object value) {
+        if (value instanceof Double number && Double.isFinite(number)) {
+            // The Rust driver's BSON formatter omits a fractional suffix for
+            // whole doubles (for example, 1.0 becomes 1). Keep unnamed index
+            // names identical on Native and Legacy connections.
+            return BigDecimal.valueOf(number).stripTrailingZeros().toPlainString();
+        }
+        return String.valueOf(value);
     }
 
     private static Object dropIndexes(JsonObject params) {
@@ -548,13 +1076,50 @@ public final class MongoAgent {
         boolean single = params.has("single") && !params.get("single").isJsonNull() && params.get("single").getAsBoolean();
         Object index = parseDropIndexesValue(indexesJson, single);
 
+        if (index instanceof List<?> indexes && serverRequiresSerialDropIndexes(c, database)) {
+            // Array-form dropIndexes was added in MongoDB 4.2. Older servers
+            // require individual commands and therefore return partial results.
+            return dropNamedIndexes(
+                indexes,
+                indexName -> c.getDatabase(database).runCommand(
+                    new Document("dropIndexes", collection).append("index", indexName)
+                )
+            );
+        }
+
         List<IndexInfo> before = listIndexInfos(c, database, collection);
         c.getDatabase(database).runCommand(new Document("dropIndexes", collection).append("index", index));
         List<IndexInfo> after = listIndexInfos(c, database, collection);
         List<String> droppedNames = diffDroppedIndexNames(before, after);
+        return dropIndexesResult(droppedNames, Collections.emptyList());
+    }
+
+    static Map<String, Object> dropNamedIndexes(List<?> indexes, Consumer<Object> dropCommand) {
+        List<String> droppedNames = new ArrayList<>();
+        List<Map<String, String>> failures = new ArrayList<>();
+        for (Object indexName : indexes) {
+            String name = String.valueOf(indexName);
+            try {
+                dropCommand.accept(indexName);
+                droppedNames.add(name);
+            } catch (RuntimeException error) {
+                String message = error.getMessage() == null ? error.toString() : error.getMessage();
+                failures.add(Map.of("name", name, "message", message));
+            }
+        }
+        return dropIndexesResult(droppedNames, failures);
+    }
+
+    private static Map<String, Object> dropIndexesResult(
+        List<String> droppedNames,
+        List<Map<String, String>> failures
+    ) {
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("dropped_names", droppedNames);
         result.put("affected_rows", droppedNames.size());
+        if (!failures.isEmpty()) {
+            result.put("failures", failures);
+        }
         return result;
     }
 
@@ -566,7 +1131,222 @@ public final class MongoAgent {
         return Collections.singletonMap("ok", true);
     }
 
-    private static Object parseDropIndexesValue(String indexesJson, boolean single) {
+    /**
+     * Clone a regular collection with the commands available to the legacy
+     * driver. This keeps older MongoDB servers on the same full-clone path as
+     * the native driver instead of silently copying documents only.
+     */
+    private static Object cloneCollection(JsonObject params) {
+        MongoClient client = requireClient();
+        String databaseName = params.get("database").getAsString();
+        String sourceName = params.get("source_collection").getAsString();
+        String targetName = params.get("target_collection").getAsString();
+        if (sourceName.equals(targetName)) {
+            throw new IllegalArgumentException("Target collection name must differ from the source collection name");
+        }
+        if (sourceName.startsWith("system.") || targetName.startsWith("system.")) {
+            throw new IllegalArgumentException("System collections cannot be cloned");
+        }
+
+        MongoDatabase database = client.getDatabase(databaseName);
+        Document sourceSpecification = requireCollectionSpecification(database, sourceName);
+        if (!isRegularCollectionSpecification(sourceSpecification)) {
+            throw new IllegalArgumentException(
+                "Only regular MongoDB collections can be cloned; views and time-series collections are not supported"
+            );
+        }
+
+        Document collectionOptions = collectionOptions(sourceSpecification);
+        // Explicit creation ensures the source is never merged into an
+        // existing target collection.
+        database.runCommand(cloneCreateCollectionCommand(targetName, sourceSpecification));
+
+        MongoCollection<Document> source = database.getCollection(sourceName);
+        MongoCollection<Document> target = database.getCollection(targetName);
+        long documentsCopied = cloneCollectionDocuments(source, target, needsValidationBypass(collectionOptions));
+        long indexesCopied = cloneCollectionIndexes(database, source, sourceName, targetName);
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("documents_copied", documentsCopied);
+        result.put("indexes_copied", indexesCopied);
+        return result;
+    }
+
+    private static Document requireCollectionSpecification(MongoDatabase database, String sourceName) {
+        for (Document specification : collectionSpecifications(database)) {
+            if (sourceName.equals(specification.getString("name"))) {
+                return specification;
+            }
+        }
+        throw new IllegalArgumentException("MongoDB collection '" + sourceName + "' was not found");
+    }
+
+    private static List<Document> collectionSpecifications(MongoDatabase database) {
+        try {
+            List<Document> specifications = new ArrayList<>();
+            for (Document specification : database.listCollections()) {
+                specifications.add(specification);
+            }
+            return specifications;
+        } catch (RuntimeException error) {
+            if (isUnsupportedCatalogCommand(error, "listcollections")) {
+                return legacyCollectionSpecifications(database);
+            }
+            throw error;
+        }
+    }
+
+    private static List<Document> legacyCollectionSpecifications(MongoDatabase database) {
+        String prefix = database.getName() + ".";
+        List<Document> specifications = new ArrayList<>();
+        for (Document namespaceDocument : database.getCollection("system.namespaces").find()) {
+            String namespace = namespaceDocument.getString("name");
+            if (namespace == null || !namespace.startsWith(prefix) || namespace.length() == prefix.length()) {
+                continue;
+            }
+            Document specification = new Document("name", namespace.substring(prefix.length()));
+            Object options = namespaceDocument.get("options");
+            if (options instanceof Document document) {
+                specification.append("options", document);
+            }
+            specifications.add(specification);
+        }
+        return specifications;
+    }
+
+    static boolean isUnsupportedCatalogCommand(RuntimeException error, String command) {
+        String message = error.getMessage() == null ? "" : error.getMessage().toLowerCase();
+        return message.contains("commandnotfound")
+            || ((message.contains("no such command") || message.contains("no such cmd")) && message.contains(command));
+    }
+
+    static boolean isRegularCollectionSpecification(Document specification) {
+        String type = specification.getString("type");
+        return type == null || type.isBlank() || "collection".equalsIgnoreCase(type);
+    }
+
+    static Document collectionOptions(Document specification) {
+        Object options = specification.get("options");
+        return options instanceof Document document ? new Document(document) : new Document();
+    }
+
+    static Document cloneCreateCollectionCommand(String targetName, Document sourceSpecification) {
+        Document command = new Document("create", targetName);
+        command.putAll(collectionOptions(sourceSpecification));
+        return command;
+    }
+
+    private static boolean needsValidationBypass(Document options) {
+        return options.containsKey("validator")
+            || options.containsKey("validationLevel")
+            || options.containsKey("validationAction");
+    }
+
+    private static long cloneCollectionDocuments(
+        MongoCollection<Document> source,
+        MongoCollection<Document> target,
+        boolean bypassDocumentValidation
+    ) {
+        List<Document> batch = new ArrayList<>(CLONE_INSERT_BATCH_SIZE);
+        long copied = 0;
+        try (MongoCursor<Document> cursor = source.find().iterator()) {
+            while (cursor.hasNext()) {
+                batch.add(cursor.next());
+                if (batch.size() == CLONE_INSERT_BATCH_SIZE) {
+                    copied += insertCloneBatch(target, batch, bypassDocumentValidation);
+                }
+            }
+        }
+        if (!batch.isEmpty()) {
+            copied += insertCloneBatch(target, batch, bypassDocumentValidation);
+        }
+        return copied;
+    }
+
+    private static long insertCloneBatch(
+        MongoCollection<Document> target,
+        List<Document> batch,
+        boolean bypassDocumentValidation
+    ) {
+        InsertManyOptions options = new InsertManyOptions();
+        if (bypassDocumentValidation) {
+            options.bypassDocumentValidation(true);
+        }
+        target.insertMany(batch, options);
+        long copied = batch.size();
+        batch.clear();
+        return copied;
+    }
+
+    private static long cloneCollectionIndexes(
+        MongoDatabase database,
+        MongoCollection<Document> source,
+        String sourceName,
+        String targetName
+    ) {
+        long copied = 0;
+        for (Document index : collectionIndexDefinitions(database, source, sourceName)) {
+            if (isAutomaticIdIndex(index)) {
+                continue;
+            }
+            database.runCommand(
+                new Document("createIndexes", targetName)
+                    .append("indexes", Collections.singletonList(cloneIndexDefinition(index)))
+            );
+            copied++;
+        }
+        return copied;
+    }
+
+    private static List<Document> collectionIndexDefinitions(
+        MongoDatabase database,
+        MongoCollection<Document> source,
+        String sourceName
+    ) {
+        try {
+            List<Document> indexes = new ArrayList<>();
+            for (Document index : source.listIndexes()) {
+                indexes.add(index);
+            }
+            return indexes;
+        } catch (RuntimeException error) {
+            if (!isUnsupportedCatalogCommand(error, "listindexes")) {
+                throw error;
+            }
+        }
+
+        String namespace = database.getName() + "." + sourceName;
+        List<Document> indexes = new ArrayList<>();
+        for (Document index : database.getCollection("system.indexes").find(new Document("ns", namespace))) {
+            indexes.add(index);
+        }
+        return indexes;
+    }
+
+    static boolean isAutomaticIdIndex(Document index) {
+        Object keys = index.get("key");
+        return keys instanceof Document document && isDefaultIdIndexSpecification(document);
+    }
+
+    static Document cloneIndexDefinition(Document sourceIndex) {
+        Document definition = new Document(sourceIndex);
+        // These fields describe the source catalog entry rather than index
+        // options accepted by createIndexes on every supported server.
+        definition.remove("v");
+        definition.remove("ns");
+        definition.remove("buildUUID");
+        definition.remove("ready");
+        return definition;
+    }
+
+    private static Object dropDatabase(JsonObject params) {
+        MongoClient c = requireClient();
+        String database = params.get("database").getAsString();
+        c.getDatabase(database).drop();
+        return Collections.singletonMap("ok", true);
+    }
+
+    static Object parseDropIndexesValue(String indexesJson, boolean single) {
         if (indexesJson == null || indexesJson.isBlank()) {
             if (single) {
                 throw new IllegalArgumentException("dropIndex requires a string index name or JSON document");
@@ -583,6 +1363,9 @@ public final class MongoAgent {
             if (single && "*".equals(name)) {
                 throw new IllegalArgumentException("dropIndex does not accept \"*\"; use dropIndexes() or dropIndexes(\"*\") instead");
             }
+            if (DEFAULT_ID_INDEX_NAME.equals(name)) {
+                throw new IllegalArgumentException("The default MongoDB _id_ index cannot be dropped");
+            }
             return name;
         }
         if (value.isJsonObject()) {
@@ -590,7 +1373,11 @@ public final class MongoAgent {
             if (object.size() == 0) {
                 throw new IllegalArgumentException("Index specification is required");
             }
-            return Document.parse(indexesJson);
+            Document specification = Document.parse(indexesJson);
+            if (isDefaultIdIndexSpecification(specification)) {
+                throw new IllegalArgumentException("The default MongoDB _id_ index cannot be dropped");
+            }
+            return specification;
         }
         if (value.isJsonArray()) {
             if (single) {
@@ -606,12 +1393,29 @@ public final class MongoAgent {
             if (names.isEmpty()) {
                 throw new IllegalArgumentException("dropIndexes only accepts non-empty string arrays");
             }
+            if (names.contains(DEFAULT_ID_INDEX_NAME)) {
+                throw new IllegalArgumentException("The default MongoDB _id_ index cannot be dropped");
+            }
             return names;
         }
         if (single) {
             throw new IllegalArgumentException("dropIndex only accepts a string index name or JSON document");
         }
         throw new IllegalArgumentException("dropIndexes only accepts a string index name, JSON document, or string array");
+    }
+
+    private static boolean isDefaultIdIndexSpecification(Document specification) {
+        if (specification.size() != 1 || !specification.containsKey("_id")) {
+            return false;
+        }
+        Object direction = specification.get("_id");
+        if (direction instanceof Number number) {
+            return number.doubleValue() == 1.0;
+        }
+        // Document.parse turns Extended JSON $numberDecimal values into
+        // Decimal128, which does not implement Number in the legacy driver.
+        return direction instanceof Decimal128 decimal
+            && decimal.bigDecimalValue().compareTo(BigDecimal.ONE) == 0;
     }
 
     private static List<IndexInfo> listIndexInfos(MongoClient c, String database, String collection) {
@@ -992,18 +1796,24 @@ public final class MongoAgent {
 
     private static Object dispatch(String method, JsonObject params) {
         return switch (method) {
-            case AgentProtocol.METHOD_HANDSHAKE -> AgentProtocol.handshakeResult();
+            case AgentProtocol.METHOD_HANDSHAKE -> AgentProtocol.mongoLegacyHandshakeResult();
             case AgentProtocol.METHOD_CONNECT -> connect(params);
             case AgentProtocol.MONGO_METHOD_LIST_DATABASES -> listDatabases();
             case AgentProtocol.MONGO_METHOD_LIST_COLLECTIONS -> listCollections(params);
             case AgentProtocol.METHOD_LIST_INDEXES -> listIndexes(params);
             case AgentProtocol.MONGO_METHOD_FIND_DOCUMENTS -> findDocuments(params);
+            case AgentProtocol.MONGO_METHOD_FIND_ONE -> findOne(params);
+            case AgentProtocol.MONGO_METHOD_EXPLAIN_FIND -> explainFind(params);
+            case AgentProtocol.MONGO_METHOD_AGGREGATE_DOCUMENTS -> aggregateDocuments(params);
             case AgentProtocol.MONGO_METHOD_FIND_DOCUMENTS_EXTENDED_JSON -> findDocumentsExtendedJson(params);
             case AgentProtocol.MONGO_METHOD_COUNT_DOCUMENTS -> countDocuments(params);
             case AgentProtocol.MONGO_METHOD_SERVER_VERSION -> serverVersion(params);
             case AgentProtocol.MONGO_METHOD_CREATE_INDEX -> createIndex(params);
+            case AgentProtocol.MONGO_METHOD_CREATE_USER -> createUser(params);
             case AgentProtocol.MONGO_METHOD_DROP_INDEXES -> dropIndexes(params);
             case AgentProtocol.MONGO_METHOD_DROP_COLLECTION -> dropCollection(params);
+            case AgentProtocol.MONGO_METHOD_CLONE_COLLECTION -> cloneCollection(params);
+            case AgentProtocol.MONGO_METHOD_DROP_DATABASE -> dropDatabase(params);
             case AgentProtocol.MONGO_METHOD_INSERT_DOCUMENT -> insertDocument(params);
             case AgentProtocol.MONGO_METHOD_UPDATE_DOCUMENT -> updateDocument(params);
             case AgentProtocol.MONGO_METHOD_UPDATE_DOCUMENTS -> updateDocuments(params);
@@ -1018,6 +1828,10 @@ public final class MongoAgent {
             }
             default -> throw new IllegalArgumentException("Unknown method: " + method);
         };
+    }
+
+    static AgentProtocol.HandshakeResult runtimeHandshakeResult() {
+        return AgentProtocol.mongoLegacyMultiSessionHandshakeResult();
     }
 
     private static MongoClient requireClient() {
@@ -1119,7 +1933,7 @@ public final class MongoAgent {
             try {
                 Object result;
                 if (AgentProtocol.METHOD_HANDSHAKE.equals(method)) {
-                    result = AgentProtocol.multiSessionHandshakeResult();
+                    result = runtimeHandshakeResult();
                 } else if (AgentProtocol.METHOD_OPEN_SESSION.equals(method)) {
                     result = openSession(requiredSessionId(params), params);
                 } else if (AgentProtocol.METHOD_CLOSE_SESSION.equals(method)) {

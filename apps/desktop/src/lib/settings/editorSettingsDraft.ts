@@ -1,5 +1,7 @@
 import type { EditorSettings } from "@/stores/settingsStore";
 import { normalizeResultPageSize } from "@/lib/dataGrid/paginationPageSize";
+import { normalizeQueryResultMaxRows } from "@/lib/dataGrid/queryResultRowLimit";
+import { normalizeCompletionTriggerMode } from "@/lib/sql/sqlCompletionTriggerPolicy";
 
 export const EDITOR_SETTINGS_DRAFT_KEYS = [
   "fontFamily",
@@ -11,6 +13,9 @@ export const EDITOR_SETTINGS_DRAFT_KEYS = [
   "customThemes",
   "activeCustomThemeId",
   "executeMode",
+  "executeAllOnBlankLine",
+  "globalConnectTimeoutSecs",
+  "globalQueryTimeoutSecs",
   "showExecutionTargetPicker",
   "showStatementRunButtons",
   "showCurrentStatementFrame",
@@ -23,16 +28,21 @@ export const EDITOR_SETTINGS_DRAFT_KEYS = [
   "sqlSemanticDiagnosticsMode",
   "confirmDangerousSqlExecution",
   "confirmUnsavedSqlClose",
+  "savedSqlOpenTargetMode",
   "appLayout",
   "tabLayout",
   "showColumnCommentsInHeader",
   "showColumnTypesInHeader",
+  "showIndexIndicatorsInHeader",
   "compactColumnHeaderActions",
   "dataGridQuickEntry",
   "dataGridAutoTransposeSingleRow",
+  "pageSize",
   "tableOpenPageSize",
+  "queryResultMaxRowsEnabled",
+  "queryResultMaxRows",
   "infiniteScroll",
-  "infiniteScrollMaxRows",
+  "regexMaxMatchCount",
   "autoCalculateTotalRows",
   "tableColumnTemplateFields",
   "shortcuts",
@@ -44,7 +54,7 @@ export const EDITOR_SETTINGS_DRAFT_KEYS = [
   "autoSelectActiveSidebarNode",
   "openTabsRestoreMode",
   "disconnectTabHandlingMode",
-  "reuseDataTab",
+  "dataTabReuseMode",
   "prefillNewQueryWithSelect",
   "updateNotificationsEnabled",
   "sidebarObjectInfoMode",
@@ -63,6 +73,7 @@ export const EDITOR_SETTINGS_DRAFT_KEYS = [
   "sqlVariableSyntaxOverrides",
   "continueOnErrorOnBatch",
   "clickTableNavigationTarget",
+  "completionTriggerMode",
 ] as const satisfies readonly (keyof EditorSettings)[];
 
 export type EditorSettingsDraftKey = (typeof EDITOR_SETTINGS_DRAFT_KEYS)[number];
@@ -78,8 +89,14 @@ export function normalizeTableOpenPageSizeDraft(value: unknown): number {
   return normalizeResultPageSize(value);
 }
 
+export function normalizeQueryResultMaxRowsDraft(value: unknown): number {
+  return normalizeQueryResultMaxRows(value);
+}
+
 function normalizedDraftValue(key: EditorSettingsDraftKey, value: unknown): unknown {
-  if (key === "tableOpenPageSize") return normalizeTableOpenPageSizeDraft(value);
+  if (key === "pageSize" || key === "tableOpenPageSize") return normalizeTableOpenPageSizeDraft(value);
+  if (key === "queryResultMaxRows") return normalizeQueryResultMaxRowsDraft(value);
+  if (key === "completionTriggerMode") return normalizeCompletionTriggerMode(value);
   return value;
 }
 

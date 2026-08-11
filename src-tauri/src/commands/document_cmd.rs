@@ -57,6 +57,7 @@ pub async fn document_find_documents(
     filter: Option<String>,
     projection: Option<String>,
     sort: Option<String>,
+    collation: Option<String>,
     execution_id: Option<String>,
 ) -> Result<DocumentQueryResult, String> {
     let app = state.inner().clone();
@@ -73,6 +74,7 @@ pub async fn document_find_documents(
             filter.as_deref(),
             projection.as_deref(),
             sort.as_deref(),
+            collation.as_deref(),
         ),
     )
     .await
@@ -103,17 +105,30 @@ pub async fn document_insert_document(
     collection: String,
     doc_json: String,
     routing: Option<String>,
+    preserve_bson_types: Option<bool>,
 ) -> Result<String, String> {
     ensure_connection_writable(&state, &connection_id, "Insert").await?;
-    dbx_core::document_ops::insert_document_core(
-        &state,
-        &connection_id,
-        &database,
-        &collection,
-        &doc_json,
-        routing.as_deref(),
-    )
-    .await
+    if preserve_bson_types.unwrap_or(false) {
+        dbx_core::document_ops::insert_document_preserving_bson_types_core(
+            &state,
+            &connection_id,
+            &database,
+            &collection,
+            &doc_json,
+            routing.as_deref(),
+        )
+        .await
+    } else {
+        dbx_core::document_ops::insert_document_core(
+            &state,
+            &connection_id,
+            &database,
+            &collection,
+            &doc_json,
+            routing.as_deref(),
+        )
+        .await
+    }
 }
 
 #[tauri::command]
@@ -147,15 +162,17 @@ pub async fn document_delete_document(
     collection: String,
     id: String,
     routing: Option<String>,
+    document_type: Option<String>,
 ) -> Result<u64, String> {
     ensure_connection_writable(&state, &connection_id, "Delete").await?;
-    dbx_core::document_ops::delete_document_core(
+    dbx_core::document_ops::delete_document_core_with_type(
         &state,
         &connection_id,
         &database,
         &collection,
         &id,
         routing.as_deref(),
+        document_type.as_deref(),
     )
     .await
 }

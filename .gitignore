@@ -15,14 +15,18 @@ CLAUDE.md
 dist/
 coverage/
 /target/
+src-tauri/webview2-fixed-runtime/
 plugins/jdbc/target/
 plugins/jdbc/dependency-reduced-pom.xml
 plugins/jdbc/lib/*.jar
+plugins/jdbc/.gradle/
+plugins/jdbc/build/
 plugins/jdbc/dist/
 docs/.next/
 docs/out/
 docs/.source/
 docs/superpowers/
+/docs/aegis/
 src-tauri/*.dylib
 
 # OS files
@@ -71,3 +75,6 @@ DBX_*_x64-portable.zip
 # Local devtest connections (contains credentials; do not commit)
 dbx-devtest-connections.json
 .npmrc
+
+# Real database integration credentials (see docs/TEST_ENVIRONMENTS.md)
+/docs/TEST_ENVIRONMENTS.md

@@ -43,6 +43,51 @@ describe("extractSqlParameters", () => {
     expect(extractSqlParameters(sql)).toEqual(["?1", "named", "shell_name", "mybatis_name", "sql_server_name"]);
   });
 
+  it("preserves PostgreSQL JSON question-mark operators", () => {
+    const sql = `
+      select
+        c."CallResult",
+        c."CallResult" -> 'data' ? 'callingResults' as "HasResult",
+        c."CallResult" ?| array['data', 'error'] as "HasAnyResult",
+        c."CallResult" ?& array['data', 'callingResults'] as "HasAllResults",
+        c."CallResult" @? '$.data.callingResults' as "MatchesPath"
+      from "FaultResultCallInfo" as c
+    `;
+
+    expect(extractSqlParameters(sql, { databaseType: "postgres" })).toEqual([]);
+    expect(substituteSqlParameters(sql, {}, { databaseType: "postgres" })).toBe(sql);
+  });
+
+  it("keeps PostgreSQL positional placeholders around JSON operators", () => {
+    const sql = "select ? as input_value from events where id = ? and payload ? ? and payload ?| ? and payload ?& ? limit ?";
+
+    expect(extractSqlParameters(sql, { databaseType: "postgres" })).toEqual(["?1", "?2", "?3", "?4", "?5", "?6"]);
+    expect(
+      substituteSqlParameters(
+        sql,
+        {
+          "?1": { kind: "number", value: "1" },
+          "?2": { kind: "number", value: "2" },
+          "?3": { kind: "string", value: "callingResults" },
+          "?4": { kind: "raw", value: "ARRAY['data', 'error']" },
+          "?5": { kind: "raw", value: "ARRAY['data', 'callingResults']" },
+          "?6": { kind: "number", value: "100" },
+        },
+        { databaseType: "postgres" },
+      ),
+    ).toBe("select 1 as input_value from events where id = 2 and payload ? 'callingResults' and payload ?| ARRAY['data', 'error'] and payload ?& ARRAY['data', 'callingResults'] limit 100");
+  });
+
+  it("keeps ordinary PostgreSQL positional placeholder contexts", () => {
+    const sql = "select ?::jsonb, coalesce(?, '{}'::jsonb) from events where ? = id order by ? limit ? offset ?";
+
+    expect(extractSqlParameters(sql, { databaseType: "postgres" })).toEqual(["?1", "?2", "?3", "?4", "?5", "?6"]);
+  });
+
+  it("keeps question marks as positional placeholders for other databases", () => {
+    expect(extractSqlParameters("select payload ? 'callingResults' from events", { databaseType: "mysql" })).toEqual(["?1"]);
+  });
+
   it("ignores npm scoped packages in JDBCX MCP command arguments", () => {
     const sql = '{{ mcp(cmd=npx, args=-y @modelcontextprotocol/server-everything, tool=echo): {"message":"hello"} }}';
     expect(extractSqlParameters(sql)).toEqual([]);
@@ -51,6 +96,14 @@ describe("extractSqlParameters", () => {
 
   it("keeps SQL Server parameters used in division expressions", () => {
     expect(extractSqlParameters("select @amount/2, @total / 4")).toEqual(["amount", "total"]);
+  });
+
+  it("ignores Oracle database links while preserving standalone at-sign placeholders", () => {
+    const sql = 'SELECT * FROM HR.EMPLOYEES@REMOTE_DB, "AUDIT_LOG"@ARCHIVE_DB WHERE tenant_id = @tenant_id';
+    expect(extractSqlParameters("SELECT 1 FROM DUAL@WDHIS160;", { databaseType: "oracle" })).toEqual([]);
+    expect(extractSqlParameters(sql, { databaseType: "oracle" })).toEqual(["tenant_id"]);
+    expect(substituteSqlParameters(sql, { tenant_id: { kind: "number", value: "7" } }, { databaseType: "oracle" })).toBe('SELECT * FROM HR.EMPLOYEES@REMOTE_DB, "AUDIT_LOG"@ARCHIVE_DB WHERE tenant_id = 7');
+    expect(extractSqlParameters("SELECT * FROM EMPLOYEES@REMOTE_DB", { databaseType: "postgres" })).toEqual(["REMOTE_DB"]);
   });
 
   it("describes each placeholder syntax for the parameter dialog", () => {
@@ -251,6 +304,90 @@ describe("extractSqlParameters", () => {
 
     expect(extractSqlParameters(sql, { databaseType: "doris" })).toEqual(["real"]);
     expect(substituteSqlParameters(sql, { real: { kind: "number", value: "7" } }, { databaseType: "doris" })).toBe("create table `broken` (value struct<field:int,\nselect 7;");
+  });
+
+  it("ignores DuckDB compact struct literal field separators", () => {
+    const sql = `
+      select {
+        'compact':column,
+        'spaced' : other_column,
+        bare_key:third_column,
+        'nested':{'inner':nested_column},
+        'listed':[{'item':list_column}],
+        'mapped':map(['entry'], [{'value':mapped_column}])
+      }
+      from t
+    `;
+
+    expect(extractSqlParameters(sql, { databaseType: "duckdb" })).toEqual([]);
+    expect(substituteSqlParameters(sql, {}, { databaseType: "duckdb" })).toBe(sql);
+  });
+
+  it("keeps real DuckDB named placeholders in struct values and outside structs", () => {
+    const sql = "select {'key': :value, 'nested': {'inner':coalesce(:nested_value, fallback_column)}}, :outside from t";
+
+    expect(extractSqlParameters(sql, { databaseType: "duckdb" })).toEqual(["value", "nested_value", "outside"]);
+    expect(
+      substituteSqlParameters(
+        sql,
+        {
+          value: { kind: "number", value: "1" },
+          nested_value: { kind: "number", value: "2" },
+          outside: { kind: "number", value: "3" },
+        },
+        { databaseType: "duckdb" },
+      ),
+    ).toBe("select {'key': 1, 'nested': {'inner':coalesce(2, fallback_column)}}, 3 from t");
+  });
+
+  it("does not globally hide DuckDB named placeholders inside braces", () => {
+    const sql = "select {'key':column}, {fn coalesce(:inside, 1)}, :outside";
+
+    expect(extractSqlParameters(sql, { databaseType: "duckdb" })).toEqual(["inside", "outside"]);
+    expect(extractSqlParameters(sql, { databaseType: "postgres" })).toEqual(["column", "inside", "outside"]);
+  });
+
+  it("ignores DuckDB struct separators around comments and quoted values", () => {
+    const sql = `
+      select {
+        'key' /* field separator */ :column,
+        'text':'literal :ignored',
+        'call':coalesce(:value, {'inner':inner_column})
+      }, :outside
+      -- {'comment':comment_column}
+    `;
+
+    expect(extractSqlParameters(sql, { databaseType: "duckdb" })).toEqual(["value", "outside"]);
+  });
+
+  it("falls back conservatively for an unterminated DuckDB struct literal", () => {
+    const sql = "select {'key':column, 'nested':{'inner':nested_column}\nunion all select :later";
+
+    expect(extractSqlParameters(sql, { databaseType: "duckdb" })).toEqual(["column", "nested_column", "later"]);
+  });
+
+  it("ignores compact DuckDB prefix alias separators", () => {
+    const sql = 'select total:price * quantity, "order":sum(amount) from sales';
+
+    expect(extractSqlParameters(sql, { databaseType: "duckdb" })).toEqual([]);
+    expect(substituteSqlParameters(sql, {}, { databaseType: "duckdb" })).toBe(sql);
+    expect(extractSqlParameters(sql, { databaseType: "postgres" })).toEqual(["price", "sum"]);
+  });
+
+  it("keeps named parameters inside DuckDB prefix alias expressions", () => {
+    const sql = "from r:range(:row_count) select total:r.range + :offset";
+
+    expect(extractSqlParameters(sql, { databaseType: "duckdb" })).toEqual(["row_count", "offset"]);
+    expect(
+      substituteSqlParameters(
+        sql,
+        {
+          row_count: { kind: "number", value: "3" },
+          offset: { kind: "number", value: "10" },
+        },
+        { databaseType: "duckdb" },
+      ),
+    ).toBe("from r:range(3) select total:r.range + 10");
   });
 
   it("ignores Doris VARIANT field type separators", () => {

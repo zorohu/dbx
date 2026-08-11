@@ -37,6 +37,16 @@ function mysqlConnection(): ConnectionConfig {
   } as ConnectionConfig;
 }
 
+function dorisConnection(): ConnectionConfig {
+  return {
+    ...mysqlConnection(),
+    id: "doris-1",
+    name: "Doris",
+    db_type: "doris",
+    port: 9030,
+  } as ConnectionConfig;
+}
+
 function oracleConnection(): ConnectionConfig {
   return {
     id: "oracle-1",
@@ -47,6 +57,19 @@ function oracleConnection(): ConnectionConfig {
     username: "SYSTEM",
     password: "",
     database: "XE",
+  } as ConnectionConfig;
+}
+
+function xuguConnection(): ConnectionConfig {
+  return {
+    id: "xugu-1",
+    name: "XuguDB",
+    db_type: "xugu",
+    host: "127.0.0.1",
+    port: 5138,
+    username: "app_user",
+    password: "",
+    database: "app_db",
   } as ConnectionConfig;
 }
 
@@ -62,6 +85,42 @@ function genericJdbcConnection(): ConnectionConfig {
     database: "testdb",
     driver_profile: "jdbc",
     connection_string: "jdbc:example://127.0.0.1/testdb",
+  } as ConnectionConfig;
+}
+
+function oracleJdbcConnection(): ConnectionConfig {
+  return {
+    ...genericJdbcConnection(),
+    id: "jdbc-oracle-1",
+    name: "Oracle JDBC",
+    username: "DBX_TEST",
+    database: undefined,
+    connection_string: "jdbc:oracle:thin:@//127.0.0.1:1521/XE",
+    jdbc_driver_class: "oracle.jdbc.OracleDriver",
+  } as ConnectionConfig;
+}
+
+function informixConnection(): ConnectionConfig {
+  return {
+    id: "informix-1",
+    name: "Informix",
+    db_type: "informix",
+    host: "127.0.0.1",
+    port: 9088,
+    username: "informix",
+    password: "",
+    database: "prulife",
+  } as ConnectionConfig;
+}
+
+function gbase8sConnection(): ConnectionConfig {
+  return {
+    ...informixConnection(),
+    id: "gbase8s-1",
+    name: "GBase 8s",
+    db_type: "gbase",
+    driver_profile: "gbase8s",
+    database: "dbx_test",
   } as ConnectionConfig;
 }
 
@@ -85,6 +144,140 @@ describe("connectionStore metadata loading", () => {
     installLocalStorage();
     setActivePinia(createPinia());
   });
+
+  // Dynamic import of the merged connectionStore plus the scoped metadata
+  // load can exceed Vitest's 5s default on slower CI runners; the assertion
+  // is deterministic, so allow a wider timeout.
+  it("loads Xugu package members through the scoped completion endpoint", async () => {
+    const completionAssistantSearch = vi.fn().mockResolvedValue({
+      candidates: [
+        { name: "process_item", kind: "procedure", signature: "p_id IN INT" },
+        { name: "process_item", kind: "procedure", signature: "p_code IN VARCHAR" },
+        { name: "item_count", kind: "function", data_type: "INT" },
+      ],
+      incomplete: false,
+      fallback_used: false,
+    });
+    vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
+    vi.doMock("@/lib/backend/api", () => ({ checkConnectionHealth: vi.fn().mockResolvedValue(undefined), completionAssistantSearch }));
+
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const store = useConnectionStore();
+    const connection = xuguConnection();
+    const packageNode: TreeNode = {
+      id: "xugu-1:app_db:app_schema:package:business_api",
+      label: "business_api",
+      type: "package",
+      connectionId: connection.id,
+      database: "app_db",
+      schema: "app_schema",
+      children: [],
+      isExpanded: false,
+    };
+    store.connections = [connection];
+    store.connectedIds = new Set([connection.id]);
+    store.treeNodes = [packageNode];
+
+    await store.loadPackageMembers(packageNode);
+
+    expect(completionAssistantSearch).toHaveBeenCalledWith({
+      connection_id: connection.id,
+      database: "app_db",
+      schema: "app_schema",
+      object_kinds: ["routine"],
+      mask: "",
+      case_sensitive: true,
+      global_search: false,
+      max_results: 1000,
+      search_in_comments: false,
+      search_in_definitions: false,
+      parent_schema: "app_schema",
+      parent_name: "business_api",
+      parent_type: "package",
+      match_mode: "prefix",
+    });
+    expect(packageNode.isExpanded).toBe(true);
+    expect(packageNode.children?.map((child) => child.label)).toEqual(["process_item(p_id IN INT)", "process_item(p_code IN VARCHAR)", "item_count"]);
+    expect(packageNode.children?.every((child) => child.parentName === "business_api")).toBe(true);
+  }, 15000);
+
+  it("loads Oracle package overloads through the shared package member path", async () => {
+    const completionAssistantSearch = vi.fn().mockResolvedValue({
+      candidates: [
+        { name: "CALCULATE", kind: "procedure", signature: "P_VALUE IN NUMBER" },
+        { name: "CALCULATE", kind: "procedure", signature: "P_VALUE IN VARCHAR2" },
+        { name: "ITEM_COUNT", kind: "function", data_type: "NUMBER" },
+      ],
+      incomplete: false,
+      fallback_used: false,
+    });
+    vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
+    vi.doMock("@/lib/backend/api", () => ({ checkConnectionHealth: vi.fn().mockResolvedValue(undefined), completionAssistantSearch }));
+
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const store = useConnectionStore();
+    const connection = oracleConnection();
+    const packageNode: TreeNode = {
+      id: "oracle-1:XE:APP:package:BUSINESS_API",
+      label: "BUSINESS_API",
+      type: "package",
+      connectionId: connection.id,
+      database: "XE",
+      schema: "APP",
+      children: [],
+      isExpanded: false,
+    };
+    store.connections = [connection];
+    store.connectedIds = new Set([connection.id]);
+    store.treeNodes = [packageNode];
+
+    await store.loadPackageMembers(packageNode);
+
+    expect(completionAssistantSearch).toHaveBeenCalledWith({
+      connection_id: connection.id,
+      database: "XE",
+      schema: "APP",
+      object_kinds: ["routine"],
+      mask: "",
+      case_sensitive: true,
+      global_search: false,
+      max_results: 1000,
+      search_in_comments: false,
+      search_in_definitions: false,
+      parent_schema: "APP",
+      parent_name: "BUSINESS_API",
+      match_mode: "prefix",
+    });
+    expect(packageNode.isExpanded).toBe(true);
+    expect(packageNode.children?.map((child) => child.label)).toEqual(["CALCULATE(P_VALUE IN NUMBER)", "CALCULATE(P_VALUE IN VARCHAR2)", "ITEM_COUNT"]);
+  }, 15000);
+
+  it("does not query package members for unsupported databases", async () => {
+    const completionAssistantSearch = vi.fn();
+    vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
+    vi.doMock("@/lib/backend/api", () => ({ checkConnectionHealth: vi.fn().mockResolvedValue(undefined), completionAssistantSearch }));
+
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const store = useConnectionStore();
+    const connection = { ...xuguConnection(), id: "dameng-1", db_type: "dameng" } as ConnectionConfig;
+    const packageNode: TreeNode = {
+      id: "dameng-1:APP:package:BUSINESS_API",
+      label: "BUSINESS_API",
+      type: "package",
+      connectionId: connection.id,
+      database: "APP",
+      schema: "APP",
+      children: [],
+      isExpanded: false,
+    };
+    store.connections = [connection];
+    store.connectedIds = new Set([connection.id]);
+
+    await store.loadPackageMembers(packageNode);
+
+    expect(completionAssistantSearch).not.toHaveBeenCalled();
+    expect(packageNode.isExpanded).toBe(false);
+  }, 15000);
 
   it("loads missing database roots only for connected sidebar search targets", async () => {
     const checkConnectionHealth = vi.fn().mockResolvedValue(undefined);
@@ -213,6 +406,49 @@ describe("connectionStore metadata loading", () => {
     ]);
   });
 
+  it("loads inferred Oracle JDBC schemas without requesting empty catalogs", async () => {
+    const listDatabases = vi.fn().mockResolvedValue([]);
+    const listSchemas = vi.fn().mockResolvedValue(["ANONYMOUS", "DBX_TEST", "SYS", "SYSTEM"]);
+    const listTables = vi.fn().mockResolvedValue([{ name: "sheet", table_type: "TABLE", comment: null }]);
+
+    vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
+    vi.doMock("@/lib/backend/api", () => ({
+      checkConnectionHealth: vi.fn().mockResolvedValue(undefined),
+      deleteSchemaCachePrefix: vi.fn().mockResolvedValue(undefined),
+      listDatabases,
+      listObjects: vi.fn().mockResolvedValue([]),
+      listSchemas,
+      listTables,
+      loadSchemaCache: vi.fn().mockResolvedValue(null),
+      saveSchemaCache: vi.fn().mockResolvedValue(undefined),
+      saveConnections: vi.fn().mockResolvedValue(undefined),
+      saveSidebarLayout: vi.fn().mockResolvedValue(undefined),
+    }));
+
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const store = useConnectionStore();
+    useSettingsStore().editorSettings.sidebarObjectDisplay = "simple";
+    const connection = oracleJdbcConnection();
+    const connectionNode: TreeNode = { id: connection.id, label: connection.name, type: "connection", connectionId: connection.id, isExpanded: false, children: [] };
+    store.connections = [connection];
+    store.connectedIds.add(connection.id);
+    store.treeNodes = [connectionNode];
+
+    await store.loadDatabases(connection.id, { force: true });
+
+    expect(listDatabases).not.toHaveBeenCalled();
+    expect(listSchemas).toHaveBeenCalledWith(connection.id, "");
+    expect(connectionNode.children?.map((node) => [node.type, node.label, node.database, node.schema])).toEqual([["schema", "DBX_TEST", "DBX_TEST", "DBX_TEST"]]);
+
+    const schemaNode = connectionNode.children?.[0];
+    expect(schemaNode).toBeDefined();
+    await store.loadTreeNodeChildren(schemaNode!, { force: true });
+
+    expect(listTables.mock.calls[0]?.slice(0, 3)).toEqual([connection.id, "DBX_TEST", "DBX_TEST"]);
+    expect(schemaNode?.children?.map((node) => [node.type, node.label, node.schema])).toEqual([["table", "sheet", "DBX_TEST"]]);
+  });
+
   it("keeps the flat object tree for unknown generic JDBC databases without schemas", async () => {
     const listSchemaInfos = vi.fn().mockResolvedValue([]);
     const listTables = vi.fn().mockResolvedValue([{ name: "t", table_type: "TABLE", comment: null }]);
@@ -245,6 +481,40 @@ describe("connectionStore metadata loading", () => {
     expect(listSchemaInfos).toHaveBeenCalledWith(connection.id, "testdb");
     expect(listTables).toHaveBeenCalled();
     expect(databaseNode.children?.map((node) => [node.type, node.label, node.schema])).toEqual([["table", "t", undefined]]);
+  });
+
+  it("keeps the flat object tree for GBase 8s databases that cannot qualify schemas in DML", async () => {
+    const listSchemaInfos = vi.fn().mockResolvedValue([]);
+    const listTables = vi.fn().mockResolvedValue([{ name: "connection_smoke", table_type: "TABLE", comment: null }]);
+
+    vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
+    vi.doMock("@/lib/backend/api", () => ({
+      checkConnectionHealth: vi.fn().mockResolvedValue(undefined),
+      deleteSchemaCachePrefix: vi.fn().mockResolvedValue(undefined),
+      listObjects: vi.fn().mockResolvedValue([]),
+      listSchemaInfos,
+      listTables,
+      loadSchemaCache: vi.fn().mockResolvedValue(null),
+      saveSchemaCache: vi.fn().mockResolvedValue(undefined),
+      saveConnections: vi.fn().mockResolvedValue(undefined),
+      saveSidebarLayout: vi.fn().mockResolvedValue(undefined),
+    }));
+
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const store = useConnectionStore();
+    useSettingsStore().editorSettings.sidebarObjectDisplay = "simple";
+    const connection = gbase8sConnection();
+    const databaseNode: TreeNode = { id: `${connection.id}:dbx_test`, label: "dbx_test", type: "database", connectionId: connection.id, database: "dbx_test", isExpanded: false, children: [] };
+    store.connections = [connection];
+    store.connectedIds.add(connection.id);
+    store.treeNodes = [{ id: connection.id, label: connection.name, type: "connection", connectionId: connection.id, isExpanded: true, children: [databaseNode] }];
+
+    await store.loadTreeNodeChildren(databaseNode, { force: true });
+
+    expect(listSchemaInfos).toHaveBeenCalledWith(connection.id, "dbx_test");
+    expect(listTables).toHaveBeenCalled();
+    expect(databaseNode.children?.map((node) => [node.type, node.label, node.schema])).toEqual([["table", "connection_smoke", undefined]]);
   });
 
   it("renders simple-mode table children without waiting for supplemental objects", async () => {
@@ -313,7 +583,7 @@ describe("connectionStore metadata loading", () => {
   });
 
   it("keeps concurrent table-tree and local-index refreshes in separate cache entries", async () => {
-    const treeCacheKey = "pg-1:app:public:group-tables:objects-v6";
+    const treeCacheKey = "pg-1:app:public:group-tables:objects-v8";
     const indexCacheKey = `${treeCacheKey}:table-search-index-v1`;
     const cachedPayloads = new Map<string, unknown>([
       [
@@ -597,6 +867,67 @@ describe("connectionStore metadata loading", () => {
     expect(currentTableGroup().children?.map((node) => node.label)).toEqual(["new_users"]);
   });
 
+  it("applies include filters to Doris internal table groups", async () => {
+    const listTables = vi.fn().mockResolvedValue([{ name: "ads_pgc_report", table_type: "BASE TABLE", comment: null }]);
+
+    vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
+    vi.doMock("@/lib/backend/api", () => ({
+      checkConnectionHealth: vi.fn().mockResolvedValue(undefined),
+      deleteSchemaCachePrefix: vi.fn().mockResolvedValue(undefined),
+      listTables,
+      loadSchemaCache: vi.fn().mockResolvedValue(null),
+      saveSchemaCache: vi.fn().mockResolvedValue(undefined),
+      saveConnections: vi.fn().mockResolvedValue(undefined),
+      saveSidebarLayout: vi.fn().mockResolvedValue(undefined),
+    }));
+
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const store = useConnectionStore();
+    const connection = dorisConnection();
+    const tableGroup: TreeNode = {
+      id: "doris-1:warehouse:__tables",
+      label: "tree.tables",
+      type: "group-tables",
+      connectionId: connection.id,
+      database: "warehouse",
+      isExpanded: false,
+      children: [],
+    };
+    store.connections = [connection];
+    store.connectedIds.add(connection.id);
+    store.treeNodes = [
+      {
+        id: connection.id,
+        label: connection.name,
+        type: "connection",
+        connectionId: connection.id,
+        isExpanded: true,
+        children: [
+          {
+            id: "doris-1:warehouse",
+            label: "warehouse",
+            type: "database",
+            connectionId: connection.id,
+            database: "warehouse",
+            isExpanded: true,
+            children: [tableGroup],
+          },
+        ],
+      },
+    ];
+
+    const scopeKey = store.tableNameFilterScopeKey({
+      connectionId: connection.id,
+      database: "warehouse",
+      nodeKind: "group-tables",
+    });
+    const revision = store.setSidebarTableNameFilter(scopeKey, { includePatterns: ["ads_pgc_%"], excludePatterns: [] });
+    await store.refreshTreeNodeForTableNameFilter(tableGroup, scopeKey, revision);
+
+    expect(listTables).toHaveBeenCalledWith(connection.id, "warehouse", "warehouse", undefined, 1001, 0, ["TABLE"], undefined, { includePatterns: ["ads_pgc_%"], excludePatterns: [] });
+    expect(tableGroup.children?.map((node) => node.label)).toEqual(["ads_pgc_report"]);
+  });
+
   it("clears a stale connection error after a schema metadata retry succeeds", async () => {
     const listSchemaInfos = vi
       .fn()
@@ -648,6 +979,261 @@ describe("connectionStore metadata loading", () => {
 
     expect(store.connectionErrors[connection.id]).toBeUndefined();
     expect(store.treeNodes[0]?.children?.[0]?.children?.map((node) => node.label)).toEqual(["public", "tree.extensions"]);
+  });
+
+  it("preserves the last successful tree snapshot when a forced metadata refresh fails", async () => {
+    const listSchemaInfos = vi.fn().mockRejectedValue(new Error("Agent RPC call timed out (5s)"));
+    const deleteSchemaCachePrefix = vi.fn().mockResolvedValue(undefined);
+
+    vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
+    vi.doMock("@/lib/backend/api", () => ({
+      checkConnectionHealth: vi.fn().mockResolvedValue(undefined),
+      deleteSchemaCachePrefix,
+      listInstalledAgents: vi.fn().mockResolvedValue([]),
+      listSchemaInfos,
+      loadSchemaCache: vi.fn().mockResolvedValue(null),
+      saveConnections: vi.fn().mockResolvedValue(undefined),
+      saveSchemaCache: vi.fn().mockResolvedValue(undefined),
+      saveSidebarLayout: vi.fn().mockResolvedValue(undefined),
+    }));
+
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const store = useConnectionStore();
+    const connection = postgresConnection();
+    const previousSchema: TreeNode = {
+      id: `${connection.id}:app:public`,
+      label: "public",
+      type: "schema",
+      connectionId: connection.id,
+      database: "app",
+      schema: "public",
+      isExpanded: false,
+      children: [],
+    };
+    const databaseNode: TreeNode = {
+      id: `${connection.id}:app`,
+      label: "app",
+      type: "database",
+      connectionId: connection.id,
+      database: "app",
+      isExpanded: true,
+      children: [previousSchema],
+    };
+    store.connections = [connection];
+    store.connectedIds.add(connection.id);
+    store.treeNodes = [
+      {
+        id: connection.id,
+        label: connection.name,
+        type: "connection",
+        connectionId: connection.id,
+        isExpanded: true,
+        children: [databaseNode],
+      },
+    ];
+
+    await expect(store.refreshTreeNode(databaseNode)).rejects.toThrow("Agent RPC call timed out (5s)");
+
+    expect(databaseNode.children).toEqual([previousSchema]);
+    expect(databaseNode.isExpanded).toBe(true);
+    expect(store.connectionErrors[connection.id]).toBe("Agent RPC call timed out (5s)");
+    expect(deleteSchemaCachePrefix).toHaveBeenCalledWith("pg-1:app:");
+  });
+
+  it("does not let an older refresh resume after a newer refresh succeeds", async () => {
+    let resolveOlderMetadata!: (value: Array<{ name: string; comment: null }>) => void;
+    const olderMetadata = new Promise<Array<{ name: string; comment: null }>>((resolve) => {
+      resolveOlderMetadata = resolve;
+    });
+    const deleteSchemaCachePrefix = vi.fn().mockResolvedValue(undefined);
+    const listSchemaInfos = vi
+      .fn()
+      .mockImplementationOnce(() => olderMetadata)
+      .mockResolvedValue([{ name: "latest", comment: null }]);
+
+    vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
+    vi.doMock("@/lib/backend/api", () => ({
+      checkConnectionHealth: vi.fn().mockResolvedValue(undefined),
+      deleteSchemaCachePrefix,
+      listInstalledAgents: vi.fn().mockResolvedValue([]),
+      listSchemaInfos,
+      loadSchemaCache: vi.fn().mockResolvedValue(null),
+      saveConnections: vi.fn().mockResolvedValue(undefined),
+      saveSchemaCache: vi.fn().mockResolvedValue(undefined),
+      saveSidebarLayout: vi.fn().mockResolvedValue(undefined),
+    }));
+
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const store = useConnectionStore();
+    const connection = postgresConnection();
+    const databaseNode: TreeNode = {
+      id: `${connection.id}:app`,
+      label: "app",
+      type: "database",
+      connectionId: connection.id,
+      database: "app",
+      isExpanded: true,
+      children: [],
+    };
+    store.connections = [connection];
+    store.connectedIds.add(connection.id);
+    store.treeNodes = [
+      {
+        id: connection.id,
+        label: connection.name,
+        type: "connection",
+        connectionId: connection.id,
+        isExpanded: true,
+        children: [databaseNode],
+      },
+    ];
+
+    const olderRefresh = store.refreshTreeNode(databaseNode);
+    await vi.waitFor(() => expect(listSchemaInfos).toHaveBeenCalledTimes(1));
+    await store.refreshTreeNode(databaseNode);
+    resolveOlderMetadata([{ name: "stale", comment: null }]);
+    await olderRefresh;
+
+    expect(listSchemaInfos).toHaveBeenCalledTimes(2);
+    expect(databaseNode.children?.map((node) => node.label)).toEqual(["latest", "tree.extensions"]);
+  });
+
+  it("does not let an older refresh failure overwrite a newer successful refresh", async () => {
+    let rejectOlderMetadata!: (reason: Error) => void;
+    const olderMetadata = new Promise<Array<{ name: string; comment: null }>>((_, reject) => {
+      rejectOlderMetadata = reject;
+    });
+    const listSchemaInfos = vi
+      .fn()
+      .mockImplementationOnce(() => olderMetadata)
+      .mockResolvedValue([{ name: "latest", comment: null }]);
+
+    vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
+    vi.doMock("@/lib/backend/api", () => ({
+      checkConnectionHealth: vi.fn().mockResolvedValue(undefined),
+      deleteSchemaCachePrefix: vi.fn().mockResolvedValue(undefined),
+      listInstalledAgents: vi.fn().mockResolvedValue([]),
+      listSchemaInfos,
+      loadSchemaCache: vi.fn().mockResolvedValue(null),
+      saveConnections: vi.fn().mockResolvedValue(undefined),
+      saveSchemaCache: vi.fn().mockResolvedValue(undefined),
+      saveSidebarLayout: vi.fn().mockResolvedValue(undefined),
+    }));
+
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const store = useConnectionStore();
+    const connection = postgresConnection();
+    const databaseNode: TreeNode = {
+      id: `${connection.id}:app`,
+      label: "app",
+      type: "database",
+      connectionId: connection.id,
+      database: "app",
+      isExpanded: true,
+      children: [],
+    };
+    store.connections = [connection];
+    store.connectedIds.add(connection.id);
+    store.treeNodes = [
+      {
+        id: connection.id,
+        label: connection.name,
+        type: "connection",
+        connectionId: connection.id,
+        isExpanded: true,
+        children: [databaseNode],
+      },
+    ];
+
+    const olderRefresh = store.refreshTreeNode(databaseNode);
+    await vi.waitFor(() => expect(listSchemaInfos).toHaveBeenCalledTimes(1));
+    await store.refreshTreeNode(databaseNode);
+    rejectOlderMetadata(new Error("connection closed"));
+    await expect(olderRefresh).rejects.toThrow("connection closed");
+
+    expect(databaseNode.children?.map((node) => node.label)).toEqual(["latest", "tree.extensions"]);
+    expect(store.connectionErrors[connection.id]).toBeUndefined();
+    expect(store.connectedIds.has(connection.id)).toBe(true);
+  });
+
+  it("does not restore a pre-disconnect snapshot into a same-id reconnected node", async () => {
+    let rejectMetadata!: (reason: Error) => void;
+    const pendingMetadata = new Promise<Array<{ name: string; comment: null }>>((_, reject) => {
+      rejectMetadata = reject;
+    });
+    const listSchemaInfos = vi.fn().mockReturnValue(pendingMetadata);
+
+    vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
+    vi.doMock("@/lib/backend/api", () => ({
+      checkConnectionHealth: vi.fn().mockResolvedValue(undefined),
+      deleteSchemaCachePrefix: vi.fn().mockResolvedValue(undefined),
+      disconnectDb: vi.fn().mockResolvedValue(undefined),
+      listInstalledAgents: vi.fn().mockResolvedValue([]),
+      listSchemaInfos,
+      loadSchemaCache: vi.fn().mockResolvedValue(null),
+      saveConnections: vi.fn().mockResolvedValue(undefined),
+      saveSchemaCache: vi.fn().mockResolvedValue(undefined),
+      saveSidebarLayout: vi.fn().mockResolvedValue(undefined),
+    }));
+
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const store = useConnectionStore();
+    const connection = postgresConnection();
+    const databaseId = `${connection.id}:app`;
+    const staleSchema: TreeNode = {
+      id: `${databaseId}:stale`,
+      label: "stale",
+      type: "schema",
+      connectionId: connection.id,
+      database: "app",
+      schema: "stale",
+      children: [],
+    };
+    const databaseNode: TreeNode = {
+      id: databaseId,
+      label: "app",
+      type: "database",
+      connectionId: connection.id,
+      database: "app",
+      isExpanded: true,
+      children: [staleSchema],
+    };
+    const connectionNode: TreeNode = {
+      id: connection.id,
+      label: connection.name,
+      type: "connection",
+      connectionId: connection.id,
+      isExpanded: true,
+      children: [databaseNode],
+    };
+    store.connections = [connection];
+    store.connectedIds.add(connection.id);
+    store.treeNodes = [connectionNode];
+
+    const staleRefresh = store.refreshTreeNode(databaseNode);
+    await vi.waitFor(() => expect(listSchemaInfos).toHaveBeenCalledTimes(1));
+    await store.disconnect(connection.id);
+
+    const freshSchema: TreeNode = {
+      id: `${databaseId}:fresh`,
+      label: "fresh",
+      type: "schema",
+      connectionId: connection.id,
+      database: "app",
+      schema: "fresh",
+      children: [],
+    };
+    const reconnectedDatabaseNode: TreeNode = {
+      ...databaseNode,
+      children: [freshSchema],
+    };
+    connectionNode.children = [reconnectedDatabaseNode];
+    store.connectedIds.add(connection.id);
+
+    rejectMetadata(new Error("disconnected refresh"));
+    await expect(staleRefresh).rejects.toThrow("disconnected refresh");
+
+    expect(reconnectedDatabaseNode.children?.map((child) => child.label)).toEqual(["fresh"]);
   });
 
   it.each(["opengauss", "kingbase"] as const)("reloads %s sidebar schemas when system visibility changes", async (dbType) => {
@@ -1847,6 +2433,223 @@ describe("connectionStore metadata loading", () => {
     expect(store.isTreeNodeChildrenLoaded(test1Id)).toBe(false);
   });
 
+  it("does not re-expand a node collapsed while its load is still in flight", async () => {
+    let resolveTables!: (tables: TableInfo[]) => void;
+    const listTables = vi.fn(
+      () =>
+        new Promise<TableInfo[]>((resolve) => {
+          resolveTables = resolve;
+        }),
+    );
+    const listObjects = vi.fn().mockResolvedValue([]);
+    const checkConnectionHealth = vi.fn().mockResolvedValue(undefined);
+    const connectDb = vi.fn().mockResolvedValue("mysql-1");
+
+    vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
+    vi.doMock("@/lib/backend/api", () => ({
+      checkConnectionHealth,
+      connectDb,
+      deleteSchemaCachePrefix: vi.fn().mockResolvedValue(undefined),
+      listInstalledAgents: vi.fn().mockResolvedValue([]),
+      listTables,
+      listObjects,
+      loadSchemaCache: vi.fn().mockResolvedValue(null),
+      saveSchemaCache: vi.fn().mockResolvedValue(undefined),
+      saveConnections: vi.fn().mockResolvedValue(undefined),
+      saveSidebarLayout: vi.fn().mockResolvedValue(undefined),
+    }));
+
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const store = useConnectionStore();
+    useSettingsStore().editorSettings.sidebarObjectDisplay = "simple";
+
+    const connection = mysqlConnection();
+    const test1Id = `${connection.id}:test1`;
+    const dbNode: TreeNode = {
+      id: test1Id,
+      label: "test1",
+      type: "database",
+      connectionId: connection.id,
+      database: "test1",
+      isExpanded: false,
+      children: [],
+    };
+    store.connections = [connection];
+    store.connectedIds.add(connection.id);
+    store.treeNodes = [
+      {
+        id: connection.id,
+        label: connection.name,
+        type: "connection",
+        connectionId: connection.id,
+        isExpanded: true,
+        children: [dbNode],
+      },
+    ];
+
+    const loadPromise = store.loadTables(connection.id, "test1");
+    await vi.waitFor(() => expect(listTables).toHaveBeenCalledTimes(1));
+    expect(dbNode.isLoading).toBe(true);
+    expect(dbNode.isExpanded).toBe(false);
+
+    // Simulate the user collapsing the node while the metadata load is still in flight.
+    dbNode.isExpanded = false;
+    store.cancelTreeNodeLoad(dbNode.id);
+
+    resolveTables([{ name: "users", table_type: "TABLE", comment: null }]);
+    await loadPromise;
+
+    // The in-flight load must not re-expand the node, and the spinner must be cleared.
+    expect(dbNode.isLoading).toBe(false);
+    expect(dbNode.isExpanded).toBe(false);
+  });
+
+  it("does not re-expand an Informix schema collapsed while its metadata cache is being saved", async () => {
+    let resolveCacheSave!: () => void;
+    const saveSchemaCache = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveCacheSave = resolve;
+        }),
+    );
+
+    vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
+    vi.doMock("@/lib/backend/api", () => ({
+      checkConnectionHealth: vi.fn().mockResolvedValue(undefined),
+      deleteSchemaCachePrefix: vi.fn().mockResolvedValue(undefined),
+      loadSchemaCache: vi.fn().mockResolvedValue(null),
+      saveSchemaCache,
+      saveConnections: vi.fn().mockResolvedValue(undefined),
+      saveSidebarLayout: vi.fn().mockResolvedValue(undefined),
+    }));
+
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const store = useConnectionStore();
+    useSettingsStore().editorSettings.sidebarObjectDisplay = "grouped";
+
+    const connection = informixConnection();
+    const databaseNode: TreeNode = {
+      id: `${connection.id}:prulife`,
+      label: "prulife",
+      type: "database",
+      connectionId: connection.id,
+      database: "prulife",
+      isExpanded: true,
+      children: [],
+    };
+    const schemaNode: TreeNode = {
+      id: `${connection.id}:prulife:xtdpcky`,
+      label: "xtdpcky",
+      type: "schema",
+      connectionId: connection.id,
+      database: "prulife",
+      schema: "xtdpcky",
+      isExpanded: true,
+      children: [],
+    };
+    databaseNode.children = [schemaNode];
+    store.connections = [connection];
+    store.connectedIds.add(connection.id);
+    store.treeNodes = [
+      {
+        id: connection.id,
+        label: connection.name,
+        type: "connection",
+        connectionId: connection.id,
+        isExpanded: true,
+        children: [databaseNode],
+      },
+    ];
+
+    const loadPromise = store.loadTables(connection.id, "prulife", "xtdpcky", { force: true });
+    await vi.waitFor(() => expect(saveSchemaCache).toHaveBeenCalledTimes(1));
+    expect(saveSchemaCache.mock.calls[0]?.[0]).toBe(`${connection.id}:prulife:xtdpcky:objects-grouped-v8-informix-owner-v2`);
+    expect(schemaNode.isLoading).toBe(true);
+
+    schemaNode.isExpanded = false;
+    store.cancelTreeNodeLoad(schemaNode.id);
+    resolveCacheSave();
+    await loadPromise;
+
+    expect(schemaNode.isLoading).toBe(false);
+    expect(schemaNode.isExpanded).toBe(false);
+  });
+
+  it("does not let an Informix schema load reclaim ownership after collapse during a health check", async () => {
+    let resolveHealthCheck!: () => void;
+    const checkConnectionHealth = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveHealthCheck = resolve;
+        }),
+    );
+    const saveSchemaCache = vi.fn().mockResolvedValue(undefined);
+
+    vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
+    vi.doMock("@/lib/backend/api", () => ({
+      checkConnectionHealth,
+      deleteSchemaCachePrefix: vi.fn().mockResolvedValue(undefined),
+      loadSchemaCache: vi.fn().mockResolvedValue(null),
+      saveSchemaCache,
+      saveConnections: vi.fn().mockResolvedValue(undefined),
+      saveSidebarLayout: vi.fn().mockResolvedValue(undefined),
+    }));
+
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const store = useConnectionStore();
+    useSettingsStore().editorSettings.sidebarObjectDisplay = "grouped";
+
+    const connection = informixConnection();
+    const schemaNode: TreeNode = {
+      id: `${connection.id}:prulife:xtdpcky`,
+      label: "xtdpcky",
+      type: "schema",
+      connectionId: connection.id,
+      database: "prulife",
+      schema: "xtdpcky",
+      isExpanded: true,
+      children: [],
+    };
+    store.connections = [connection];
+    store.connectedIds.add(connection.id);
+    store.treeNodes = [
+      {
+        id: connection.id,
+        label: connection.name,
+        type: "connection",
+        connectionId: connection.id,
+        isExpanded: true,
+        children: [
+          {
+            id: `${connection.id}:prulife`,
+            label: "prulife",
+            type: "database",
+            connectionId: connection.id,
+            database: "prulife",
+            isExpanded: true,
+            children: [schemaNode],
+          },
+        ],
+      },
+    ];
+
+    const loadPromise = store.loadTables(connection.id, "prulife", "xtdpcky", { force: true });
+    await vi.waitFor(() => expect(checkConnectionHealth).toHaveBeenCalledTimes(1));
+    expect(schemaNode.isLoading).toBe(true);
+
+    schemaNode.isExpanded = false;
+    store.cancelTreeNodeLoad(schemaNode.id);
+    resolveHealthCheck();
+    await loadPromise;
+
+    expect(saveSchemaCache).not.toHaveBeenCalled();
+    expect(schemaNode.isLoading).toBe(false);
+    expect(schemaNode.isExpanded).toBe(false);
+  });
+
   it("does not apply load-more results after the parent generation is invalidated", async () => {
     const firstPage = Array.from({ length: 201 }, (_, index) => ({
       name: `t_${String(index + 1).padStart(4, "0")}`,
@@ -2184,5 +2987,76 @@ describe("connectionStore metadata loading", () => {
     expect(staleDbNode.children?.length ?? 0).toBe(0);
     expect(replacementDb.children?.length ?? 0).toBeGreaterThan(0);
     expect(store.isTreeNodeChildrenLoaded(dbId)).toBe(true);
+  });
+
+  it("loads custom type members into the current tree node and ignores stale responses", async () => {
+    let resolveFirst!: (value: any) => void;
+    const first = new Promise((resolve) => {
+      resolveFirst = resolve;
+    });
+    const getCustomTypeDetails = vi
+      .fn()
+      .mockReturnValueOnce(first)
+      .mockResolvedValueOnce({
+        name: "status",
+        schema: "app",
+        kind: "enum",
+        members: [{ name: "", dataType: "", ordinal: 1, enumValue: "published" }],
+        properties: { domainConstraints: [] },
+      });
+
+    vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
+    vi.doMock("@/lib/backend/api", () => ({
+      checkConnectionHealth: vi.fn().mockResolvedValue(undefined),
+      deleteSchemaCachePrefix: vi.fn().mockResolvedValue(undefined),
+      getCustomTypeDetails,
+      loadSchemaCache: vi.fn().mockResolvedValue(null),
+      saveSchemaCache: vi.fn().mockResolvedValue(undefined),
+      saveConnections: vi.fn().mockResolvedValue(undefined),
+      saveSidebarLayout: vi.fn().mockResolvedValue(undefined),
+    }));
+
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const store = useConnectionStore();
+    const connection = postgresConnection();
+    const typeNode: TreeNode = {
+      id: `${connection.id}:app:types:status`,
+      label: "status",
+      objectName: "status",
+      type: "type",
+      connectionId: connection.id,
+      database: "app",
+      schema: "app",
+      children: undefined,
+    };
+    store.connections = [connection];
+    store.connectedIds.add(connection.id);
+    store.treeNodes = [
+      {
+        id: connection.id,
+        label: connection.name,
+        type: "connection",
+        connectionId: connection.id,
+        children: [typeNode],
+      },
+    ];
+
+    const staleLoad = store.loadCustomTypeChildren(typeNode, { force: true });
+    await vi.waitFor(() => expect(getCustomTypeDetails).toHaveBeenCalledTimes(1));
+    await store.loadCustomTypeChildren(typeNode, { force: true });
+    resolveFirst({
+      name: "status",
+      schema: "app",
+      kind: "enum",
+      members: [{ name: "", dataType: "", ordinal: 1, enumValue: "draft" }],
+      properties: { domainConstraints: [] },
+    });
+    await staleLoad;
+
+    expect(typeNode.isExpanded).toBe(true);
+    expect(typeNode.customTypeKind).toBe("enum");
+    expect(typeNode.hasMembers).toBe(true);
+    expect(typeNode.children?.map((child) => child.label)).toEqual(["published"]);
+    expect(store.isTreeNodeChildrenLoaded(typeNode.id)).toBe(true);
   });
 });

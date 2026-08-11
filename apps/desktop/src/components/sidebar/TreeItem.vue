@@ -30,10 +30,12 @@ import {
   UsersRound,
   CalendarClock,
   Gauge,
+  ShieldCheck,
   Lock,
   Archive,
   Square,
   X,
+  CircleX,
   RefreshCw,
 } from "@lucide/vue";
 import { useConnectionStore } from "@/stores/connectionStore";
@@ -47,18 +49,20 @@ import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import LightTooltip from "@/components/ui/LightTooltip.vue";
-import type { ColumnInfo, ConnectionConfig, DatabaseType, TreeNode } from "@/types/database";
+import type { ColumnInfo, ConnectionConfig, CustomTypeTreeMemberMeta, DatabaseType, TreeNode, TriggerInfo } from "@/types/database";
 import { alignedCommentLeadingWidth, canTreeNodePin, canTreeNodeShowExpander, sidebarTreeNodeComment, trailingCommentAvailableWidth, trailingCommentGapPx, treeItemPaddingLeft, treeLabelWidthClass, usesFullWidthTreeLabel } from "@/lib/sidebar/sidebarTreeItemLayout";
 import { clearActiveTableReferencePayload, createTableReferencePayload, createTableReferenceDropEvent, setActiveTableReferencePayload, type QueryEditorTableReferencePayload } from "@/lib/editor/queryEditorTableDrop";
 import { formatSidebarObjectStorage } from "@/lib/sidebar/sidebarDatabaseStorage";
 import { dataTabOpenModeFromTreeClick } from "@/lib/sidebar/dataTabOpenPolicy";
 import { effectiveDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
+import { connectionDisplayUrlScheme } from "@/lib/connection/connectionPresentation";
 import { hexToRgba } from "@/lib/common/color";
 import { sidebarDisplayTableName } from "@/lib/sidebar/sidebarTableNameDisplay";
 import { shouldMeasureSidebarLabelOverflow } from "@/lib/sidebar/sidebarLabelTooltip";
 import { treeSelectionRangeIdsByIndex, treeSelectionRangeIds } from "@/lib/sidebar/sidebarTreeSelection";
 import { isSidebarDatabaseOpenForVisual } from "@/lib/sidebar/sidebarDatabaseOpenState";
 import { sidebarTreeContextKey } from "@/lib/sidebar/sidebarTreeContext";
+import { connectionCanConfigureSidebarVisibleDatabases } from "@/lib/sidebar/sidebarVisibleFilterMenu";
 import { isWindows } from "@/lib/backend/platform";
 import { flattenTree } from "@/composables/useFlatTree";
 import { productionContextForDatabase } from "@/lib/database/productionSafety";
@@ -68,6 +72,8 @@ import { useDragSort } from "@/composables/useDragSort";
 import { sidebarTreeRuntimeKey } from "@/lib/sidebar/sidebarTreeRuntime";
 import { treeNodePinKey } from "@/lib/app/pinnedItems";
 import { isTreeGroupNodeType } from "@/lib/sidebar/treeNodeGroup";
+import { customTypeCapabilities } from "@/lib/database/databaseObjectCapabilities";
+import { shouldActivateTreeNodeOnSingleClick } from "@/lib/sidebar/treeNodeClick";
 
 const { t } = useI18n();
 
@@ -154,7 +160,8 @@ const useWindowsSidebarCommentFont = isWindows();
 const props = defineProps<{
   node: TreeNode;
   depth: number;
-  dragDisabled?: boolean;
+  reorderDisabled?: boolean;
+  referenceDragDisabled?: boolean;
   pendingRename?: boolean;
   highlighted?: boolean;
   commentLabelWidth?: number;
@@ -257,8 +264,13 @@ function getIconInfo(node: TreeNode): { icon: any; colorClass: string } | null {
       return { icon: Database, colorClass: "text-sky-500" };
     case "etcd-dashboard":
       return { icon: Gauge, colorClass: "text-sky-500" };
+    case "etcd-access-control":
+      return { icon: ShieldCheck, colorClass: "text-sky-500" };
     case "zookeeper-root":
+    case "consul-root":
       return { icon: Database, colorClass: "text-blue-500" };
+    case "consul-overview":
+      return { icon: Gauge, colorClass: "text-blue-500" };
     case "mongo-db":
       return { icon: Database, colorClass: "text-yellow-500" };
     case "mongo-gridfs":
@@ -288,6 +300,8 @@ function getIconInfo(node: TreeNode): { icon: any; colorClass: string } | null {
       return { icon: Braces, colorClass: "text-violet-500" };
     case "type-body":
       return { icon: FileCode, colorClass: "text-violet-400" };
+    case "type-member":
+      return { icon: Columns3, colorClass: "text-muted-foreground" };
     case "group-tables":
       return { icon: Table, colorClass: "text-green-500" };
     case "group-views":
@@ -332,6 +346,12 @@ function displayLabel(node: TreeNode): string {
   return isGroupLabel(node) ? t(node.label) : node.label;
 }
 
+function treeNodeSecondaryValue(node: TreeNode): string | undefined {
+  if (node.type === "type" && node.customTypeKind) return t(`customType.kinds.${node.customTypeKind}`);
+  if (node.type === "type-member") return (node.meta as CustomTypeTreeMemberMeta | undefined)?.displayValue;
+  return undefined;
+}
+
 function visibleLabel(node: TreeNode): string {
   const withValidity = (label: string) => (node.valid === false ? `${label} · INVALID` : label);
   if (node.type === "table" || node.type === "view" || node.type === "materialized_view" || node.type === "mongo-collection" || node.type === "vector-collection" || node.type === "elasticsearch-index") {
@@ -356,6 +376,10 @@ type DetailTooltipRow = {
   label: string;
   value: string;
   multiline?: boolean;
+  /** When set, renders each value on its own line (e.g. one host per line) */
+  values?: string[];
+  action?: () => void;
+  actionLabel?: string;
 };
 
 function cleanTooltipValue(value: string | number | null | undefined): string {
@@ -370,37 +394,8 @@ function redactedConnectionString(value: string): string {
   return value.replace(/(:\/\/[^/\s:@?#;]+):([^@\s/?#;]+)@/g, "$1:***@").replace(/([?&;](?:password|pwd|pass|token|secret|key)=)[^&;]*/gi, "$1***");
 }
 
-function connectionTooltipScheme(config: Pick<ConnectionConfig, "db_type" | "ssl">): string {
-  switch (config.db_type) {
-    case "postgres":
-    case "gaussdb":
-    case "kwdb":
-    case "yashandb":
-    case "redshift":
-    case "questdb":
-      return "postgresql";
-    case "sqlserver":
-      return "mssql";
-    case "elasticsearch":
-    case "qdrant":
-    case "milvus":
-    case "weaviate":
-    case "chromadb":
-    case "rqlite":
-    case "turso":
-    case "mq":
-      return config.ssl ? "https" : "http";
-    case "cloudflare-d1":
-      return "https";
-    case "dameng":
-      return "dm";
-    default:
-      return config.db_type;
-  }
-}
-
 function hostForDisplay(host: string): string {
-  if (!host.includes(":") || host.startsWith("[") || host.includes("://")) return host;
+  if (!host.includes(":") || host.startsWith("[") || host.includes("://") || host.includes(",")) return host;
   return `[${host}]`;
 }
 
@@ -417,7 +412,7 @@ function connectionTooltipUrl(config: ConnectionConfig): string {
     return `${config.db_type}://${host}`;
   }
 
-  const scheme = connectionTooltipScheme(config);
+  const scheme = connectionDisplayUrlScheme(config);
   const port = Number(config.port) > 0 ? `:${config.port}` : "";
   const user = cleanTooltipValue(config.username);
   const userInfo = user ? `${encodeURIComponent(user)}@` : "";
@@ -434,17 +429,54 @@ const detailTooltip = computed(() => {
     const config = connectionStore.getConfig(node.connectionId);
     if (!config) return null;
     const hostLabel = isLocalFileConnection(config) ? t("connection.filePath") : t("connection.host");
+    const hostValue = cleanTooltipValue(config.host);
+    const hostValues = hostValue.includes(",")
+      ? hostValue
+          .split(",")
+          .map((h) => h.trim())
+          .filter(Boolean)
+      : [];
+    const visibleFilterSummary = connectionCanConfigureSidebarVisibleDatabases(config.db_type) || config.db_type === "nacos" ? connectionStore.getSidebarVisibleFilterSummary(node.connectionId) : null;
+    const visibleFilterRow: DetailTooltipRow | null =
+      visibleFilterSummary?.selected != null && visibleFilterSummary.total != null
+        ? {
+            label: t(visibleFilterSummary.mode === "namespace" ? "nacos.nacosVisibleNamespacesDetailLabel" : visibleFilterSummary.mode === "schema" ? "visibleSchemas.detailLabel" : "visibleDatabases.detailLabel"),
+            value: `${visibleFilterSummary.selected}/${visibleFilterSummary.total}`,
+            action: () => treeRuntime.openPrimaryVisibleFilter(node),
+            actionLabel: t(visibleFilterSummary.mode === "namespace" ? "nacos.nacosVisibleNamespacesDetailActionLabel" : visibleFilterSummary.mode === "schema" ? "visibleSchemas.detailActionLabel" : "visibleDatabases.detailActionLabel", { connection: config.name }),
+          }
+        : null;
     const rows: DetailTooltipRow[] = [
       { label: t("connection.name"), value: cleanTooltipValue(config.name) },
       { label: "URL", value: connectionTooltipUrl(config), multiline: true },
-      { label: hostLabel, value: cleanTooltipValue(config.host), multiline: isLocalFileConnection(config) },
+      ...(hostValues.length > 0 ? [{ label: hostLabel, value: hostValues[0], values: hostValues } as DetailTooltipRow] : [{ label: hostLabel, value: hostValue, multiline: isLocalFileConnection(config) } as DetailTooltipRow]),
       { label: "Port", value: Number(config.port) > 0 ? String(config.port) : "" },
       { label: t("connection.database"), value: cleanTooltipValue(config.database) },
       { label: t("connection.user"), value: cleanTooltipValue(config.username) },
       { label: t("connection.type"), value: config.driver_label || config.driver_profile || config.db_type },
       { label: t("connection.databaseInfo.productVersion"), value: cleanTooltipValue(config.database_info?.productVersion) },
+      ...(visibleFilterRow ? [visibleFilterRow] : []),
+      { label: t("connection.note"), value: cleanTooltipValue(config.note), multiline: true },
     ].filter((row) => row.value);
     return { rows };
+  }
+  if (node.type === "trigger" && node.meta && node.connectionId && effectiveDatabaseTypeForConnection(connectionStore.getConfig(node.connectionId)) === "xugu") {
+    const trigger = node.meta as TriggerInfo;
+    const hasXuguDetails = trigger.level != null || trigger.condition != null || trigger.language != null || trigger.enabled != null || trigger.valid != null || trigger.created_at != null || trigger.comment != null;
+    if (!hasXuguDetails) return null;
+    const rows: DetailTooltipRow[] = [
+      { label: t("objects.name"), value: visibleLabel(node) },
+      { label: t("objects.triggerTiming"), value: cleanTooltipValue(trigger.timing) },
+      { label: t("objects.triggerEvent"), value: cleanTooltipValue(trigger.event) },
+      { label: t("objects.triggerLevel"), value: cleanTooltipValue(trigger.level) },
+      { label: t("objects.triggerStatus"), value: trigger.enabled == null ? "" : t(trigger.enabled ? "objects.enabled" : "objects.disabled") },
+      { label: t("objects.validity"), value: trigger.valid == null ? "" : t(trigger.valid ? "objects.valid" : "objects.invalid") },
+      { label: t("objects.triggerCondition"), value: cleanTooltipValue(trigger.condition), multiline: true },
+      { label: t("objects.triggerLanguage"), value: cleanTooltipValue(trigger.language) },
+      { label: t("objects.createdAt"), value: cleanTooltipValue(trigger.created_at) },
+      { label: t("objects.comment"), value: cleanTooltipValue(trigger.comment), multiline: true },
+    ].filter((row) => row.value);
+    return rows.length ? { rows } : null;
   }
   const comment = node.type === "column" && node.meta && "comment" in node.meta ? (node.meta as ColumnInfo).comment : node.comment;
   if (!comment || (node.type !== "schema" && node.type !== "table" && node.type !== "view" && node.type !== "column")) return null;
@@ -549,12 +581,19 @@ async function cancelConnectionAttempt() {
   }
 }
 
-const canExpand = computed(() =>
-  canTreeNodeShowExpander({
+const canExpand = computed(() => {
+  // PostgreSQL-family custom types: only show the expander when the type has
+  // loadable members; types without members (enum/domain/range/base) do not
+  // expand even if the catalog row lists child metadata.
+  if (activeNode.value.type === "type" && customTypeCapabilities(currentDatabaseType()).details) {
+    return activeNode.value.hasMembers === true;
+  }
+  return canTreeNodeShowExpander({
     type: activeNode.value.type,
     childCount: activeNode.value.children?.length ?? 0,
-  }),
-);
+    explicitContainer: (activeNode.value.type === "package" && activeNode.value.children !== undefined) || activeNode.value.xuguTypeMembersExpandable === true,
+  });
+});
 
 const isPinned = computed(() => activeNode.value.pinned || connectionStore.isTreeNodePinned(activeNode.value));
 
@@ -565,6 +604,9 @@ const isNodeDefaultDatabase = computed(
     typeof activeNode.value.database === "string" &&
     connectionStore.isDefaultDatabase(activeNode.value.connectionId, activeNode.value.database),
 );
+function isNodeDefaultSchema(): boolean {
+  return activeNode.value.type === "schema" && !!activeNode.value.connectionId && !!activeNode.value.schema && connectionStore.isDefaultSchema(activeNode.value.connectionId, activeNode.value.schema);
+}
 
 const trailingComment = computed(() => {
   if (!settingsStore.editorSettings.sidebarObjectInfoMode.startsWith("comment-")) return null;
@@ -627,7 +669,9 @@ function formattedObjectStorage(): string {
   return formatSidebarObjectStorage(activeNode.value.sizeBytes);
 }
 
-const alignedCommentLabelWidth = computed(() => (settingsStore.editorSettings.sidebarObjectInfoMode === "comment-aligned" ? props.commentLabelWidth : undefined));
+// 连接节点不参与 aligned 对齐：顶层连接各自独立，按同层最大 label 宽对齐只会让短连接名
+// 后留下一大段空白。无论全局是 aligned 还是 inline，连接节点的 comment 都紧跟 label。
+const alignedCommentLabelWidth = computed(() => (settingsStore.editorSettings.sidebarObjectInfoMode === "comment-aligned" && activeNode.value.type !== "connection" ? props.commentLabelWidth : undefined));
 
 function alignedCommentLeadingStyle(): { width: string } | undefined {
   const width = alignedCommentLeadingWidth(alignedCommentLabelWidth.value, canTreeNodePin(activeNode.value.type));
@@ -642,7 +686,13 @@ const usesFullWidthLabel = computed(() => usesFullWidthTreeLabel(activeNode.valu
 
 const rowWidthClass = computed(() => (usesFullWidthLabel.value ? "w-max min-w-full" : "w-full min-w-0"));
 
-const labelWidthClass = computed(() => treeLabelWidthClass({ fullWidth: usesFullWidthLabel.value, hasTrailingComment: hasTrailingMetadata(), hasInlineAction: isPinned.value }));
+const labelWidthClass = computed(() => {
+  // aligned 模式靠 leading 块固定宽度对齐 comment 列，label 需 flex-1 撑满 leading 块；
+  // inline/right 模式 leading 块无固定宽度，label 用 shrink 让 comment 紧跟 label，
+  // 避免 label flex-1 把 leading 块撑到整行、comment 被推到视口最右端。
+  const alignLeading = alignedCommentLabelWidth.value !== undefined;
+  return treeLabelWidthClass({ fullWidth: usesFullWidthLabel.value, hasTrailingComment: hasTrailingMetadata(), hasInlineAction: isPinned.value, alignLeading });
+});
 
 watch(() => [isRightAlignedComment(), visibleLabel(activeNode.value), trailingComment.value, trailingCommentLayoutRef.value, trailingCommentLeadingRef.value], refreshTrailingCommentMeasurement, { flush: "post", immediate: true });
 
@@ -698,7 +748,7 @@ const rowStyle = computed(() => {
     paddingLeft: paddingLeft.value,
     paddingRight: trailingComment.value ? "12px" : undefined,
     "--tree-connection-row-bg": backgroundColor,
-    "--tree-connection-row-hover-bg": hexToRgba(color, isActiveConnectionScope.value ? 0.18 : 0.12),
+    "--tree-connection-row-hover-bg": hexToRgba(color, isActiveConnectionScope.value ? 0.2 : 0.16),
     "--tree-connection-active-bg": hexToRgba(color, 0.18),
     "--tree-connection-active-focus-bg": hexToRgba(color, 0.22),
   };
@@ -793,7 +843,7 @@ function pinnedSortKey(): string {
 }
 
 function canDragPinnedOrder(): boolean {
-  return isPinned.value && !isNodeDefaultDatabase.value && !props.dragDisabled;
+  return isPinned.value && !isNodeDefaultDatabase.value && !props.reorderDisabled;
 }
 
 const {
@@ -814,8 +864,8 @@ const {
   connectionStore.reorderSidebarEntries(draggedIds, targetId, position);
 });
 
-const isDraggable = computed(() => {
-  if (props.dragDisabled) return false;
+const canReorderTreeNode = computed(() => {
+  if (props.reorderDisabled) return false;
   return activeNode.value.type === "connection" || activeNode.value.type === "connection-group";
 });
 
@@ -865,7 +915,7 @@ const TABLE_REFERENCE_DRAG_THRESHOLD = 5;
 const TABLE_REFERENCE_DRAGGING_CLASS = "dbx-table-reference-dragging";
 
 const canDragTableReference = computed(() => {
-  if (props.dragDisabled || !activeNode.value.connectionId) return false;
+  if (props.referenceDragDisabled || !activeNode.value.connectionId) return false;
   if (activeNode.value.type === "database") return typeof activeNode.value.database === "string" && activeNode.value.database.trim().length > 0;
   if (activeNode.value.database == null) return false;
   if (activeNode.value.type === "table" || activeNode.value.type === "view" || activeNode.value.type === "materialized_view") return true;
@@ -982,7 +1032,7 @@ function startTableReferenceMouseDrag(event: MouseEvent) {
 }
 
 function onRowMouseDown(event: MouseEvent) {
-  if (isDraggable.value) {
+  if (canReorderTreeNode.value) {
     startDrag(event, activeNode.value.id, activeNode.value.type);
   } else if (canDragTableReference.value) {
     startTableReferenceMouseDrag(event);
@@ -1057,7 +1107,7 @@ function onClick(event: MouseEvent) {
   }
   selectSingleTreeNode(props.node);
   rowRef.value?.focus({ preventScroll: true });
-  if (settingsStore.editorSettings.sidebarActivation === "double") return;
+  if (!shouldActivateTreeNodeOnSingleClick(props.node.type, settingsStore.editorSettings.sidebarActivation) && props.node.type !== "load-more") return;
   treeRuntime.handleRowClick(props.node, event.detail);
 }
 
@@ -1108,10 +1158,10 @@ function onKeydown(event: KeyboardEvent) {
   </div>
 
   <div v-else @contextmenu="onTreeItemContextMenu">
-    <LightTooltip :text="displayLabel(node)" :disabled="isTooltipDisabled()" side="right" :side-offset="8" :delay="0" :close-delay="0" :surface="detailTooltip ? 'popover' : 'foreground'">
+    <LightTooltip :text="visibleLabel(node)" :disabled="isTooltipDisabled()" side="right" :side-offset="8" :delay="0" :close-delay="30" :surface="detailTooltip ? 'popover' : 'foreground'">
       <div
         ref="rowRef"
-        class="group flex items-center gap-2 py-1 px-2 cursor-pointer relative outline-none"
+        class="group flex cursor-default items-center gap-2 py-1 px-2 relative outline-none"
         style="contain: layout style"
         :class="[
           rowWidthClass,
@@ -1121,7 +1171,7 @@ function onKeydown(event: KeyboardEvent) {
             'opacity-50': dragVisual.dragging,
             'tree-item-connection-tint': connectionColor,
             'hover:bg-accent': node.type !== 'connection',
-            'hover:bg-secondary/60': node.type === 'connection',
+            'hover:bg-sidebar-accent': node.type === 'connection',
             rounded: !selectionVisual.rowSelected,
             'tree-item-active': selectionVisual.rowSelected,
             'tree-item-active--selection-set': selectionVisual.usesSelectionSetHighlight && selectionVisual.rowSelected,
@@ -1151,9 +1201,12 @@ function onKeydown(event: KeyboardEvent) {
           </button>
         </template>
         <span v-else class="w-3.5 h-3.5 shrink-0" />
-        <DatabaseIcon v-if="node.type === 'connection'" :db-type="connectionIconType(node.connectionId)" class="h-3.5 w-3.5 shrink-0" />
-        <Loader2 v-else-if="node.type === 'load-more' && node.isLoading" class="w-3.5 h-3.5 shrink-0 animate-spin text-primary" />
-        <component v-else :is="getIconInfo(node)?.icon || Database" class="w-3.5 h-3.5 shrink-0" :class="databaseOpenVisual.iconClass" />
+        <span class="relative flex h-3.5 w-3.5 shrink-0" :class="{ 'overflow-visible': node.valid === false }">
+          <DatabaseIcon v-if="node.type === 'connection'" :db-type="connectionIconType(node.connectionId)" class="h-3.5 w-3.5 shrink-0" />
+          <Loader2 v-else-if="node.type === 'load-more' && node.isLoading" class="h-3.5 w-3.5 shrink-0 animate-spin text-primary" />
+          <component v-else :is="getIconInfo(node)?.icon || Database" class="h-3.5 w-3.5 shrink-0" :class="databaseOpenVisual.iconClass" />
+          <CircleX v-if="node.valid === false" data-invalid-object-indicator="true" class="pointer-events-none absolute -right-1 -bottom-1 h-2.5 w-2.5 rounded-full bg-background text-destructive stroke-[3]" aria-hidden="true" />
+        </span>
         <div ref="trailingCommentLayoutRef" :class="hasTrailingMetadata() ? 'flex flex-1 min-w-0 items-center' : 'contents'">
           <div ref="trailingCommentLeadingRef" :class="trailingComment ? 'flex max-w-full min-w-0 shrink-0 items-center gap-2' : formattedObjectStorage() ? 'flex min-w-0 flex-1 items-center gap-2' : 'contents'" :style="alignedCommentLeadingStyle()">
             <input
@@ -1166,7 +1219,8 @@ function onKeydown(event: KeyboardEvent) {
               @keydown.escape.prevent="isRenamingGroup = false"
               @click.stop
             />
-            <span v-else ref="labelRef" :class="[labelWidthClass, { 'flex-1': node.type === 'connection' }]">{{ visibleLabel(node) }}</span>
+            <span v-else ref="labelRef" :class="[labelWidthClass, { 'flex-1': node.type === 'connection' && !trailingComment }]">{{ visibleLabel(node) }}</span>
+            <span v-if="treeNodeSecondaryValue(node)" class="min-w-0 max-w-[55%] shrink truncate text-xs text-muted-foreground" :title="treeNodeSecondaryValue(node)">{{ treeNodeSecondaryValue(node) }}</span>
             <button
               v-if="canDragPinnedOrder()"
               type="button"
@@ -1188,9 +1242,11 @@ function onKeydown(event: KeyboardEvent) {
                   node.type === 'group-materialized-views' ||
                   node.type === 'group-procedures' ||
                   node.type === 'group-functions' ||
+                  node.type === 'group-triggers' ||
                   node.type === 'group-sequences' ||
                   node.type === 'group-synonyms' ||
                   node.type === 'group-packages' ||
+                  node.type === 'group-types' ||
                   node.type === 'group-partitions') &&
                 node.objectCount != null
               "
@@ -1200,8 +1256,11 @@ function onKeydown(event: KeyboardEvent) {
             <Badge v-if="isNodeDefaultDatabase" variant="secondary" class="h-4 px-1.5 text-[10px]">
               {{ t("editor.defaultDatabase") }}
             </Badge>
+            <Badge v-if="isNodeDefaultSchema()" variant="secondary" class="h-4 px-1.5 text-[10px]">
+              {{ t("editor.defaultSchema") }}
+            </Badge>
           </div>
-          <span v-if="trailingComment && !isRightAlignedComment()" class="sidebar-object-comment ml-2 min-w-0 flex-1 truncate text-left" :class="{ 'sidebar-object-comment--windows': useWindowsSidebarCommentFont }">{{ trailingComment }}</span>
+          <span v-if="trailingComment && !isRightAlignedComment()" class="sidebar-object-comment ml-4 min-w-0 flex-1 truncate text-left" :class="{ 'sidebar-object-comment--windows': useWindowsSidebarCommentFont }">{{ trailingComment }}</span>
           <span v-if="isRightAlignedComment() && trailingCommentMaxWidth > 0" class="min-w-0 flex-1" aria-hidden="true" />
           <span
             v-if="isRightAlignedComment() && trailingCommentMaxWidth > 0"
@@ -1244,8 +1303,23 @@ function onKeydown(event: KeyboardEvent) {
         <div class="w-max min-w-40 max-w-[min(28rem,calc(100vw-24px))] rounded-md border border-border bg-popover p-2 text-popover-foreground shadow-lg">
           <div class="space-y-1">
             <div v-for="row in detailTooltip.rows" :key="row.label" class="grid grid-cols-[max-content_minmax(0,1fr)] gap-2 text-xs leading-5">
-              <span class="text-muted-foreground">{{ row.label }}</span>
-              <span v-if="row.multiline" class="max-h-20 overflow-hidden whitespace-pre-wrap break-words text-foreground/90">
+              <span class="text-muted-foreground shrink-0">{{ row.label }}</span>
+              <template v-if="row.values">
+                <div class="flex flex-col gap-0.5 font-mono text-foreground/90">
+                  <span v-for="(v, vi) in row.values" :key="vi" class="break-all">{{ v }}</span>
+                </div>
+              </template>
+              <button
+                v-else-if="row.action"
+                type="button"
+                class="w-fit rounded bg-primary/10 px-1 font-mono text-primary underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                :aria-label="row.actionLabel"
+                :title="row.actionLabel"
+                @click.stop="row.action()"
+              >
+                {{ row.value }}
+              </button>
+              <span v-else-if="row.multiline" class="max-h-20 overflow-hidden whitespace-pre-wrap break-words text-foreground/90">
                 {{ row.value }}
               </span>
               <span v-else class="truncate font-mono text-foreground/90" :title="row.value">{{ row.value }}</span>

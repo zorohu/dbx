@@ -4,6 +4,7 @@ import com.dbx.agent.AbstractJdbcAgent;
 import com.dbx.agent.ColumnInfo;
 import com.dbx.agent.ConnectParams;
 import com.dbx.agent.DatabaseInfo;
+import com.dbx.agent.DdlBuilder;
 import com.dbx.agent.ForeignKeyInfo;
 import com.dbx.agent.IndexInfo;
 import com.dbx.agent.JdbcIdentifiers;
@@ -78,6 +79,11 @@ public final class SparkAgent extends AbstractJdbcAgent {
     protected void afterConnect(ConnectParams params, Connection connection) throws Exception {
         String catalog = extractCatalogParam(params.getUrl_params());
         configuredCatalog = catalog;
+    }
+
+    @Override
+    protected void afterPhysicalConnect(ConnectParams params, Connection connection) throws Exception {
+        String catalog = extractCatalogParam(params.getUrl_params());
         if (catalog != null && !catalog.isEmpty()) {
             try (java.sql.Statement stmt = connection.createStatement()) {
                 stmt.execute("USE " + JdbcIdentifiers.INSTANCE.backtick(catalog));
@@ -184,6 +190,31 @@ public final class SparkAgent extends AbstractJdbcAgent {
     }
 
     @Override
+    public String getTableDdl(String schema, String table) {
+        try {
+            String tableReference = qualifiedTableReference(schema, table);
+            try (java.sql.Statement stmt = requireConnected().createStatement();
+                 ResultSet rs = stmt.executeQuery("SHOW CREATE TABLE " + tableReference)) {
+                if (rs.next()) {
+                    String ddl = trimToNull(rs.getString(1));
+                    if (ddl != null) {
+                        return ddl;
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+            // Some Spark-compatible Thrift endpoints may not expose SHOW CREATE TABLE.
+        }
+        return DdlBuilder.buildTableDdl(
+            schema,
+            table,
+            getColumns(schema, table),
+            Collections.emptyList(),
+            Collections.emptyList()
+        );
+    }
+
+    @Override
     public String setSchemaSQL(String schema) {
         // When a catalog is configured, qualify the USE statement with the
         // catalog so switching schemas does not reset the catalog back to the
@@ -224,9 +255,7 @@ public final class SparkAgent extends AbstractJdbcAgent {
     }
 
     private void useSchema(String schema) throws Exception {
-        try (java.sql.Statement stmt = requireConnected().createStatement()) {
-            stmt.execute(setSchemaSQL(schema));
-        }
+        applySchemaContext(requireConnected(), schema);
     }
 
     private List<ColumnInfo> getColumnsFromDescribe(String schema, String table) throws Exception {
@@ -267,6 +296,20 @@ public final class SparkAgent extends AbstractJdbcAgent {
             }
         }
         return result;
+    }
+
+    private String qualifiedTableReference(String schema, String table) {
+        if (configuredCatalog != null && !configuredCatalog.isEmpty()) {
+            String reference = JdbcIdentifiers.INSTANCE.backtick(configuredCatalog);
+            if (schema != null && !schema.isEmpty() && !schema.equals(configuredCatalog)) {
+                reference += "." + JdbcIdentifiers.INSTANCE.backtick(schema);
+            }
+            return reference + "." + JdbcIdentifiers.INSTANCE.backtick(table);
+        }
+        if (schema != null && !schema.isEmpty()) {
+            return JdbcIdentifiers.INSTANCE.backtick(schema) + "." + JdbcIdentifiers.INSTANCE.backtick(table);
+        }
+        return JdbcIdentifiers.INSTANCE.backtick(table);
     }
 
     private static List<ColumnInfo> getColumnsFromMetadata(Connection conn, String schema, String table) throws Exception {

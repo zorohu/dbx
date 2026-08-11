@@ -22,14 +22,14 @@ pub async fn mq_test_connection_core(state: &AppState, conn_id: &str) -> Result<
     let cfg = state.configs.read().await.get(conn_id).cloned().ok_or("Connection not found")?;
     let mqc = state.mq_admin_config_for_connection(conn_id, &cfg).await?;
     let agent_launch = resolve_mq_agent_launch_spec(&mqc, state);
-    let adapter = match state.mq_registry.get_or_build_config(conn_id, mqc, agent_launch).await {
-        Ok(adapter) => adapter,
+    let build = match state.mq_registry.get_or_build_config(conn_id, mqc, agent_launch).await {
+        Ok(build) => build,
         Err(err) => {
             state.mq_registry.drop_connection(conn_id).await;
             return Err(err);
         }
     };
-    match adapter.test_connection().await {
+    match build.adapter.test_connection().await {
         Ok(info) => Ok(info),
         Err(err) => {
             state.mq_registry.drop_connection(conn_id).await;
@@ -390,6 +390,15 @@ pub async fn mq_list_subscriptions_core(
     adapter.list_subscriptions(&topic).await
 }
 
+pub async fn mq_enrich_subscriptions_core(
+    state: &AppState,
+    conn_id: &str,
+    topic: TopicRef,
+) -> Result<Vec<SubscriptionInfo>, String> {
+    let adapter = get_adapter(state, conn_id).await?;
+    adapter.enrich_subscriptions(&topic).await
+}
+
 pub async fn mq_create_subscription_core(
     state: &AppState,
     conn_id: &str,
@@ -476,9 +485,9 @@ pub async fn mq_peek_messages_core(
     sub: String,
     count: u32,
     options: Option<PeekMessagesOptions>,
-) -> Result<Vec<PeekedMessage>, String> {
+) -> Result<PeekMessagesResult, String> {
     if count == 0 {
-        return Ok(Vec::new());
+        return Ok(PeekMessagesResult::default());
     }
     if count > MAX_PEEK_MESSAGES {
         return Err(format!("Peek message count must be between 1 and {MAX_PEEK_MESSAGES}"));
@@ -801,7 +810,7 @@ async fn get_adapter(
     let cfg = state.configs.read().await.get(conn_id).cloned().ok_or("Connection not found")?;
     let mqc = state.mq_admin_config_for_connection(conn_id, &cfg).await?;
     let agent_launch = resolve_mq_agent_launch_spec(&mqc, state);
-    state.mq_registry.get_or_build_config(conn_id, mqc, agent_launch).await
+    state.mq_registry.get_or_build_config(conn_id, mqc, agent_launch).await.map(|build| build.adapter)
 }
 
 /// Resolve the MQ agent launch spec for agent-backed systems (Kafka, RocketMQ, RabbitMQ).
@@ -842,6 +851,8 @@ async fn ensure_connection_writable(state: &AppState, conn_id: &str, operation: 
                 config.name, operation
             ));
         }
+        // Production protection for desktop MQ uses UI confirmation; MCP enforces
+        // is_production separately. Do not hard-block confirmed desktop writes here.
     }
     Ok(())
 }
@@ -855,6 +866,7 @@ mod tests {
 
     fn mq_connection(read_only: bool) -> ConnectionConfig {
         ConnectionConfig {
+            docs_notes_path: None,
             id: "readonly-mq".to_string(),
             name: "Read only MQ".to_string(),
             note: String::new(),
@@ -868,6 +880,7 @@ mod tests {
             username: String::new(),
             password: String::new(),
             database: None,
+            default_schema: None,
             visible_databases: None,
             visible_schemas: None,
             show_system_schemas: false,
@@ -937,6 +950,29 @@ mod tests {
         let state = AppState::new_with_plugin_dir(storage, dir.join("plugins"));
         state.configs.write().await.insert(config.id.clone(), config);
         (state, dir)
+    }
+
+    #[tokio::test]
+    async fn mutating_rocketmq_send_blocks_read_only_connections() {
+        let (state, _dir) = test_state_with(mq_connection(true)).await;
+        let err = mq_send_message_core(
+            &state,
+            "readonly-mq",
+            SendMessageRequest {
+                topic: "t".into(),
+                key: None,
+                payload_base64: "eA==".into(),
+                payload_text: Some("x".into()),
+                headers: Default::default(),
+                partition: None,
+                exchange: None,
+                routing_key: None,
+                namespace: None,
+            },
+        )
+        .await
+        .expect_err("read-only must block send");
+        assert!(err.contains("Read-only mode"), "{err}");
     }
 
     #[tokio::test]

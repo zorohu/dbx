@@ -71,11 +71,19 @@ pub struct ObjectInfo {
     pub valid: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_type_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_members: Option<bool>,
     pub comment: Option<String>,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
     pub parent_schema: Option<String>,
     pub parent_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<TriggerInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xugu_type_members_expandable: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,6 +111,7 @@ pub enum ObjectSourceKind {
     Function,
     Trigger,
     Sequence,
+    Synonym,
     Package,
     PackageBody,
     Type,
@@ -126,6 +135,8 @@ pub struct ColumnInfo {
     pub is_nullable: bool,
     pub column_default: Option<String>,
     pub is_primary_key: bool,
+    #[serde(default)]
+    pub is_unique: bool,
     pub extra: Option<String>,
     pub comment: Option<String>,
     pub numeric_precision: Option<i32>,
@@ -137,6 +148,14 @@ pub struct ColumnInfo {
     pub character_set: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collation: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TableColumnsResult {
+    pub table_name: String,
+    pub columns: Vec<ColumnInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -225,6 +244,91 @@ pub struct CompletionAssistantResponse {
     pub fallback_used: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpatialColumn {
+    /// Zero-based index into `QueryResult.columns`.
+    pub column_index: usize,
+    /// SRID shared by the column's geometry cells. `None` when unknown/absent
+    /// (or SRID 0). A column reports the first non-null SRID it observes.
+    pub srid: Option<u32>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct SpatialColumnBuilder {
+    // column_index -> first non-null srid seen (sticky once set)
+    columns: std::collections::BTreeMap<usize, Option<u32>>,
+}
+
+impl SpatialColumnBuilder {
+    pub(crate) fn new(column_indices: impl IntoIterator<Item = usize>) -> Self {
+        let mut builder = Self::default();
+        for column_index in column_indices {
+            builder.columns.entry(column_index).or_insert(None);
+        }
+        builder
+    }
+
+    /// Record a geometry cell's SRID. The first non-null (and non-zero) value
+    /// wins; later observations for the same column are ignored.
+    pub(crate) fn observe(&mut self, column_index: usize, srid: Option<u32>) {
+        let entry = self.columns.entry(column_index).or_insert(None);
+        if entry.is_none() {
+            if let Some(value) = srid.filter(|value| *value != 0) {
+                *entry = Some(value);
+            }
+        }
+    }
+
+    pub(crate) fn finish(self) -> Vec<SpatialColumn> {
+        self.columns.into_iter().map(|(column_index, srid)| SpatialColumn { column_index, srid }).collect()
+    }
+
+    pub(crate) fn finish_with_values(
+        self,
+        spatial_values: Vec<Vec<Option<u32>>>,
+    ) -> (Vec<SpatialColumn>, Vec<Vec<Option<u32>>>) {
+        let spatial_columns = self.finish();
+        let spatial_values = if spatial_columns.is_empty() { Vec::new() } else { spatial_values };
+        (spatial_columns, spatial_values)
+    }
+}
+
+/// A message emitted by the database server while executing a statement:
+/// PostgreSQL `RAISE NOTICE`/`WARNING`, MySQL warnings and OK-packet info
+/// strings, SQL Server `PRINT`/`RAISERROR` info messages, and similar.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryMessage {
+    /// Severity/level as reported by the server (e.g. `NOTICE`, `WARNING`,
+    /// `INFO`, `ERROR`, MySQL's `Note`/`Warning`).
+    pub severity: String,
+    pub message: String,
+    /// Server error/condition code (PostgreSQL SQLSTATE, MySQL error code).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+}
+
+impl QueryMessage {
+    /// One-line text rendering shared by the CLI, MCP, and agent tool output:
+    /// `SEVERITY: message` plus inline `(code: …, detail: …, hint: …)` extras.
+    pub fn format_line(&self) -> String {
+        let mut line = format!("{}: {}", self.severity.to_uppercase(), self.message);
+        let extras = [
+            self.code.as_ref().map(|value| format!("code: {value}")),
+            self.detail.as_ref().map(|value| format!("detail: {value}")),
+            self.hint.as_ref().map(|value| format!("hint: {value}")),
+        ];
+        let extras: Vec<_> = extras.into_iter().flatten().collect();
+        if !extras.is_empty() {
+            line.push_str(&format!(" ({})", extras.join(", ")));
+        }
+        line
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryResult {
     pub columns: Vec<String>,
@@ -237,6 +341,16 @@ pub struct QueryResult {
     /// be shorter/empty when a driver cannot supply sortable information.
     #[serde(default)]
     pub column_sortables: Vec<bool>,
+    /// Spatial reference metadata for geometry/geography cells. Kept outside
+    /// `rows` so displayed, copied, exported, and edited values remain WKT.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spatial_columns: Vec<SpatialColumn>,
+    /// Per-cell SRID metadata, parallel to `rows`: `spatial_values[row][column]`
+    /// is the SRID of that cell's geometry value (`None` for non-spatial cells
+    /// or unknown SRID). Unlike `spatial_columns` (a column-level hint), every
+    /// geometry value keeps its own SRID so mixed-SRID results stay correct.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spatial_values: Vec<Vec<Option<u32>>>,
     pub rows: Vec<Vec<serde_json::Value>>,
     pub affected_rows: u64,
     pub execution_time_ms: u128,
@@ -251,6 +365,11 @@ pub struct QueryResult {
     /// between the tabular view and the original JSON.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub elasticsearch_raw_body: Option<String>,
+    /// Messages emitted by the database server while executing the statement
+    /// (notices, warnings, info messages). Empty for drivers that do not
+    /// capture server messages.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub messages: Vec<QueryMessage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -284,6 +403,20 @@ pub struct TriggerInfo {
     pub name: String,
     pub event: String,
     pub timing: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub statement: Option<String>,
 }
@@ -381,17 +514,263 @@ pub struct OwnerInfo {
     pub owner: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CustomTypeKind {
+    Base,
+    Composite,
+    Domain,
+    Enum,
+    Range,
+    Multirange,
+}
+
+impl CustomTypeKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Base => "base",
+            Self::Composite => "composite",
+            Self::Domain => "domain",
+            Self::Enum => "enum",
+            Self::Range => "range",
+            Self::Multirange => "multirange",
+        }
+    }
+}
+
+/// A member of a user-defined type.
+///
+/// Composite types expose fields (`name`/`data_type`/`ordinal`/`nullable`/
+/// `default`/`comment`), enums expose values (`ordinal`/`enum_value`), and
+/// domains/ranges/base types expose neither (their members list stays empty;
+/// the UI shows an explanatory empty state instead).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomTypeMember {
+    pub name: String,
+    pub data_type: String,
+    pub ordinal: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nullable: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enum_value: Option<String>,
+}
+
+/// A domain CHECK constraint, keeping its name so generated DDL never invents
+/// duplicate constraint identifiers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomTypeDomainConstraint {
+    pub name: String,
+    pub definition: String,
+}
+
+/// Category-specific type attributes. Fields that do not apply to a category
+/// are `None`, never empty strings, so the UI can distinguish “unknown” from
+/// “not applicable”.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomTypeProperties {
+    pub base_type: Option<String>,
+    pub not_null: Option<bool>,
+    pub default: Option<String>,
+    pub collation: Option<String>,
+    #[serde(default)]
+    pub domain_constraints: Vec<CustomTypeDomainConstraint>,
+    pub range_subtype: Option<String>,
+    pub range_multirange_name: Option<String>,
+    pub range_canonical_function: Option<String>,
+    pub range_subtype_diff_function: Option<String>,
+    pub range_subtype_opclass: Option<String>,
+    pub input_function: Option<String>,
+    pub output_function: Option<String>,
+    pub receive_function: Option<String>,
+    pub send_function: Option<String>,
+    pub analyze_function: Option<String>,
+    pub internallength: Option<i32>,
+    pub passed_by_value: Option<bool>,
+    pub alignment: Option<String>,
+    pub storage: Option<String>,
+}
+
+/// Generated `CREATE TYPE` text for a user-defined type.
+///
+/// `complete = true` means the text can be executed standalone in the current
+/// schema. `complete = false` means the text is for viewing only (it may depend
+/// on other types/functions or internal attributes); `warnings` must be shown
+/// in the UI and the text must never be presented as executable source.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomTypeDdl {
+    pub sql: String,
+    pub complete: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomTypeDetails {
+    pub name: String,
+    pub schema: String,
+    pub kind: CustomTypeKind,
+    pub comment: Option<String>,
+    #[serde(default)]
+    pub members: Vec<CustomTypeMember>,
+    pub properties: CustomTypeProperties,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ddl: Option<CustomTypeDdl>,
+}
+
 #[cfg(test)]
 mod tests {
-    use super::ObjectInfo;
+    use super::{ObjectInfo, ObjectSourceKind, QueryMessage, SpatialColumn, SpatialColumnBuilder};
+
+    #[test]
+    fn query_message_format_line_uppercases_severity() {
+        let message = QueryMessage {
+            severity: "notice".to_string(),
+            message: "hello world".to_string(),
+            code: None,
+            detail: None,
+            hint: None,
+        };
+
+        assert_eq!(message.format_line(), "NOTICE: hello world");
+    }
+
+    #[test]
+    fn query_message_format_line_appends_code_detail_hint_extras() {
+        let message = QueryMessage {
+            severity: "WARNING".to_string(),
+            message: "careful".to_string(),
+            code: Some("01000".to_string()),
+            detail: Some("column truncated".to_string()),
+            hint: Some("widen the column".to_string()),
+        };
+
+        assert_eq!(
+            message.format_line(),
+            "WARNING: careful (code: 01000, detail: column truncated, hint: widen the column)"
+        );
+    }
+
+    #[test]
+    fn query_message_format_line_skips_missing_extras() {
+        let message = QueryMessage {
+            severity: "INFO".to_string(),
+            message: "Records: 3".to_string(),
+            code: None,
+            detail: None,
+            hint: Some("use a table".to_string()),
+        };
+
+        assert_eq!(message.format_line(), "INFO: Records: 3 (hint: use a table)");
+    }
+
+    #[test]
+    fn query_message_omits_empty_optional_fields_in_json() {
+        let minimal = QueryMessage {
+            severity: "NOTICE".to_string(),
+            message: "hello".to_string(),
+            code: None,
+            detail: None,
+            hint: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&minimal).unwrap(),
+            serde_json::json!({ "severity": "NOTICE", "message": "hello" })
+        );
+
+        let full = QueryMessage {
+            severity: "NOTICE".to_string(),
+            message: "hello".to_string(),
+            code: Some("00000".to_string()),
+            detail: Some("d".to_string()),
+            hint: Some("h".to_string()),
+        };
+        assert_eq!(
+            serde_json::to_value(&full).unwrap(),
+            serde_json::json!({ "severity": "NOTICE", "message": "hello", "code": "00000", "detail": "d", "hint": "h" })
+        );
+    }
+
+    #[test]
+    fn query_message_deserializes_without_optional_fields() {
+        let message: QueryMessage = serde_json::from_str(r#"{"severity":"Note","message":"Records: 1"}"#).unwrap();
+
+        assert_eq!(message.severity, "Note");
+        assert_eq!(message.message, "Records: 1");
+        assert_eq!(message.code, None);
+        assert_eq!(message.detail, None);
+        assert_eq!(message.hint, None);
+    }
 
     #[test]
     fn list_objects_payload_preserves_optional_validity() {
         let objects: Vec<ObjectInfo> =
-            serde_json::from_str(r#"[{"name":"TRG_AUDIT","object_type":"TRIGGER","schema":"APP","valid":false}]"#)
+            serde_json::from_str(
+                r#"[{"name":"TRG_AUDIT","object_type":"TRIGGER","schema":"APP","valid":false,"trigger":{"name":"TRG_AUDIT","event":"INSERT","timing":"BEFORE","level":"FOR EACH ROW","enabled":false,"valid":false,"comment":"audit","created_at":"2026-08-10 09:30:00"}},{"name":"ORDER_TYPE","object_type":"TYPE","schema":"APP","xugu_type_members_expandable":true}]"#,
+            )
                 .unwrap();
 
         assert_eq!(objects[0].valid, Some(false));
         assert_eq!(objects[0].object_type, "TRIGGER");
+        let trigger = objects[0].trigger.as_ref().unwrap();
+        assert_eq!(trigger.level.as_deref(), Some("FOR EACH ROW"));
+        assert_eq!(trigger.enabled, Some(false));
+        assert_eq!(trigger.comment.as_deref(), Some("audit"));
+        assert_eq!(objects[1].xugu_type_members_expandable, Some(true));
+    }
+
+    #[test]
+    fn spatial_builder_reports_first_non_null_srid_per_column() {
+        let mut builder = SpatialColumnBuilder::new([3]);
+        builder.observe(3, None);
+        builder.observe(1, Some(4326));
+        builder.observe(3, Some(3857));
+        builder.observe(3, Some(4490)); // ignored: column 3 already set
+        builder.observe(1, None); // ignored: column 1 already set
+
+        assert_eq!(
+            builder.finish(),
+            vec![
+                SpatialColumn { column_index: 1, srid: Some(4326) },
+                SpatialColumn { column_index: 3, srid: Some(3857) },
+            ]
+        );
+    }
+
+    #[test]
+    fn spatial_builder_normalizes_zero_and_all_null() {
+        let mut builder = SpatialColumnBuilder::new([0]);
+        builder.observe(0, Some(0)); // SRID 0 -> unknown
+        assert_eq!(builder.finish(), vec![SpatialColumn { column_index: 0, srid: None }]);
+        assert!(SpatialColumnBuilder::default().finish().is_empty());
+    }
+
+    #[test]
+    fn spatial_builder_omits_values_without_spatial_columns() {
+        let values = vec![vec![None, None]];
+        let (columns, values) = SpatialColumnBuilder::default().finish_with_values(values);
+        assert!(columns.is_empty());
+        assert!(values.is_empty());
+
+        let expected_values = vec![vec![None, None]];
+        let (columns, values) = SpatialColumnBuilder::new([0]).finish_with_values(expected_values.clone());
+        assert_eq!(columns, vec![SpatialColumn { column_index: 0, srid: None }]);
+        assert_eq!(values, expected_values);
+    }
+
+    #[test]
+    fn object_source_kind_accepts_synonym_wire_value() {
+        let kind: ObjectSourceKind = serde_json::from_str("\"SYNONYM\"").unwrap();
+
+        assert_eq!(kind, ObjectSourceKind::Synonym);
+        assert_eq!(serde_json::to_string(&kind).unwrap(), "\"SYNONYM\"");
     }
 }

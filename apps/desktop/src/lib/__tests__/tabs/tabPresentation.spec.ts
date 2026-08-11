@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
 import { useConnectionStore } from "@/stores/connectionStore";
-import { connectionGroupDisplayName, middleEllipsis, queryResultBaseSql, queryResultExecutionSql, resultSourceRange, statementExecutionMarkers, tabTooltipLines, tabularResultItems } from "@/lib/tabs/tabPresentation";
+import { connectionGroupDisplayName, executionSummaryItems, middleEllipsis, queryResultBaseSql, queryResultExecutionSql, resultSourceRange, statementExecutionMarkers, tabTooltipLines, tabularResultItems } from "@/lib/tabs/tabPresentation";
 import { sqlTextFingerprint } from "@/lib/sql/sqlTextFingerprint";
 import type { ConnectionConfig, QueryTab } from "@/types/database";
 
@@ -221,6 +221,47 @@ describe("query result source ranges", () => {
   it("does not highlight a stale or ambiguous statement", () => {
     expect(resultSourceRange("SELECT * FROM users;", { sourceStatement: "SELECT * FROM orders" }, 0, "mysql")).toBeUndefined();
     expect(resultSourceRange("SELECT * FROM users; SELECT * FROM users;", { sourceStatement: "SELECT * FROM users" }, undefined, "mysql")).toBeUndefined();
+  });
+});
+
+describe("execution summary", () => {
+  it("uses the explicit execution marker instead of the result column name", () => {
+    const successfulAlias = { columns: ["Error"], rows: [[2]], affected_rows: 0, execution_time_ms: 1 };
+    const markedFailure = { columns: ["Error"], rows: [["failed"]], affected_rows: 0, execution_time_ms: 1, execution_error: true as const };
+
+    expect(executionSummaryItems({ results: [successfulAlias, markedFailure] }).map(({ status, isError }) => ({ status, isError }))).toEqual([
+      { status: "success", isError: false },
+      { status: "error", isError: true },
+    ]);
+  });
+
+  it("maps out-of-order results to their explicit statement indexes", () => {
+    const items = executionSummaryItems({
+      results: [
+        { columns: ["value"], rows: [["third"]], affected_rows: 0, execution_time_ms: 3, statement_index: 2 },
+        { columns: ["value"], rows: [["first"]], affected_rows: 0, execution_time_ms: 1, statement_index: 0 },
+      ],
+      batchSqlExecution: {
+        executionId: "run-out-of-order",
+        submittedSql: "SELECT 'first'; SELECT 'second'; SELECT 'third'",
+        editorFingerprint: "fingerprint",
+        sourceOffset: 0,
+        completed: 2,
+        total: 3,
+        startedAt: 1,
+        items: [
+          { statementIndex: 0, sql: "SELECT 'first'", from: 0, to: 14, status: "success" },
+          { statementIndex: 1, sql: "SELECT 'second'", from: 16, to: 31, status: "skipped" },
+          { statementIndex: 2, sql: "SELECT 'third'", from: 33, to: 47, status: "success" },
+        ],
+      },
+    });
+
+    expect(items.map((item) => [item.statementIndex, item.result?.rows[0]?.[0]])).toEqual([
+      [0, "first"],
+      [1, undefined],
+      [2, "third"],
+    ]);
   });
 });
 

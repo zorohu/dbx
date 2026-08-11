@@ -34,11 +34,66 @@ describe("useDataGridConditionEditor", () => {
     await nextTick();
     await vi.waitFor(() => expect(editor.suggestions.value.map((item) => item.value)).toEqual(["customer_id", "customer_name"]));
     expect(editor.navigate(1)).toBe(true);
+    expect(editor.highlightedIndex.value).toBe(0);
+    expect(editor.navigate(1)).toBe(true);
     expect(editor.highlightedIndex.value).toBe(1);
     expect(editor.navigate(1)).toBe(true);
     expect(editor.highlightedIndex.value).toBe(1);
     expect(editor.accept()).toBe(true);
     expect(value.value).toBe("status = customer_name");
+  });
+
+  it.each(["where", "orderBy"] as const)("searches %s fields by camel-case initials and any-position text", async (kind) => {
+    const value = ref("");
+    const editor = useDataGridConditionEditor({ kind, value, columns: ["userProfile", "order_id", "created_at"], historyScope: {} });
+
+    value.value = "up";
+    await nextTick();
+    await vi.waitFor(() => expect(editor.suggestions.value.map((item) => item.value)).toEqual(["userProfile"]));
+
+    value.value = "id";
+    await nextTick();
+    await vi.waitFor(() => expect(editor.suggestions.value.map((item) => item.value)).toEqual(["order_id"]));
+  });
+
+  it.each(["where", "orderBy"] as const)("hides weaker %s matches when the input exactly matches a field", async (kind) => {
+    const value = ref("");
+    const editor = useDataGridConditionEditor({ kind, value, columns: ["id", "Is_Di", "Did"], historyScope: {} });
+
+    value.value = "id";
+    await nextTick();
+    await vi.waitFor(() => expect(editor.suggestions.value).toEqual([]));
+  });
+
+  it("keeps suggestions dismissed after accepting until the text changes again", async () => {
+    const value = ref("");
+    const selectionStart = ref(0);
+    const selectionEnd = ref(0);
+    const editor = useDataGridConditionEditor({ kind: "orderBy", value, selectionStart, selectionEnd, columns: ["name", "namespace"], historyScope: {} });
+
+    value.value = "na";
+    selectionStart.value = 2;
+    selectionEnd.value = 2;
+    await nextTick();
+    await vi.waitFor(() => expect(editor.suggestions.value).toHaveLength(2));
+    editor.navigate(1);
+    expect(editor.handleKeydown(keyboardEvent("Enter"))).toBe("accept");
+    expect(value.value).toBe("name");
+    expect(editor.suggestions.value).toEqual([]);
+
+    selectionStart.value = 2;
+    selectionEnd.value = 2;
+    await nextTick();
+    selectionStart.value = 4;
+    selectionEnd.value = 4;
+    await nextTick();
+    expect(editor.suggestions.value).toEqual([]);
+
+    value.value = "nam";
+    selectionStart.value = 3;
+    selectionEnd.value = 3;
+    await nextTick();
+    await vi.waitFor(() => expect(editor.suggestions.value.map((item) => item.value)).toEqual(["name", "namespace"]));
   });
 
   it("builds and applies suggestions at the current caret instead of the value end", async () => {
@@ -381,17 +436,38 @@ describe("useDataGridConditionEditor", () => {
 
   it("maps Enter, Tab, arrows, and Escape without applying stale selections", async () => {
     const value = ref("");
-    const editor = useDataGridConditionEditor({ kind: "orderBy", value, columns: ["name"], historyScope: {} });
+    const editor = useDataGridConditionEditor({ kind: "orderBy", value, columns: ["name", "namespace"], historyScope: {} });
     value.value = "na";
     await nextTick();
-    await vi.waitFor(() => expect(editor.suggestions.value).toHaveLength(1));
+    await vi.waitFor(() => expect(editor.suggestions.value).toHaveLength(2));
+    expect(editor.highlightedIndex.value).toBe(-1);
+
+    const initialEnter = keyboardEvent("Enter");
+    expect(editor.handleKeydown(initialEnter)).toBe("apply");
+    expect(initialEnter.preventDefault).toHaveBeenCalledOnce();
+    expect(value.value).toBe("na");
+    expect(editor.suggestions.value).toEqual([]);
+
+    value.value = "nam";
+    await nextTick();
+    await vi.waitFor(() => expect(editor.suggestions.value).toHaveLength(2));
 
     const down = keyboardEvent("ArrowDown");
     expect(editor.handleKeydown(down)).toBe("navigate");
     expect(down.preventDefault).toHaveBeenCalledOnce();
-    const tab = keyboardEvent("Tab");
-    expect(editor.handleKeydown(tab)).toBe("accept");
+    expect(editor.highlightedIndex.value).toBe(0);
+    const navigatedEnter = keyboardEvent("Enter");
+    expect(editor.handleKeydown(navigatedEnter)).toBe("accept");
     expect(value.value).toBe("name");
+
+    const tabValue = ref("");
+    const tabEditor = useDataGridConditionEditor({ kind: "orderBy", value: tabValue, columns: ["name"], historyScope: {} });
+    tabValue.value = "na";
+    await nextTick();
+    await vi.waitFor(() => expect(tabEditor.suggestions.value).toHaveLength(1));
+    const tab = keyboardEvent("Tab");
+    expect(tabEditor.handleKeydown(tab)).toBe("accept");
+    expect(tabValue.value).toBe("name");
 
     const enter = keyboardEvent("Enter");
     expect(editor.handleKeydown(enter)).toBe("apply");

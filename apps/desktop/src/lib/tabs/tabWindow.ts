@@ -23,7 +23,7 @@ interface TransferSignal {
 
 export interface DetachedTabTransferPayload extends TransferSignal {
   tab: DetachedTabDescriptor;
-  activeOutputView: "result" | "summary" | "explain" | "chart";
+  activeOutputView: "result" | "summary" | "explain" | "chart" | "messages";
   selectedSql: string;
   cursorPos: number;
   explainMode: "explain" | "autotrace";

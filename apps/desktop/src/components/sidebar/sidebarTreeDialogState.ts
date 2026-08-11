@@ -4,6 +4,7 @@ import type { PasteTableMode } from "@/lib/table/tableClipboard";
 import { fallbackCreateDatabaseCharsetMetadata } from "@/lib/database/createDatabaseCharsetOptions";
 import type { DatabaseUserIdentity } from "@/lib/database/databaseUserAdmin";
 import type { AuthorizationPlan, AuthorizationStepResult } from "@/lib/database/databaseAuthorizationPlan";
+import type { MongoCreateIndexForm } from "@/lib/sidebar/mongoCollectionMutation";
 
 export type DuplicateStructureSource = TreeNode & { connectionId: string; database: string };
 type ConnectionDeleteTarget = TreeNode & { connectionId: string };
@@ -58,7 +59,7 @@ export const duplicateTableName = ref("");
 export const duplicateStructureSource = ref<DuplicateStructureSource | null>(null);
 export const showPasteDialog = ref(false);
 export const pasteTableMode = ref<PasteTableMode>("structure-and-data");
-export const pasteTableEntries = ref<Array<{ sourceName: string; targetName: string; connectionId: string; database: string; schema?: string }>>([]);
+export const pasteTableEntries = ref<Array<{ sourceName: string; targetName: string; connectionId: string; database: string; schema?: string; tableComment?: string | null }>>([]);
 export const showCreateDatabaseDialog = ref(false);
 export const createDatabaseName = ref("");
 export const createDatabaseCharset = ref("utf8mb4");
@@ -92,10 +93,26 @@ export const renameMongoCollectionName = ref("");
 export const renameMongoCollectionError = ref("");
 export const renameMongoCollectionPreview = ref("");
 export const renameMongoCollectionLoading = ref(false);
+export const showCloneMongoCollectionDialog = ref(false);
+export const cloneMongoCollectionName = ref("");
+export const cloneMongoCollectionError = ref("");
+export const cloneMongoCollectionLoading = ref(false);
 export const showDropMongoIndexConfirm = ref(false);
 export const dropMongoIndexLoading = ref(false);
 export const showDropAllMongoIndexesConfirm = ref(false);
 export const dropAllMongoIndexesLoading = ref(false);
+export const showCreateMongoIndexDialog = ref(false);
+export const mongoCreateIndexForm = ref<MongoCreateIndexForm>({ name: "", fields: [{ id: 1, path: "", type: "1" }], unique: false, sparse: false });
+export const mongoCreateIndexFieldOptions = ref<string[]>([]);
+export const mongoCreateIndexError = ref("");
+export const mongoCreateIndexLoading = ref(false);
+
+export function resetMongoCreateIndexForm() {
+  mongoCreateIndexForm.value = { name: "", fields: [{ id: 1, path: "", type: "1" }], unique: false, sparse: false };
+  mongoCreateIndexFieldOptions.value = [];
+  mongoCreateIndexError.value = "";
+  mongoCreateIndexLoading.value = false;
+}
 export const showFlushRedisDbConfirm = ref(false);
 export const showRedisDatabaseAliasDialog = ref(false);
 export const redisDatabaseAliasInput = ref("");
@@ -139,8 +156,10 @@ const openFlags = [
   showDropDatabaseConfirm,
   showDropMongoCollectionConfirm,
   showRenameMongoCollectionDialog,
+  showCloneMongoCollectionDialog,
   showDropMongoIndexConfirm,
   showDropAllMongoIndexesConfirm,
+  showCreateMongoIndexDialog,
   showFlushRedisDbConfirm,
   showRedisDatabaseAliasDialog,
   showCreateSchemaDialog,
@@ -162,6 +181,10 @@ export function resetSidebarTreeDialogState() {
   createDatabaseAuthorizationApplying.value = false;
   redisDatabaseAliasInput.value = "";
   redisDatabaseAliasSaving.value = false;
+  cloneMongoCollectionName.value = "";
+  cloneMongoCollectionError.value = "";
+  cloneMongoCollectionLoading.value = false;
+  resetMongoCreateIndexForm();
   sidebarTreeDialogOwner.value = null;
   sidebarDangerTarget.value = null;
   sidebarFormTarget.value = null;

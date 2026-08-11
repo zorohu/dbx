@@ -8,8 +8,34 @@ pub enum MongoCommand {
     Version,
     #[serde(rename = "use")]
     Use { database: String },
+    #[serde(rename = "createUser")]
+    CreateUser {
+        #[serde(rename = "userJson")]
+        user_json: String,
+        #[serde(rename = "writeConcernJson")]
+        write_concern_json: Option<String>,
+    },
     #[serde(rename = "find")]
-    Find { collection: String, filter: String, projection: Option<String>, sort: Option<String>, skip: u64, limit: i64 },
+    Find {
+        collection: String,
+        filter: String,
+        projection: Option<String>,
+        sort: Option<String>,
+        collation: Option<String>,
+        skip: u64,
+        limit: i64,
+    },
+    #[serde(rename = "findExplain")]
+    FindExplain {
+        collection: String,
+        filter: String,
+        projection: Option<String>,
+        sort: Option<String>,
+        collation: Option<String>,
+        skip: u64,
+        limit: i64,
+        verbosity: String,
+    },
     #[serde(rename = "findOne")]
     FindOne { collection: String, filter: String, projection: Option<String>, options: Option<String> },
     #[serde(rename = "countDocuments")]
@@ -58,7 +84,8 @@ impl MongoCommand {
     pub fn is_mutating(&self) -> bool {
         matches!(
             self,
-            Self::Insert { .. }
+            Self::CreateUser { .. }
+                | Self::Insert { .. }
                 | Self::Update { .. }
                 | Self::Delete { .. }
                 | Self::CreateIndex { .. }
@@ -71,7 +98,7 @@ impl MongoCommand {
     }
 
     pub fn is_dangerous(&self) -> bool {
-        matches!(self, Self::DropCollection { .. })
+        matches!(self, Self::CreateUser { .. } | Self::DropCollection { .. })
             || matches!(self, Self::DropIndexes { indexes: None, single: false, .. })
             || matches!(self, Self::Aggregate { pipeline, .. } if aggregate_writes(pipeline))
     }
@@ -329,6 +356,23 @@ pub fn parse(input: &str) -> Result<MongoCommand, String> {
     if let Some(database) = parse_use_database(source) {
         return Ok(MongoCommand::Use { database });
     }
+    if let Some((args, tail)) = database_method_call(source, "createUser") {
+        if !tail.is_empty() || !(1..=2).contains(&args.len()) {
+            return Err("MongoDB createUser() requires a user document and optional write concern.".to_string());
+        }
+        let user_json = normalized_json(&args[0])?;
+        let user = parse_json_value(&user_json)
+            .and_then(|value| value.as_object().cloned())
+            .ok_or("MongoDB createUser() requires a user document.")?;
+        if user.get("user").and_then(Value::as_str).is_none_or(|user| user.trim().is_empty()) {
+            return Err("MongoDB createUser() requires a non-empty user name.".to_string());
+        }
+        let write_concern_json = optional_json_argument(args.get(1))?;
+        if write_concern_json.as_deref().and_then(parse_json_value).is_some_and(|value| !value.is_object()) {
+            return Err("MongoDB createUser() write concern must be a document.".to_string());
+        }
+        return Ok(MongoCommand::CreateUser { user_json, write_concern_json });
+    }
     let (collection, prefix_end) = parse_collection_prefix(source)?;
 
     if let Some((args, tail)) = method_call(source, prefix_end, "find") {
@@ -339,20 +383,44 @@ pub fn parse(input: &str) -> Result<MongoCommand, String> {
             return Err("MongoDB find() accepts at most filter and projection arguments.".to_string());
         }
         let mut sort = None;
+        let mut collation = None;
         let mut skip = 0;
         let mut limit = 100;
-        for (name, call_args) in chained_calls(&tail)? {
+        let calls = chained_calls(&tail)?;
+        let call_count = calls.len();
+        for (index, (name, call_args)) in calls.into_iter().enumerate() {
             match name.as_str() {
                 "sort" => sort = Some(normalized_json(call_args.first().map(String::as_str).unwrap_or("{}"))?),
+                "collation" => {
+                    if call_args.len() != 1 {
+                        return Err("MongoDB collation() requires one options object.".to_string());
+                    }
+                    collation = Some(normalized_json(&call_args[0])?);
+                }
                 "skip" => skip = parse_integer(&call_args, "skip")? as u64,
                 "limit" => limit = parse_integer(&call_args, "limit")?,
                 "count" if call_args.is_empty() => {
                     return Ok(MongoCommand::Count { collection, filter, accurate: false });
                 }
+                "explain" => {
+                    if index + 1 != call_count {
+                        return Err("MongoDB explain() must be the final find() chain operation.".to_string());
+                    }
+                    return Ok(MongoCommand::FindExplain {
+                        collection,
+                        filter,
+                        projection,
+                        sort,
+                        collation,
+                        skip,
+                        limit,
+                        verbosity: parse_explain_verbosity(&call_args)?,
+                    });
+                }
                 _ => return Err(format!("Unsupported MongoDB find() chain: {name}()")),
             }
         }
-        return Ok(MongoCommand::Find { collection, filter, projection, sort, skip, limit });
+        return Ok(MongoCommand::Find { collection, filter, projection, sort, collation, skip, limit });
     }
 
     if let Some((args, tail)) = method_call(source, prefix_end, "findOne") {
@@ -501,6 +569,19 @@ pub fn parse(input: &str) -> Result<MongoCommand, String> {
             });
         }
     }
+    if let Some((args, tail)) = method_call(source, prefix_end, "update") {
+        if !tail.is_empty() || !(2..=3).contains(&args.len()) {
+            return Err("Invalid MongoDB update() command.".to_string());
+        }
+        let (options, many) = legacy_update_options(args.get(2))?;
+        return Ok(MongoCommand::Update {
+            collection,
+            filter: normalized_json(&args[0])?,
+            update: normalized_json(&args[1])?,
+            options,
+            many,
+        });
+    }
     for (method, many) in [("deleteOne", false), ("deleteMany", true)] {
         if let Some((args, tail)) = method_call(source, prefix_end, method) {
             if !tail.is_empty() || args.len() != 1 {
@@ -595,6 +676,24 @@ fn method_call(source: &str, prefix_end: usize, method: &str) -> Option<(Vec<Str
     Some((split_top_level(&source[open + 1..close]), source[close + 1..].trim().to_string()))
 }
 
+fn database_method_call(source: &str, method: &str) -> Option<(Vec<String>, String)> {
+    if !source.get(..2).is_some_and(|prefix| prefix.eq_ignore_ascii_case("db")) {
+        return None;
+    }
+    let after_db = source.get(2..)?.trim_start();
+    let after_dot = after_db.strip_prefix('.')?.trim_start();
+    if !after_dot.get(..method.len()).is_some_and(|name| name.eq_ignore_ascii_case(method)) {
+        return None;
+    }
+    let after_method = after_dot.get(method.len()..)?.trim_start();
+    if !after_method.starts_with('(') {
+        return None;
+    }
+    let open = source.len() - after_method.len();
+    let close = matching_paren(source, open)?;
+    Some((split_top_level(&source[open + 1..close]), source[close + 1..].trim().to_string()))
+}
+
 fn chained_calls(chain: &str) -> Result<Vec<(String, Vec<String>)>, String> {
     let mut rest = chain.trim();
     let mut calls = Vec::new();
@@ -626,6 +725,20 @@ fn parse_integer(args: &[String], name: &str) -> Result<i64, String> {
 fn parse_string_arg(arg: &str) -> Result<String, String> {
     let value = parse_json_value(&normalized_json(arg)?).ok_or("Invalid MongoDB string argument.")?;
     value.as_str().map(ToOwned::to_owned).ok_or_else(|| "MongoDB argument must be a string.".to_string())
+}
+
+fn parse_explain_verbosity(args: &[String]) -> Result<String, String> {
+    if args.len() > 1 {
+        return Err("MongoDB explain() accepts at most one verbosity string.".to_string());
+    }
+    let verbosity = match args.first() {
+        Some(value) => parse_string_arg(value)?,
+        None => "queryPlanner".to_string(),
+    };
+    match verbosity.as_str() {
+        "queryPlanner" | "executionStats" | "allPlansExecution" => Ok(verbosity),
+        _ => Err("MongoDB explain() verbosity must be queryPlanner, executionStats, or allPlansExecution.".to_string()),
+    }
 }
 
 fn normalized_json(input: &str) -> Result<String, String> {
@@ -670,6 +783,28 @@ fn parse_json_value(value: &str) -> Option<Value> {
 
 fn optional_json_argument(value: Option<&String>) -> Result<Option<String>, String> {
     value.filter(|value| !value.trim().is_empty()).map(|value| normalized_json(value)).transpose()
+}
+
+fn legacy_update_options(value: Option<&String>) -> Result<(Option<String>, bool), String> {
+    let Some(value) = value.filter(|value| !value.trim().is_empty()) else {
+        return Ok((None, false));
+    };
+    let normalized = normalized_json(value)?;
+    let value = parse_json_value(&normalized).ok_or("Invalid MongoDB update() options.")?;
+    let Value::Object(mut options) = value else {
+        return Err("MongoDB update() options must be a document.".to_string());
+    };
+    let many = match options.remove("multi") {
+        Some(Value::Bool(many)) => many,
+        Some(_) => return Err("MongoDB update() multi option must be a boolean.".to_string()),
+        None => false,
+    };
+    let options = if options.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(&Value::Object(options)).map_err(|error| error.to_string())?)
+    };
+    Ok((options, many))
 }
 
 fn parse_use_database(source: &str) -> Option<String> {
@@ -787,10 +922,62 @@ mod tests {
                 filter: r#"{"_id":{"$oid":"507f1f77bcf86cd799439011"}}"#.to_string(),
                 projection: Some(r#"{"title":1,"_id":0}"#.to_string()),
                 sort: Some(r#"{"title":1}"#.to_string()),
+                collation: None,
                 skip: 0,
                 limit: 1,
             }
         );
+    }
+
+    #[test]
+    fn parses_find_with_collation_chain() {
+        assert_eq!(
+            parse(r#"db.t_user.find({name: 'xxx'}).collation({ locale: "en", strength: 1 }).limit(20)"#).unwrap(),
+            MongoCommand::Find {
+                collection: "t_user".to_string(),
+                filter: r#"{"name":"xxx"}"#.to_string(),
+                projection: None,
+                sort: None,
+                collation: Some(r#"{"locale":"en","strength":1}"#.to_string()),
+                skip: 0,
+                limit: 20,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_find_explain_with_query_options_and_verbosity() {
+        let command = parse(
+            r#"db.im_msg.find({active: true}, {email: 1}).sort({email: 1}).collation({locale: "en", strength: 1}).skip(2).limit(5).explain("executionStats")"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(command).unwrap(),
+            serde_json::json!({
+                "kind": "findExplain",
+                "collection": "im_msg",
+                "filter": "{\"active\":true}",
+                "projection": "{\"email\":1}",
+                "sort": "{\"email\":1}",
+                "collation": "{\"locale\":\"en\",\"strength\":1}",
+                "skip": 2,
+                "limit": 5,
+                "verbosity": "executionStats"
+            })
+        );
+    }
+
+    #[test]
+    fn find_explain_defaults_and_validates_verbosity() {
+        let default = serde_json::to_value(parse("db.items.find({}).explain()").unwrap()).unwrap();
+        assert_eq!(default["verbosity"], "queryPlanner");
+
+        let all_plans = serde_json::to_value(parse("db.items.find({}).explain('allPlansExecution')").unwrap()).unwrap();
+        assert_eq!(all_plans["verbosity"], "allPlansExecution");
+
+        assert!(parse("db.items.find({}).explain('invalid')").unwrap_err().contains("verbosity"));
+        assert!(parse("db.items.find({}).explain('executionStats').limit(1)").unwrap_err().contains("final"));
     }
 
     #[test]
@@ -808,6 +995,31 @@ mod tests {
         assert!(aggregate.is_dangerous());
         let update = parse("db.projects.updateMany({}, {$set: {active: false}})").unwrap();
         assert!(update.has_empty_filter());
+        let legacy_update = parse("db.projects.update({}, {$set: {active: false}}, {multi: true})").unwrap();
+        assert!(legacy_update.has_empty_filter());
+        assert_eq!(validate_safety(&legacy_update, true, false, false), Err(MongoSafetyError::EmptyFilter));
+    }
+
+    #[test]
+    fn parses_create_user_as_a_dangerous_write() {
+        let command = parse(
+            r#"db . createUser({user: "test-db", pwd: "test-password", roles: [{role: "readWrite", db: "db1"}]}, {w: "majority"})"#,
+        )
+        .unwrap();
+        assert_eq!(
+            command,
+            MongoCommand::CreateUser {
+                user_json: r#"{"user":"test-db","pwd":"test-password","roles":[{"role":"readWrite","db":"db1"}]}"#
+                    .to_string(),
+                write_concern_json: Some(r#"{"w":"majority"}"#.to_string()),
+            }
+        );
+        assert!(command.is_mutating());
+        assert!(command.is_dangerous());
+        assert_eq!(validate_safety(&command, true, false, false), Err(MongoSafetyError::Dangerous));
+        assert_eq!(validate_safety(&command, true, true, false), Ok(()));
+        assert!(parse(r#"db.createUser({pwd: "missing-user", roles: []})"#).is_err());
+        assert!(parse(r#"db.createUser({user: "test"}, "majority")"#).is_err());
     }
 
     #[test]
@@ -854,6 +1066,52 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(update, MongoCommand::Update { many: true, options: Some(_), .. }));
+    }
+
+    #[test]
+    fn parses_legacy_update_with_single_and_multi_semantics() {
+        assert_eq!(
+            parse("db.projects.update({_id: 1}, {$set: {active: true}})").unwrap(),
+            MongoCommand::Update {
+                collection: "projects".to_string(),
+                filter: r#"{"_id":1}"#.to_string(),
+                update: r#"{"$set":{"active":true}}"#.to_string(),
+                options: None,
+                many: false,
+            }
+        );
+
+        let command =
+            parse(r#"db.getCollection("xxx").update({tenantId: 7}, {$set: {active: true}}, {upsert: true})"#).unwrap();
+        let MongoCommand::Update { collection, update, options, many, .. } = command else {
+            panic!("expected legacy update command");
+        };
+        assert_eq!(collection, "xxx");
+        assert!(!many);
+        assert_eq!(parse_json_value(&update).unwrap(), serde_json::json!({ "$set": { "active": true } }));
+        assert_eq!(parse_json_value(options.as_deref().unwrap()).unwrap(), serde_json::json!({ "upsert": true }));
+
+        let command = parse(
+            r#"db.projects.update({tenantId: 7}, [{$set: {active: true}}], {multi: true, arrayFilters: [{"item.id": 1}]})"#,
+        )
+        .unwrap();
+        let MongoCommand::Update { update, options, many, .. } = command else {
+            panic!("expected legacy multi update command");
+        };
+        assert!(many);
+        assert_eq!(parse_json_value(&update).unwrap(), serde_json::json!([{ "$set": { "active": true } }]));
+        assert_eq!(
+            parse_json_value(options.as_deref().unwrap()).unwrap(),
+            serde_json::json!({ "arrayFilters": [{ "item.id": 1 }] })
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_legacy_update_arguments() {
+        assert!(parse("db.projects.update({_id: 1})").is_err());
+        assert!(parse("db.projects.update({_id: 1}, {$set: {active: true}}, true)").is_err());
+        assert!(parse("db.projects.update({_id: 1}, {$set: {active: true}}, {multi: 'yes'})").is_err());
+        assert!(parse("db.projects.update({_id: 1}, {$set: {active: true}}, {}, false)").is_err());
     }
 
     #[test]
@@ -909,6 +1167,10 @@ mod tests {
         let count = serde_json::to_value(parse("db.items.count({})").unwrap()).unwrap();
         assert_eq!(count["kind"], "countDocuments");
         assert_eq!(count["accurate"], false);
+        let create_user =
+            serde_json::to_value(parse(r#"db.createUser({user: "app", pwd: "secret", roles: []})"#).unwrap()).unwrap();
+        assert_eq!(create_user["kind"], "createUser");
+        assert_eq!(create_user["userJson"], r#"{"user":"app","pwd":"secret","roles":[]}"#);
     }
 
     #[test]

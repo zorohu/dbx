@@ -20,6 +20,38 @@ afterEach(() => {
 });
 
 describe("CustomContextMenu lifecycle", () => {
+  it("removes the capture keydown listener when unmounted while open", async () => {
+    const documentAdd = vi.spyOn(document, "addEventListener");
+    const documentRemove = vi.spyOn(document, "removeEventListener");
+    const root = defineComponent({
+      setup() {
+        return () =>
+          h(
+            CustomContextMenu,
+            { items: [{ label: "Inspect" }] },
+            {
+              default: ({ onContextMenu }: { onContextMenu: (event: MouseEvent) => void }) => h("div", { id: "context-target", onContextmenu: onContextMenu }, "Target"),
+            },
+          );
+      },
+    });
+    const container = document.createElement("div");
+    mountedContainers.push(container);
+    document.body.append(container);
+    const app = createApp(root);
+    app.mount(container);
+
+    container.querySelector("#context-target")?.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true }));
+    await nextTick();
+    const keydownListener = callsFor(documentAdd, "keydown").at(-1)?.[1];
+    expect(keydownListener).toBeTruthy();
+
+    app.unmount();
+    await nextTick();
+
+    expect(documentRemove.mock.calls).toContainEqual(["keydown", keydownListener, true]);
+  });
+
   it("uses one shared listener set across repeated bulk mount cycles", async () => {
     const documentAdd = vi.spyOn(document, "addEventListener");
     const documentRemove = vi.spyOn(document, "removeEventListener");
@@ -93,6 +125,72 @@ describe("CustomContextMenu lifecycle", () => {
     window.dispatchEvent(new Event("resize"));
     await nextTick();
     expect(document.body.textContent).not.toContain("Inspect");
+
+    app.unmount();
+  });
+
+  it("closes the menu when an application shortcut is pressed", async () => {
+    const root = defineComponent({
+      setup() {
+        return () =>
+          h(
+            CustomContextMenu,
+            { items: [{ label: "Refresh row" }] },
+            {
+              default: ({ onContextMenu }: { onContextMenu: (event: MouseEvent) => void }) => h("div", { id: "context-target", onContextmenu: onContextMenu, onKeydown: (event: KeyboardEvent) => event.stopPropagation() }, "Target"),
+            },
+          );
+      },
+    });
+    const container = document.createElement("div");
+    mountedContainers.push(container);
+    document.body.append(container);
+    const app = createApp(root);
+    app.mount(container);
+
+    const target = container.querySelector("#context-target");
+    target?.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true }));
+    await nextTick();
+    expect(document.body.textContent).toContain("Refresh row");
+
+    target?.dispatchEvent(new KeyboardEvent("keydown", { key: "Meta", metaKey: true, bubbles: true }));
+    await nextTick();
+    expect(document.body.textContent).toContain("Refresh row");
+
+    target?.dispatchEvent(new KeyboardEvent("keydown", { key: "r", metaKey: true, bubbles: true }));
+    await nextTick();
+    expect(document.body.textContent).not.toContain("Refresh row");
+
+    app.unmount();
+  });
+
+  it("renders checked state in the leading icon slot", async () => {
+    const root = defineComponent({
+      setup() {
+        return () =>
+          h(
+            CustomContextMenu,
+            { items: [{ label: "Current", checked: true }, { label: "Other" }] },
+            {
+              default: ({ onContextMenu }: { onContextMenu: (event: MouseEvent) => void }) => h("div", { id: "context-target", onContextmenu: onContextMenu }, "Target"),
+            },
+          );
+      },
+    });
+    const container = document.createElement("div");
+    mountedContainers.push(container);
+    document.body.append(container);
+    const app = createApp(root);
+    app.mount(container);
+
+    container.querySelector("#context-target")?.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true }));
+    await nextTick();
+
+    const current = Array.from(document.body.querySelectorAll("button")).find((button) => button.textContent?.includes("Current"));
+    const other = Array.from(document.body.querySelectorAll("button")).find((button) => button.textContent?.includes("Other"));
+    expect(current?.firstElementChild?.querySelector("svg")).not.toBeNull();
+    expect(current?.lastElementChild?.tagName.toLowerCase()).toBe("span");
+    expect(other?.querySelector("svg")).toBeNull();
 
     app.unmount();
   });

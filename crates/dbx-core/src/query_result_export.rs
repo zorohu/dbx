@@ -35,8 +35,6 @@ use sqlparser::parser::Parser;
 use tokio_util::sync::CancellationToken;
 
 const AGENT_UNBOUNDED_ROW_LIMIT: usize = i32::MAX as usize;
-pub const XLSX_MAX_DATA_ROWS: usize = 1_048_575;
-const XLSX_ROW_LIMIT_ERROR: &str = "XLSX supports at most 1,048,575 data rows. Use CSV export for the full result.";
 const STREAMING_PAGINATION_UNSUPPORTED_ERROR: &str =
     "Streaming export is unsupported for this query. Simplify it or use a supported driver.";
 const AGENT_SESSION_MISSING_ERROR: &str =
@@ -65,6 +63,8 @@ pub struct QueryResultExportRequest {
     pub database: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog: Option<String>,
     pub sql: String,
     pub query_base_sql: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -241,11 +241,7 @@ fn progress(
     status: ExportStatus,
     error_message: Option<String>,
 ) -> TableExportProgress {
-    let total_rows = request.total_rows.map(|total| {
-        let format = request.format.to_lowercase();
-        let limit = effective_row_limit(&format, request);
-        limit.map_or(total, |limit| total.min(limit as u64))
-    });
+    let total_rows = request.total_rows.map(|total| request.row_limit.map_or(total, |limit| total.min(limit as u64)));
     TableExportProgress {
         export_id: request.export_id.clone(),
         table_name: String::new(),
@@ -265,25 +261,27 @@ fn stream_export_was_cancelled(error: &str, token_cancelled: bool, export_cancel
 ///
 /// `column_types` are the types returned by the executed query (original column
 /// order). The request's overrides are expected to align 1:1 in the same order.
-/// If the request provides fewer overrides than the result has columns the
-/// extra columns are left untyped. Overrides that are `None` or empty are
-/// treated as "infer from the query result".
+/// Missing, `None`, or empty overrides infer only MySQL spatial types, which
+/// preserves the historical literal formatting of other database types.
 fn sql_insert_column_types(request: &QueryResultExportRequest, column_types: &[String]) -> Vec<Option<String>> {
-    match request.export_column_types.as_ref() {
-        Some(overrides) => {
-            let mut result: Vec<Option<String>> = overrides
-                .iter()
-                .map(|t| match t {
-                    Some(s) if !s.is_empty() => Some(s.clone()),
-                    _ => None,
+    column_types
+        .iter()
+        .enumerate()
+        .map(|(index, inferred)| {
+            request
+                .export_column_types
+                .as_ref()
+                .and_then(|overrides| overrides.get(index))
+                .and_then(|override_type| override_type.as_deref())
+                .filter(|override_type| !override_type.is_empty())
+                .map(str::to_string)
+                .or_else(|| {
+                    (request.database_type == DatabaseType::Mysql
+                        && crate::database_export::is_mysql_spatial_export_type(inferred))
+                    .then(|| inferred.clone())
                 })
-                .collect();
-            // Pad with None if fewer overrides than result columns
-            result.resize(column_types.len(), None);
-            result
-        }
-        None => vec![None; column_types.len()],
-    }
+        })
+        .collect()
 }
 
 /// Bounded SQL INSERT writer with staged-file replacement safety.
@@ -387,16 +385,8 @@ impl SqlInsertWriter {
     }
 }
 
-fn effective_row_limit(format: &str, request: &QueryResultExportRequest) -> Option<usize> {
-    if format == "xlsx" {
-        Some(request.row_limit.map_or(XLSX_MAX_DATA_ROWS, |limit| limit.min(XLSX_MAX_DATA_ROWS)))
-    } else {
-        request.row_limit
-    }
-}
-
-fn xlsx_hard_limit_active(format: &str, request: &QueryResultExportRequest) -> bool {
-    format == "xlsx" && request.row_limit.is_none_or(|limit| limit > XLSX_MAX_DATA_ROWS)
+fn effective_row_limit(request: &QueryResultExportRequest) -> Option<usize> {
+    request.row_limit
 }
 
 fn format_text_export_header(format: &str, columns: &[String]) -> String {
@@ -619,18 +609,8 @@ async fn export_query_result_core_inner(
     }
 
     let page_size = request.page_size.max(1);
-    let effective_row_limit = effective_row_limit(&format, request);
-    let xlsx_hard_limit_active = xlsx_hard_limit_active(&format, request);
-    if xlsx_hard_limit_active && request.total_rows.is_some_and(|total| total > XLSX_MAX_DATA_ROWS as u64) {
-        return Err(XLSX_ROW_LIMIT_ERROR.to_string());
-    }
-
-    let agent_max_rows = if xlsx_hard_limit_active {
-        XLSX_MAX_DATA_ROWS + 1
-    } else {
-        effective_row_limit.unwrap_or(AGENT_UNBOUNDED_ROW_LIMIT)
-    }
-    .max(1);
+    let effective_row_limit = effective_row_limit(request);
+    let agent_max_rows = effective_row_limit.unwrap_or(AGENT_UNBOUNDED_ROW_LIMIT).max(1);
 
     on_progress(progress(request, 0, ExportStatus::Running, None));
 
@@ -695,11 +675,6 @@ async fn export_query_result_core_inner(
             break;
         }
         let this_page = remaining.map_or(page_size, |rem| rem.min(page_size)).max(1);
-        let fetch_limit = if xlsx_hard_limit_active && remaining.is_some_and(|rem| rem <= page_size) {
-            this_page.saturating_add(1)
-        } else {
-            this_page
-        };
 
         let (sql_to_execute, plan_limit, use_agent_result_session) = if let Some(plan) = keyset_plan.as_ref() {
             (
@@ -710,9 +685,9 @@ async fn export_query_result_core_inner(
                     &request.database_type,
                     &plan.primary_keys,
                     &plan.last_pk_values,
-                    fetch_limit,
+                    this_page,
                 ),
-                fetch_limit,
+                this_page,
                 false,
             )
         } else {
@@ -720,7 +695,7 @@ async fn export_query_result_core_inner(
                 sql: request.sql.clone(),
                 query_base_sql: request.query_base_sql.clone(),
                 database_type: Some(request.database_type),
-                pagination: QueryPagination { limit: fetch_limit, offset, session_id: session_id.clone() },
+                pagination: QueryPagination { limit: this_page, offset, session_id: session_id.clone() },
                 use_agent_cursor: request.use_agent_cursor,
                 first_page_uses_actual_sql: true,
             });
@@ -739,6 +714,7 @@ async fn export_query_result_core_inner(
                 timeout_secs: request.timeout_secs,
                 client_session_id: request.client_session_id.clone(),
                 execution_id: request.execution_id.clone(),
+                catalog: request.catalog.clone(),
                 ..Default::default()
             }
         } else {
@@ -748,6 +724,7 @@ async fn export_query_result_core_inner(
                 timeout_secs: request.timeout_secs,
                 client_session_id: request.client_session_id.clone(),
                 execution_id: request.execution_id.clone(),
+                catalog: request.catalog.clone(),
                 ..Default::default()
             }
         };
@@ -801,12 +778,6 @@ async fn export_query_result_core_inner(
             }
         }
         let fetched_row_count = result.rows.len();
-        if xlsx_hard_limit_active {
-            let remaining_rows = XLSX_MAX_DATA_ROWS.saturating_sub(rows_exported as usize);
-            if fetched_row_count > remaining_rows {
-                return Err(XLSX_ROW_LIMIT_ERROR.to_string());
-            }
-        }
         if result.rows.len() > this_page {
             result.rows.truncate(this_page);
         }
@@ -964,10 +935,8 @@ async fn try_export_postgres_query_result_stream(
     state.touch_pool_activity(&pool_key).await;
     let _activity_touch = state.pool_activity_touch(&pool_key);
 
-    let xlsx_hard_limit_active = xlsx_hard_limit_active(format, request);
-    let row_limit = effective_row_limit(format, request);
-    let stream_row_limit =
-        if xlsx_hard_limit_active { row_limit.map(|limit| limit.saturating_add(1)) } else { row_limit };
+    let row_limit = effective_row_limit(request);
+    let stream_row_limit = row_limit;
     let progress_row_interval = request.page_size.max(1) as u64;
     let mut columns: Vec<String> = Vec::new();
     let mut temporal_column_types: Vec<String> = Vec::new();
@@ -1020,9 +989,6 @@ async fn try_export_postgres_query_result_stream(
                     }
                 }
                 crate::db::postgres::PostgresQueryStreamItem::Row(row) => {
-                    if xlsx_hard_limit_active && rows_exported as usize >= XLSX_MAX_DATA_ROWS {
-                        return Err(XLSX_ROW_LIMIT_ERROR.to_string());
-                    }
                     let formatted = crate::temporal_format::format_temporal_export_row_with_string_types(
                         &row,
                         &temporal_column_types,
@@ -1161,10 +1127,8 @@ async fn try_export_mysql_query_result_stream(
         crate::query_execution_sql::check_read_only(&request.sql, &name, database_type)?;
     }
 
-    let xlsx_hard_limit_active = xlsx_hard_limit_active(format, request);
-    let row_limit = effective_row_limit(format, request);
-    let stream_row_limit =
-        if xlsx_hard_limit_active { row_limit.map(|limit| limit.saturating_add(1)) } else { row_limit };
+    let row_limit = effective_row_limit(request);
+    let stream_row_limit = row_limit;
     let progress_row_interval = request.page_size.max(1) as u64;
     let mut columns: Vec<String> = Vec::new();
     let mut temporal_column_types: Vec<String> = Vec::new();
@@ -1239,6 +1203,7 @@ async fn try_export_mysql_query_result_stream(
         stream_row_limit,
         mysql_dialect,
         &export_cancelled,
+        format.eq_ignore_ascii_case("sql"),
         |item| {
             if export_cancelled.load(Ordering::SeqCst)
                 || cancel_token.as_ref().is_some_and(|token| token.is_cancelled())
@@ -1266,9 +1231,6 @@ async fn try_export_mysql_query_result_stream(
                     }
                 }
                 crate::db::mysql::MySqlQueryStreamItem::Row(row) => {
-                    if xlsx_hard_limit_active && rows_exported as usize >= XLSX_MAX_DATA_ROWS {
-                        return Err(XLSX_ROW_LIMIT_ERROR.to_string());
-                    }
                     let formatted = crate::temporal_format::format_temporal_export_row_with_string_types(
                         &row,
                         &temporal_column_types,
@@ -1427,10 +1389,8 @@ async fn try_export_clickhouse_query_result_stream(
     state.touch_pool_activity(&pool_key).await;
     let _activity_touch = state.pool_activity_touch(&pool_key);
 
-    let xlsx_hard_limit_active = xlsx_hard_limit_active(format, request);
-    let row_limit = effective_row_limit(format, request);
-    let stream_row_limit =
-        if xlsx_hard_limit_active { row_limit.map(|limit| limit.saturating_add(1)) } else { row_limit };
+    let row_limit = effective_row_limit(request);
+    let stream_row_limit = row_limit;
     let progress_row_interval = request.page_size.max(1) as u64;
     let mut columns: Vec<String> = Vec::new();
     let mut temporal_column_types: Vec<String> = Vec::new();
@@ -1484,9 +1444,6 @@ async fn try_export_clickhouse_query_result_stream(
                     }
                 }
                 crate::db::clickhouse_driver::ClickHouseQueryStreamItem::Row(row) => {
-                    if xlsx_hard_limit_active && rows_exported as usize >= XLSX_MAX_DATA_ROWS {
-                        return Err(XLSX_ROW_LIMIT_ERROR.to_string());
-                    }
                     let formatted = crate::temporal_format::format_temporal_export_row_with_string_types(
                         &row,
                         &temporal_column_types,
@@ -1600,10 +1557,8 @@ async fn try_export_sqlserver_query_result_stream(
         state.running_queries.set_pool_key(execution_id, pool_key);
     }
 
-    let xlsx_hard_limit_active = xlsx_hard_limit_active(format, request);
-    let row_limit = effective_row_limit(format, request);
-    let stream_row_limit =
-        if xlsx_hard_limit_active { row_limit.map(|limit| limit.saturating_add(1)) } else { row_limit };
+    let row_limit = effective_row_limit(request);
+    let stream_row_limit = row_limit;
     let mut columns: Vec<String> = Vec::new();
     let mut temporal_column_types: Vec<String> = Vec::new();
     let mut rows_exported = 0_u64;
@@ -1667,9 +1622,6 @@ async fn try_export_sqlserver_query_result_stream(
                     }
                 }
                 crate::db::sqlserver::SqlServerStreamItem::Row(row) => {
-                    if xlsx_hard_limit_active && rows_exported as usize >= XLSX_MAX_DATA_ROWS {
-                        return Err(XLSX_ROW_LIMIT_ERROR.to_string());
-                    }
                     let formatted = crate::temporal_format::format_temporal_export_row_with_string_types(
                         row,
                         &temporal_column_types,
@@ -1840,6 +1792,7 @@ mod tests {
             connection_id: "conn-1".to_string(),
             database: "db".to_string(),
             schema: None,
+            catalog: None,
             sql: "SELECT * FROM users".to_string(),
             query_base_sql: "SELECT * FROM users".to_string(),
             setup_sql: Vec::new(),
@@ -1865,12 +1818,12 @@ mod tests {
 
     #[test]
     fn csv_unlimited_export_has_no_effective_row_limit() {
-        assert_eq!(effective_row_limit("csv", &request("csv", None, None)), None);
+        assert_eq!(effective_row_limit(&request("csv", None, None)), None);
     }
 
     #[test]
     fn txt_unlimited_export_has_no_effective_row_limit() {
-        assert_eq!(effective_row_limit("txt", &request("txt", None, None)), None);
+        assert_eq!(effective_row_limit(&request("txt", None, None)), None);
     }
 
     #[test]
@@ -1879,47 +1832,38 @@ mod tests {
     }
 
     #[test]
-    fn xlsx_unlimited_export_uses_excel_hard_limit() {
-        assert_eq!(effective_row_limit("xlsx", &request("xlsx", None, None)), Some(XLSX_MAX_DATA_ROWS));
+    fn xlsx_no_row_limit_has_no_query_layer_cap() {
+        // Without the old hard limit, XLSX uses the writer's internal splitting.
+        assert_eq!(effective_row_limit(&request("xlsx", None, None)), None);
     }
 
     #[test]
-    fn xlsx_row_limit_caps_to_excel_hard_limit() {
-        assert_eq!(
-            effective_row_limit("xlsx", &request("xlsx", Some(XLSX_MAX_DATA_ROWS + 10), None)),
-            Some(XLSX_MAX_DATA_ROWS)
-        );
+    fn xlsx_user_row_limit_still_respected() {
+        assert_eq!(effective_row_limit(&request("xlsx", Some(500), None)), Some(500));
     }
 
     #[test]
-    fn xlsx_known_total_above_hard_limit_errors_before_export() {
-        let req = request("xlsx", None, Some(XLSX_MAX_DATA_ROWS as u64 + 1));
-        assert!(xlsx_hard_limit_active("xlsx", &req));
-        assert!(req.total_rows.is_some_and(|total| total > XLSX_MAX_DATA_ROWS as u64));
-    }
-
-    #[test]
-    fn sql_insert_export_has_no_xlsx_row_cap() {
-        // SQL format should not be limited by XLSX_MAX_DATA_ROWS.
-        let req = request("sql", None, None);
-        assert!(!xlsx_hard_limit_active("sql", &req));
-        assert_eq!(effective_row_limit("sql", &req), None);
+    fn xlsx_total_rows_above_sheet_limit_no_longer_errors() {
+        // total_rows > 1M no longer triggers a pre-check error; the writer splits.
+        let req = request("xlsx", None, Some(2_000_000));
+        assert!(effective_row_limit(&req).is_none());
+        // The function that used to check this (xlsx_hard_limit_active) no longer exists.
     }
 
     #[test]
     fn sql_insert_column_types_maps_request_types_to_option_vec() {
         let req = request("sql", None, None);
-        // No export_column_types set → every column becomes None
+        // Non-MySQL exports preserve their historical untyped behavior.
         let result = sql_insert_column_types(&req, &["int4".into(), "text".into()]);
         assert_eq!(result, vec![None, None]);
 
-        // Export_column_types provided → null becomes None, Some becomes Some
+        // Explicit non-empty overrides take precedence; missing values stay untyped.
         let mut req = req;
         req.export_column_types = Some(vec![Some("int4".into()), None, Some("jsonb".into())]);
         let result = sql_insert_column_types(&req, &["int4".into(), "text".into(), "json".into()]);
         assert_eq!(result, vec![Some("int4".into()), None, Some("jsonb".into())]);
 
-        // Empty string in an override is treated as None
+        // Empty string in an override stays untyped for non-MySQL exports.
         req.export_column_types = Some(vec![Some("".into())]);
         let result = sql_insert_column_types(&req, &["int4".into()]);
         assert_eq!(result, vec![None]);
@@ -1928,7 +1872,7 @@ mod tests {
     #[test]
     fn sql_insert_column_types_handles_partial_overrides_gracefully() {
         let req = request("sql", None, None);
-        // Fewer overrides than result columns → extra columns become None
+        // Fewer overrides than result columns → extra columns remain untyped.
         let mut req = req;
         req.export_column_types = Some(vec![Some("int4".into()), None]);
         let result = sql_insert_column_types(&req, &["int4".into(), "text".into(), "json".into(), "bool".into()]);
@@ -1949,7 +1893,7 @@ mod tests {
     #[test]
     fn sql_insert_column_types_handles_all_none_and_all_some() {
         let req = request("sql", None, None);
-        // All None
+        // All None remains untyped for non-MySQL exports.
         let mut req = req;
         req.export_column_types = Some(vec![None, None, None]);
         let result = sql_insert_column_types(&req, &["int4".into(), "text".into(), "json".into()]);
@@ -1959,6 +1903,16 @@ mod tests {
         req.export_column_types = Some(vec![Some("int4".into()), Some("text".into()), Some("json".into())]);
         let result = sql_insert_column_types(&req, &["int4".into(), "text".into(), "json".into()]);
         assert_eq!(result, vec![Some("int4".into()), Some("text".into()), Some("json".into())]);
+    }
+
+    #[test]
+    fn sql_insert_column_types_infers_only_mysql_spatial_result_types() {
+        let mut req = request("sql", None, None);
+        req.database_type = DatabaseType::Mysql;
+        assert_eq!(
+            sql_insert_column_types(&req, &["int".into(), "geometry".into(), "varchar".into()]),
+            vec![None, Some("geometry".into()), None]
+        );
     }
 
     #[test]

@@ -2,12 +2,13 @@ import * as api from "@/lib/backend/api";
 import { connectionObjectTreeNodeSchema, effectiveDatabaseTypeForConnection, metadataSchemaForConnection } from "@/lib/database/jdbcDialect";
 import { invalidateTableMetadataCache, loadTableMetadata } from "@/lib/metadata/tableMetadataCache";
 import { canApplyDataTabMetadata } from "@/lib/sidebar/dataTabOpenPolicy";
-import { isNoSnapshotErrorResult } from "@/lib/query/queryResultError";
+import { isNoSnapshotErrorResult, isQueryExecutionErrorResult } from "@/lib/query/queryResultError";
 import { buildTableSelectSql } from "@/lib/table/tableSelectSql";
 import { editableRowIdentifierColumns, usesSyntheticRowIdKey } from "@/lib/table/tableEditing";
 import { tableOpenPageLimit } from "@/lib/table/tableOpenPageLimit";
 import { uuid } from "@/lib/common/utils";
 import { beginDataTabNavigation, endDataTabNavigation, isCurrentDataTabNavigation } from "@/lib/tabs/dataTabNavigationGeneration";
+import { useSidebarDataOpenRuntime } from "@/composables/useSidebarDataOpenRuntime";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useQueryStore } from "@/stores/queryStore";
 import { useSettingsStore } from "@/stores/settingsStore";
@@ -108,6 +109,7 @@ async function openTableTarget(target: NavigationTarget, options: { tableInfoTab
       const primaryKeys = editableRowIdentifierColumns(effectiveDbType, columns, undefined, targetTableType);
       const sql = await buildTableSelectSql({
         databaseType: effectiveDbType,
+        driverProfile: config.driver_profile,
         identifierQuote,
         schema: tableSchema,
         catalog: target.catalog,
@@ -136,6 +138,7 @@ async function openTableTarget(target: NavigationTarget, options: { tableInfoTab
     }
     const sql = await buildTableSelectSql({
       databaseType: effectiveDbType,
+      driverProfile: config.driver_profile,
       identifierQuote,
       schema: tableSchema,
       catalog: target.catalog,
@@ -168,7 +171,7 @@ async function openTableTarget(target: NavigationTarget, options: { tableInfoTab
     const tabAfterFirstExecute = queryStore.tabs.find((tab) => tab.id === tabId);
     const firstResult = tabAfterFirstExecute?.result;
     const cancelRequestedDuringExecute = (tabAfterFirstExecute?.cancelRequestCount ?? 0) > cancelCountBeforeExecute;
-    const firstQueryFailed = cancelRequestedDuringExecute || tabAfterFirstExecute?.isCancelling === true || (firstResult?.columns.length === 1 && firstResult.columns[0] === "Error");
+    const firstQueryFailed = cancelRequestedDuringExecute || tabAfterFirstExecute?.isCancelling === true || (firstResult !== undefined && isQueryExecutionErrorResult(firstResult));
     // executeTabSql surfaces query failures as an "Error" result instead of throwing.
     // A snapshot-less lake table fails the data preview above but its metadata still
     // reads fine — retry with LIMIT 0 so the user sees the table structure (columns +
@@ -179,6 +182,7 @@ async function openTableTarget(target: NavigationTarget, options: { tableInfoTab
     if (fellBackToLimitZero) {
       const emptySql = await buildTableSelectSql({
         databaseType: effectiveDbType,
+        driverProfile: config.driver_profile,
         identifierQuote,
         schema: tableSchema,
         catalog: target.catalog,
@@ -223,6 +227,7 @@ async function openTableTarget(target: NavigationTarget, options: { tableInfoTab
       if (!fellBackToLimitZero && !firstQueryFailed && (useRowId || config.db_type === "tdengine")) {
         const newSql = await buildTableSelectSql({
           databaseType: effectiveDbType,
+          driverProfile: config.driver_profile,
           identifierQuote,
           schema: tableSchema,
           catalog: target.catalog,
@@ -253,6 +258,33 @@ async function openTableTarget(target: NavigationTarget, options: { tableInfoTab
 export function useNavigationTargets(dialogs: { showFieldLineageDialog: { value: boolean }; showDatabaseSearchDialog: { value: boolean }; showDiagramDialog: { value: boolean } }) {
   const connectionStore = useConnectionStore();
   const queryStore = useQueryStore();
+  const settingsStore = useSettingsStore();
+  const { openData } = useSidebarDataOpenRuntime();
+
+  async function openObjectBrowserTableTarget(target: NavigationTarget) {
+    if (settingsStore.editorSettings.dataTabReuseMode === "always-new") {
+      await openTableTarget(target);
+      return;
+    }
+    connectionStore.activeConnectionId = target.connectionId;
+    const normalizedTableType = target.tableType?.trim().toUpperCase().replaceAll(" ", "_");
+    const nodeType = normalizedTableType === "VIEW" ? "view" : normalizedTableType === "MATERIALIZED_VIEW" ? "materialized_view" : "table";
+    await openData(
+      {
+        id: uuid(),
+        label: target.tableName,
+        type: nodeType,
+        connectionId: target.connectionId,
+        database: target.database,
+        schema: target.schema,
+        catalog: target.catalog,
+        tableType: target.tableType,
+      },
+      undefined,
+      "default",
+      { reuseMode: settingsStore.editorSettings.dataTabReuseMode },
+    );
+  }
 
   async function openLineageTarget(target: NavigationTarget) {
     dialogs.showFieldLineageDialog.value = false;
@@ -269,7 +301,7 @@ export function useNavigationTargets(dialogs: { showFieldLineageDialog: { value:
     await openTableTarget(target);
   }
 
-  async function onStructureEditorSaved(reloadData: () => Promise<void>, toast: (msg: string, duration?: number) => void, context: { connectionId: string; database: string; schema?: string; tableName: string }, commentChanged?: boolean) {
+  async function onStructureEditorSaved(reloadData: () => Promise<void>, toast: (msg: string, duration?: number) => void, context: { connectionId: string; database: string; schema?: string; catalog?: string; tableName: string }, commentChanged?: boolean) {
     if (!context.tableName) {
       try {
         await connectionStore.refreshObjectListTreeNode(context.connectionId, context.database, context.schema || undefined);
@@ -281,6 +313,7 @@ export function useNavigationTargets(dialogs: { showFieldLineageDialog: { value:
         await connectionStore.refreshObjectListTreeNode(context.connectionId, context.database, context.schema || undefined);
       } catch {}
     }
+    connectionStore.invalidateCompletionTableCache(context.connectionId, context.database, context.tableName, context.schema, context.catalog);
     queryStore.invalidateTableStructure(context.connectionId, context.database, context.schema, context.tableName);
     // 结构已变更：无论是否有打开的 data tab 都必须作废共享元数据缓存，否则
     // 其它 loadTableMetadata 消费者最长 30 秒拿到旧列。不带 schema/catalog
@@ -332,5 +365,5 @@ export function useNavigationTargets(dialogs: { showFieldLineageDialog: { value:
     }
   }
 
-  return { openLineageTarget, openDatabaseSearchTarget, openDiagramTarget, onStructureEditorSaved, openTableTarget };
+  return { openLineageTarget, openDatabaseSearchTarget, openDiagramTarget, openObjectBrowserTableTarget, onStructureEditorSaved, openTableTarget };
 }

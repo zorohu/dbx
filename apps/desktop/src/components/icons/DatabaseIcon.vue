@@ -26,6 +26,7 @@ const assetIcons: Record<string, string> = {
   mariadb: "mariadb",
   tidb: "tidb",
   elasticsearch: "elasticsearch",
+  easysearch: "easysearch",
   oracle: "oracle",
   "oracle-10g": "oracle",
   "oracle-legacy": "oracle",
@@ -34,6 +35,7 @@ const assetIcons: Record<string, string> = {
   sqlserver: "sqlserver",
   access: "access.png",
   oceanbase: "oceanbase",
+  oceanbase_oracle: "oceanbase",
   opengauss: "opengauss",
   gaussdb: "gaussdb",
   questdb: "questdb",
@@ -53,6 +55,7 @@ const assetIcons: Record<string, string> = {
   prestosql: "presto",
   hive: "hive",
   hbase: "hbase",
+  phoenix: "phoenix",
   spark: "spark-logo.png",
   apache_kylin: "apache_kylin",
   sundb: "sundb",
@@ -96,15 +99,20 @@ const assetIcons: Record<string, string> = {
   rocketmq: "rocketmq",
   rabbitmq: "rabbitmq",
   nacos: "nacos.png",
+  consul: "consul",
   iris: "iris",
   influxdb: "influxdb",
+  victoriametrics: "victoriametrics.png",
   zookeeper: "zookeeper",
   oscar: "oscar.png",
   jdbcx: "jdbcx",
+  mqtt: "mqtt",
+  dolt: "dolt",
 };
 
 const normalizedType = computed(() => props.dbType.toLowerCase().replace(/[\s-]+/g, "_"));
 const assetName = computed(() => assetIcons[normalizedType.value]);
+const useLightIconInDarkMode = computed(() => normalizedType.value === "easysearch" && isDark.value);
 const assetSrc = computed(() => {
   if (!assetName.value) return "";
   if (normalizedType.value === "uxdb" && isDark.value) return webPath("/icons/database/uxdb-dark.svg");
@@ -113,7 +121,7 @@ const assetSrc = computed(() => {
 </script>
 
 <template>
-  <img v-if="assetName" :src="assetSrc" alt="" class="database-logo object-contain" aria-hidden="true" />
+  <img v-if="assetName" :src="assetSrc" alt="" class="database-logo object-contain" :class="{ 'database-logo-light': useLightIconInDarkMode }" aria-hidden="true" />
   <Database v-else class="text-blue-400" />
 </template>
 
@@ -121,5 +129,9 @@ const assetSrc = computed(() => {
 .database-logo {
   transform: scale(1.35);
   transform-origin: center;
+}
+
+.database-logo-light {
+  filter: brightness(0) invert(82%);
 }
 </style>

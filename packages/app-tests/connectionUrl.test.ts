@@ -46,7 +46,7 @@ test.each(["kingbase", "kingbase8", "jdbc:kingbase8"])("parses %s connection URL
   assert.deepEqual(parseConnectionUrl(`${scheme}://framework:secret@172.21.203.70:443/hq_official?sslmode=disable`), {
     dbType: "kingbase",
     driverProfile: "kingbase",
-    driverLabel: "KingBase",
+    driverLabel: "人大金仓 KingbaseES",
     host: "172.21.203.70",
     port: 443,
     username: "framework",
@@ -237,7 +237,7 @@ test("parses GBase 8s JDBC URLs", () => {
 
   assert.equal(parsed.dbType, "gbase");
   assert.equal(parsed.driverProfile, "gbase8s");
-  assert.equal(parsed.driverLabel, "GBase 8s");
+  assert.equal(parsed.driverLabel, "南大通用 GBase 8s");
   assert.equal(parsed.host, "gbase.example.com");
   assert.equal(parsed.port, 20013);
   assert.equal(parsed.username, "gbasedbt");
@@ -456,6 +456,18 @@ test("uses selected HTTP-compatible profile for HTTP URLs", () => {
   assert.equal(parsed.host, "search.example.com");
   assert.equal(parsed.port, 9243);
   assert.equal(parsed.ssl, true);
+});
+
+test("parses Easysearch URLs and keeps the selected HTTPS profile", () => {
+  const dedicated = parseConnectionUrl("easysearch://dbx_test:secret@search.example.com:9200");
+  const https = parseConnectionUrl("https://search.example.com:9243", "easysearch");
+
+  assert.equal(dedicated.dbType, "easysearch");
+  assert.equal(dedicated.driverProfile, "easysearch");
+  assert.equal(dedicated.username, "dbx_test");
+  assert.equal(https.dbType, "easysearch");
+  assert.equal(https.port, 9243);
+  assert.equal(https.ssl, true);
 });
 
 test("parses HTTPS ClickHouse URLs with selected profile", () => {

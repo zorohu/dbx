@@ -2,11 +2,36 @@ import { describe, expect, it } from "vitest";
 import { connectionNamespaceCreationTarget, databaseNodeNamespaceCreationTarget } from "@/lib/database/databaseNamespaceCreation";
 import { editableDatabasePropertyGroups, editableSchemaPropertyGroups } from "@/lib/database/databasePropertyEditing";
 import { buildGetDatabaseCommentSql } from "@/lib/database/dbAdminSql";
-import { isSchemaAware, supportsDatabaseNameCompletion, supportsDatabaseSchemaQualifier, supportsSqlInListPaste, supportsTransaction } from "@/lib/database/databaseFeatureSupport";
+import {
+  isSchemaAware,
+  supportsConnectionScopedQueryExecution,
+  supportsDatabaseNameCompletion,
+  supportsDatabaseSchemaQualifier,
+  supportsQueryTargetDatabaseListing,
+  supportsSqlInListPaste,
+  supportsTableImport,
+  supportsTransaction,
+  usesConnectionOnlyQueryTarget,
+} from "@/lib/database/databaseFeatureSupport";
 
 describe("schema awareness", () => {
   it("keeps SQLite database aliases separate from schema-capable databases", () => {
     expect(isSchemaAware("sqlite")).toBe(false);
+  });
+});
+
+describe("connection-scoped query targets", () => {
+  it("keeps connection-only target types separate from unregistered namespace targets", () => {
+    expect(usesConnectionOnlyQueryTarget("etcd")).toBe(true);
+    expect(usesConnectionOnlyQueryTarget("zookeeper")).toBe(true);
+    expect(usesConnectionOnlyQueryTarget("elasticsearch")).toBe(true);
+    expect(supportsConnectionScopedQueryExecution("elasticsearch")).toBe(true);
+    expect(supportsQueryTargetDatabaseListing("elasticsearch")).toBe(false);
+    expect(usesConnectionOnlyQueryTarget("qdrant")).toBe(true);
+    expect(usesConnectionOnlyQueryTarget("milvus")).toBe(true);
+    expect(usesConnectionOnlyQueryTarget("weaviate")).toBe(true);
+    expect(usesConnectionOnlyQueryTarget("chromadb")).toBe(true);
+    expect(supportsQueryTargetDatabaseListing("etcd")).toBe(false);
   });
 });
 
@@ -73,6 +98,7 @@ describe("supportsSqlInListPaste", () => {
     expect(supportsSqlInListPaste("redis")).toBe(false);
     expect(supportsSqlInListPaste("mongodb")).toBe(false);
     expect(supportsSqlInListPaste("elasticsearch")).toBe(false);
+    expect(supportsSqlInListPaste("easysearch")).toBe(false);
     expect(supportsSqlInListPaste("qdrant")).toBe(false);
     expect(supportsSqlInListPaste("milvus")).toBe(false);
     expect(supportsSqlInListPaste("weaviate")).toBe(false);
@@ -85,6 +111,12 @@ describe("supportsSqlInListPaste", () => {
 
   it("excludes Neo4j because Cypher uses list syntax instead of SQL IN tuples", () => {
     expect(supportsSqlInListPaste("neo4j")).toBe(false);
+  });
+});
+
+describe("supportsTableImport", () => {
+  it("enables OceanBase Oracle table import", () => {
+    expect(supportsTableImport("oceanbase-oracle")).toBe(true);
   });
 });
 
@@ -133,6 +165,7 @@ describe("database namespace creation", () => {
     expect(connectionNamespaceCreationTarget({ db_type: "sqlite" })).toBe("attach");
     expect(connectionNamespaceCreationTarget({ db_type: "mongodb" })).toBe("special");
     expect(connectionNamespaceCreationTarget({ db_type: "mongodb", driver_profile: "mongodb-legacy" })).toBeNull();
+    expect(connectionNamespaceCreationTarget({ db_type: "mongodb", driver_profile: "legacy" })).toBeNull();
   });
 
   it("hides persistent SQLite attachment for memory and SQLCipher connections", () => {

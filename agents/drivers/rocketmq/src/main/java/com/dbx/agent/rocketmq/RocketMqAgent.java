@@ -3,7 +3,9 @@ package com.dbx.agent.rocketmq;
 import com.google.gson.*;
 import org.apache.rocketmq.acl.common.AclClientRPCHook;
 import org.apache.rocketmq.acl.common.SessionCredentials;
+import org.apache.rocketmq.client.ClientConfig;
 import org.apache.rocketmq.client.QueryResult;
+import org.apache.rocketmq.client.exception.MQBrokerException;
 import org.apache.rocketmq.client.exception.MQClientException;
 import org.apache.rocketmq.client.consumer.DefaultLitePullConsumer;
 import org.apache.rocketmq.client.consumer.DefaultMQPullConsumer;
@@ -20,11 +22,13 @@ import org.apache.rocketmq.common.message.MessageExt;
 import org.apache.rocketmq.common.message.MessageQueue;
 import org.apache.rocketmq.remoting.RPCHook;
 import org.apache.rocketmq.remoting.protocol.admin.ConsumeStats;
+import org.apache.rocketmq.remoting.protocol.admin.OffsetWrapper;
 import org.apache.rocketmq.remoting.protocol.admin.TopicStatsTable;
 import org.apache.rocketmq.remoting.protocol.body.AclInfo;
 import org.apache.rocketmq.remoting.protocol.body.ClusterInfo;
 import org.apache.rocketmq.remoting.protocol.body.Connection;
 import org.apache.rocketmq.remoting.protocol.body.ConsumerConnection;
+import org.apache.rocketmq.remoting.protocol.body.ConsumerRunningInfo;
 import org.apache.rocketmq.remoting.protocol.body.GroupList;
 import org.apache.rocketmq.remoting.protocol.body.ProducerConnection;
 import org.apache.rocketmq.remoting.protocol.body.ProducerInfo;
@@ -43,6 +47,11 @@ import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 /**
  * RocketMQ admin agent for DBX. Communicates with the Rust bridge via JSON-RPC
@@ -54,6 +63,27 @@ public final class RocketMqAgent {
     private static final Gson GSON = new GsonBuilder().serializeNulls().create();
     private static final int DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
     private static final int DEFAULT_LIST_LIMIT = 200;
+    private static final int CONSUMER_GROUP_ENRICH_CONCURRENCY = 8;
+    private static final int CONSUMER_GROUP_COLLECT_CONCURRENCY = 8;
+    private static final int CONSUMER_LAG_CONCURRENCY = 8;
+    /**
+     * Phase baselines at {@link #DEFAULT_REQUEST_TIMEOUT_MS}. Scaled via
+     * {@link #scaledOperationBudgetMs} so Advanced query timeout expands headroom without letting
+     * collect+enrich+lag each consume a full RPC window.
+     */
+    private static final long CONSUMER_GROUP_COLLECT_BUDGET_BASELINE_MS = 12_000;
+    private static final long CONSUMER_GROUP_ENRICH_BUDGET_BASELINE_MS = 8_000;
+    private static final long CONSUMER_LAG_BUDGET_BASELINE_MS = 10_000;
+    private static final long TOPIC_LIST_ROUTE_BUDGET_BASELINE_MS = 8_000;
+    /** Host-side Docker collision-fallbacks are usually blackholed; keep remoting short. */
+    private static final long COLLISION_FALLBACK_PROBE_TIMEOUT_MS = 2_000;
+    /**
+     * LitePullConsumer.poll wait for local pull cache — not an RPC budget.
+     * Must stay short: empty queues block for the full timeout, and peek walks queues serially.
+     */
+    private static final long MESSAGE_POLL_TIMEOUT_MS = 3_000;
+    /** Nameserver route enrichment for listTopics fallback when bulk broker config is unavailable. */
+    private static final int TOPIC_LIST_ROUTE_CONCURRENCY = 8;
     private static final String AUTO_CREATE_TOPIC_KEY = "TBW102";
     /** RocketMQ 5.x topic attribute key for message type (NORMAL/DELAY/FIFO/TRANSACTION). */
     private static final String TOPIC_MESSAGE_TYPE_ATTRIBUTE = "message.type";
@@ -83,12 +113,17 @@ public final class RocketMqAgent {
 
     /**
      * Align with rocketmq-dashboard ConsumerServiceImpl group type: SYSTEM / FIFO / NORMAL.
+     * When the subscription dump is missing for a discovered group, return UNKNOWN instead of
+     * silently labeling FIFO groups as NORMAL.
      */
     static String classifyConsumerGroupType(String groupId, SubscriptionGroupConfig config) {
         if (isSystemConsumerGroup(groupId)) {
             return "SYSTEM";
         }
-        if (config != null && config.isConsumeMessageOrderly()) {
+        if (config == null) {
+            return "UNKNOWN";
+        }
+        if (config.isConsumeMessageOrderly()) {
             return "FIFO";
         }
         return "NORMAL";
@@ -357,24 +392,19 @@ public final class RocketMqAgent {
     private static Object connect(JsonObject params) throws Exception {
         JsonObject conn = connectionObject(params);
         DefaultMQAdminExt nextAdmin = null;
-        DefaultMQProducer nextProducer = null;
         try {
             nextAdmin = buildAdminClient(conn);
-            nextAdmin.examineBrokerClusterInfo();
-            nextProducer = buildProducer(conn);
+            // One ClusterInfo per connect — reuse for name/broker resolution and test payload.
+            ClusterInfo clusterInfo = nextAdmin.examineBrokerClusterInfo();
             closeClients();
             adminClient = nextAdmin;
-            producer = nextProducer;
             cachedConnection = conn.deepCopy();
-            cachedClusterName = resolveClusterName(nextAdmin, conn);
-            cachedBrokerAddr = resolveBrokerAddr(nextAdmin, conn);
-            return Collections.singletonMap("ok", true);
+            cachedClusterName = resolveClusterName(clusterInfo, conn);
+            cachedBrokerAddr = resolveBrokerAddr(nextAdmin, conn, clusterInfo);
+            return buildClusterTestResult(clusterInfo, nextAdmin, conn);
         } catch (Exception e) {
             if (nextAdmin != null) {
                 nextAdmin.shutdown();
-            }
-            if (nextProducer != null) {
-                nextProducer.shutdown();
             }
             throw e;
         }
@@ -382,27 +412,47 @@ public final class RocketMqAgent {
 
     private static Object testConnection(JsonObject params) throws Exception {
         JsonObject conn = connectionObject(params);
+        if (adminClient != null && cachedConnection != null && connectionMatches(cachedConnection, conn)) {
+            ClusterInfo clusterInfo = adminClient.examineBrokerClusterInfo();
+            return buildClusterTestResult(clusterInfo, adminClient, conn);
+        }
         DefaultMQAdminExt probe = null;
         try {
             probe = buildAdminClient(conn);
             ClusterInfo clusterInfo = probe.examineBrokerClusterInfo();
-            String clusterName = resolveClusterName(clusterInfo, conn);
-            List<Map<String, Object>> brokers = brokerNodes(clusterInfo);
-            boolean aclEnabled = probeAclSupport(probe);
-
-            Map<String, Object> result = new LinkedHashMap<>();
-            result.put("ok", true);
-            result.put("clusterId", clusterName);
-            result.put("brokers", brokers);
-            result.put("nodeCount", brokers.size());
-            result.put("controller", brokers.isEmpty() ? null : brokers.get(0));
-            result.put("aclEnabled", aclEnabled);
-            return result;
+            return buildClusterTestResult(clusterInfo, probe, conn);
         } finally {
             if (probe != null) {
                 probe.shutdown();
             }
         }
+    }
+
+    private static Map<String, Object> buildClusterTestResult(
+        ClusterInfo clusterInfo,
+        DefaultMQAdminExt admin,
+        JsonObject conn
+    ) throws Exception {
+        String clusterName = resolveClusterName(clusterInfo, conn);
+        List<Map<String, Object>> brokers = brokerNodes(clusterInfo);
+        boolean aclEnabled = probeAclSupport(admin, clusterInfo);
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("ok", true);
+        result.put("clusterId", clusterName);
+        result.put("brokers", brokers);
+        result.put("nodeCount", brokers.size());
+        result.put("controller", brokers.isEmpty() ? null : brokers.get(0));
+        result.put("aclEnabled", aclEnabled);
+        return result;
+    }
+
+    static boolean connectionMatches(JsonObject cached, JsonObject requested) {
+        return namesrvAddr(cached).equals(namesrvAddr(requested))
+            && clusterName(cached).equals(clusterName(requested))
+            && brokerAddress(cached).equals(brokerAddress(requested))
+            && credential(cached, "access_key", "accessKey").equals(credential(requested, "access_key", "accessKey"))
+            && credential(cached, "secret_key", "secretKey").equals(credential(requested, "secret_key", "secretKey"));
     }
 
     private static void closeClients() {
@@ -423,47 +473,129 @@ public final class RocketMqAgent {
         DefaultMQAdminExt admin = requireAdmin();
         String keyword = stringOrEmpty(params, "keyword").toLowerCase(Locale.ROOT);
         int offset = Math.max(0, intOrDefault(params, "offset", 0));
+        // limit <= 0: return all rows from offset (legacy single-shot signal).
+        // Large positive limits (e.g. Integer.MAX_VALUE) also return the full remaining
+        // catalog and stay compatible with older agents that coerced limit<=0 to 200.
         int limit = intOrDefault(params, "limit", DEFAULT_LIST_LIMIT);
-        if (limit <= 0) {
-            limit = DEFAULT_LIST_LIMIT;
+        JsonObject conn = connectionObject(params);
+
+        // One ClusterInfo per list call — avoid repeated examineBrokerClusterInfo in helpers.
+        ClusterInfo clusterInfo = admin.examineBrokerClusterInfo();
+        Set<String> brokerSystemTopics = collectBrokerSystemTopics(admin);
+        Set<String> brokerNames = collectBrokerNames(clusterInfo);
+        String cluster = resolveClusterName(clusterInfo, conn);
+        BrokerTopicConfigSnapshot brokerSnapshot = collectBrokerTopicConfigSnapshot(admin, conn, clusterInfo);
+        Map<String, TopicConfig> brokerTopics = brokerSnapshot.topics();
+        Map<String, Map<String, String>> topicAttributes = topicAttributesFromConfigs(brokerTopics);
+
+        Set<String> nameserverTopics = Set.of();
+        if (!brokerSnapshot.complete() || brokerTopics.isEmpty()) {
+            // Reuse resolved cluster — do not call examineBrokerClusterInfo again via clusterName(conn, admin).
+            TopicList topicList = fetchTopicList(admin, cluster);
+            nameserverTopics = topicList.getTopicList();
+        }
+        Set<String> topicNames = topicCatalogNames(brokerSnapshot, nameserverTopics);
+
+        List<Map<String, Object>> topics = buildTopicCatalogRows(
+            topicNames,
+            brokerTopics,
+            topicAttributes,
+            brokerSystemTopics,
+            brokerNames,
+            cluster,
+            keyword,
+            admin::examineTopicRouteInfo,
+            TOPIC_LIST_ROUTE_CONCURRENCY,
+            scaledOperationBudgetMs(conn, TOPIC_LIST_ROUTE_BUDGET_BASELINE_MS)
+        );
+        topics.sort(Comparator.comparing(m -> String.valueOf(m.get("name"))));
+
+        int total = topics.size();
+        List<Map<String, Object>> page = paginate(topics, offset, limit);
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("topics", page);
+        result.put("total", total);
+        result.put("offset", offset);
+        result.put("limit", limit);
+        return result;
+    }
+
+    @FunctionalInterface
+    interface TopicRouteLookup {
+        TopicRouteData load(String topic) throws Exception;
+    }
+
+    @FunctionalInterface
+    interface BrokerTopicConfigLookup {
+        TopicConfigSerializeWrapper load(String brokerAddr) throws Exception;
+    }
+
+    static final class BrokerTopicConfigSnapshot {
+        private final Map<String, TopicConfig> topics;
+        private final boolean complete;
+
+        private BrokerTopicConfigSnapshot(Map<String, TopicConfig> topics, boolean complete) {
+            this.topics = topics;
+            this.complete = complete;
         }
 
-        TopicList topicList = fetchTopicList(admin, connectionObject(params));
-        Set<String> brokerSystemTopics = collectBrokerSystemTopics(admin);
-        Set<String> brokerNames = collectBrokerNames(admin);
-        String cluster = clusterName(params, admin);
-        JsonObject conn = connectionObject(params);
-        Map<String, TopicConfig> brokerTopics = collectBrokerTopicConfigs(admin, conn);
-        Map<String, Map<String, String>> topicAttributes = topicAttributesFromConfigs(brokerTopics);
-        // Prefer broker topic configs (Dashboard ground truth); nameserver routes can outlive broker deletion.
-        Set<String> topicNames = brokerTopics.isEmpty()
-            ? new TreeSet<>(topicList.getTopicList())
-            : brokerTopics.keySet();
+        Map<String, TopicConfig> topics() {
+            return topics;
+        }
+
+        boolean complete() {
+            return complete;
+        }
+    }
+
+    static Set<String> topicCatalogNames(
+        BrokerTopicConfigSnapshot brokerSnapshot, Set<String> nameserverTopics) {
+        if (brokerSnapshot.complete() && !brokerSnapshot.topics().isEmpty()) {
+            return new TreeSet<>(brokerSnapshot.topics().keySet());
+        }
+        Set<String> topics = new TreeSet<>(brokerSnapshot.topics().keySet());
+        topics.addAll(nameserverTopics);
+        return topics;
+    }
+
+    /**
+     * Build topic catalog rows from names + optional bulk broker configs.
+     * When bulk configs are empty, partition counts are filled via a single budgeted route RPC
+     * per topic; per-topic examineTopicConfig / resolveTopicMessageType is never used (that path
+     * hits the same broker that already failed getAllTopicConfig and can stall for minutes).
+     */
+    static List<Map<String, Object>> buildTopicCatalogRows(
+        Set<String> topicNames,
+        Map<String, TopicConfig> brokerTopics,
+        Map<String, Map<String, String>> topicAttributes,
+        Set<String> brokerSystemTopics,
+        Set<String> brokerNames,
+        String cluster,
+        String keyword,
+        TopicRouteLookup routeLookup,
+        int routeConcurrency,
+        long routeBudgetMs
+    ) {
+        String keywordLower = keyword == null ? "" : keyword.toLowerCase(Locale.ROOT);
+        boolean hasBrokerCatalog = brokerTopics != null && !brokerTopics.isEmpty();
         List<Map<String, Object>> topics = new ArrayList<>();
+        List<Map<String, Object>> needsRoute = new ArrayList<>();
         for (String topic : topicNames) {
-            if (!keyword.isBlank() && !topic.toLowerCase(Locale.ROOT).contains(keyword)) {
+            if (!keywordLower.isBlank() && !topic.toLowerCase(Locale.ROOT).contains(keywordLower)) {
                 continue;
             }
-            TopicConfig brokerConfig = brokerTopics.get(topic);
-            int partitions = brokerConfig == null ? 1 : Math.max(brokerConfig.getReadQueueNums(), 1);
-            if (brokerConfig == null) {
-                try {
-                    TopicRouteData route = admin.examineTopicRouteInfo(topic);
-                    if (route.getQueueDatas() != null && !route.getQueueDatas().isEmpty()) {
-                        partitions = Math.max(route.getQueueDatas().get(0).getReadQueueNums(), 1);
-                    }
-                } catch (Exception ignored) {
-                    // Stale nameserver-only topics are skipped below when broker configs are available.
-                    if (!brokerTopics.isEmpty()) {
-                        continue;
-                    }
-                }
+            TopicConfig brokerConfig = hasBrokerCatalog ? brokerTopics.get(topic) : null;
+            // Nameserver-only stale topics are skipped when broker catalog is the source of truth.
+            if (hasBrokerCatalog && brokerConfig == null) {
+                continue;
             }
-            Map<String, String> attributes = topicAttributes.get(topic);
-            if (isUserTopic(topic) && readTopicMessageTypeAttribute(attributes) == null) {
-                String resolved = brokerConfig == null
-                    ? resolveTopicMessageType(admin, conn, topic)
-                    : readTopicMessageType(brokerConfig);
+            int partitions = brokerConfig == null ? 1 : Math.max(brokerConfig.getReadQueueNums(), 1);
+            Map<String, String> attributes = topicAttributes == null ? null : topicAttributes.get(topic);
+            // Type from bulk config attributes only — never examineTopicConfig per topic on fallback.
+            if (brokerConfig != null
+                && isUserTopic(topic)
+                && readTopicMessageTypeAttribute(attributes) == null) {
+                String resolved = readTopicMessageType(brokerConfig);
                 if (resolved != null && !resolved.isBlank()) {
                     attributes = attributes == null ? new HashMap<>() : new HashMap<>(attributes);
                     attributes.put("+" + TOPIC_MESSAGE_TYPE_ATTRIBUTE, resolved);
@@ -481,17 +613,71 @@ public final class RocketMqAgent {
             row.put("internal", internal);
             row.put("messageType", messageType);
             topics.add(row);
+            if (brokerConfig == null) {
+                needsRoute.add(row);
+            }
         }
-        topics.sort(Comparator.comparing(m -> String.valueOf(m.get("name"))));
+        if (!needsRoute.isEmpty() && routeLookup != null) {
+            enrichTopicPartitions(needsRoute, routeLookup, routeConcurrency, routeBudgetMs);
+        }
+        return topics;
+    }
 
-        int total = topics.size();
-        List<Map<String, Object>> page = paginate(topics, offset, limit);
-        Map<String, Object> result = new LinkedHashMap<>();
-        result.put("topics", page);
-        result.put("total", total);
-        result.put("offset", offset);
-        result.put("limit", limit);
-        return result;
+    static int partitionsFromRoute(TopicRouteData route) {
+        if (route == null || route.getQueueDatas() == null || route.getQueueDatas().isEmpty()) {
+            return 1;
+        }
+        return Math.max(route.getQueueDatas().get(0).getReadQueueNums(), 1);
+    }
+
+    /**
+     * Fill {@code partitions} via nameserver route lookups with bounded concurrency and a global
+     * time budget. Unfinished/failed topics keep the default partitions=1.
+     */
+    static void enrichTopicPartitions(
+        List<Map<String, Object>> rows,
+        TopicRouteLookup lookup,
+        int concurrency,
+        long budgetMs) {
+        if (rows.isEmpty() || lookup == null) {
+            return;
+        }
+        int workers = Math.max(1, Math.min(concurrency, rows.size()));
+        ExecutorService executor = Executors.newFixedThreadPool(workers, runnable -> {
+            Thread thread = new Thread(runnable, "dbx-rocketmq-topic-route");
+            thread.setDaemon(true);
+            return thread;
+        });
+        List<Callable<Integer>> tasks = new ArrayList<>(rows.size());
+        for (Map<String, Object> row : rows) {
+            String topic = String.valueOf(row.get("name"));
+            tasks.add(() -> {
+                try {
+                    return partitionsFromRoute(lookup.load(topic));
+                } catch (Exception ignored) {
+                    return 1;
+                }
+            });
+        }
+        List<Future<Integer>> results = Collections.emptyList();
+        try {
+            results = executor.invokeAll(tasks, Math.max(1, budgetMs), TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } finally {
+            executor.shutdownNow();
+        }
+        for (int index = 0; index < rows.size(); index++) {
+            Map<String, Object> row = rows.get(index);
+            if (index < results.size() && !results.get(index).isCancelled()) {
+                try {
+                    row.put("partitions", results.get(index).get());
+                } catch (Exception ignored) {
+                    // Keep default partitions=1 when enrichment fails.
+                }
+            }
+            row.putIfAbsent("partitions", 1);
+        }
     }
 
     private static Object createTopic(JsonObject params) throws Exception {
@@ -699,7 +885,7 @@ public final class RocketMqAgent {
                 consumer.assign(Collections.singletonList(queue));
                 consumer.seek(queue, offset);
                 consumer.setPullBatchSize(1);
-                List<MessageExt> polled = consumer.poll(3000);
+                List<MessageExt> polled = consumer.poll(MESSAGE_POLL_TIMEOUT_MS);
                 if (polled == null || polled.isEmpty()) {
                     continue;
                 }
@@ -929,61 +1115,432 @@ public final class RocketMqAgent {
 
     private static SubscriptionGroupConfig findSubscriptionGroupConfig(
         DefaultMQAdminExt admin, JsonObject conn, String groupId) throws Exception {
+        // Walk every master and FIFO-merge so an earlier NORMAL stub cannot hide orderly=true.
+        long timeoutMs = Math.max(1_000L, intOrDefault(conn, "request_timeout_ms", DEFAULT_REQUEST_TIMEOUT_MS));
+        Map<String, SubscriptionGroupConfig> merged = new HashMap<>();
         for (String brokerAddr : resolveMasterBrokerAddrs(admin, conn)) {
             try {
-                SubscriptionGroupWrapper wrapper = admin.getAllSubscriptionGroup(brokerAddr, DEFAULT_REQUEST_TIMEOUT_MS);
+                SubscriptionGroupWrapper wrapper = admin.getAllSubscriptionGroup(brokerAddr, timeoutMs);
                 if (wrapper == null || wrapper.getSubscriptionGroupTable() == null) {
                     continue;
                 }
                 SubscriptionGroupConfig config = wrapper.getSubscriptionGroupTable().get(groupId);
                 if (config != null) {
-                    return config;
+                    mergeSubscriptionGroupConfigs(merged, Map.of(groupId, config));
                 }
             } catch (Exception ignored) {
                 // Try next broker.
             }
         }
-        return null;
+        return merged.get(groupId);
+    }
+
+    private static Map<String, SubscriptionGroupConfig> collectConsumerGroupConfigs(
+        DefaultMQAdminExt admin, JsonObject conn) throws Exception {
+        long budgetMs = scaledOperationBudgetMs(conn, CONSUMER_GROUP_COLLECT_BUDGET_BASELINE_MS);
+        MasterBrokerAddrPlan plan = resolveMasterBrokerAddrPlan(admin, conn);
+        // Fallbacks are usually Docker-internal and blackholed from host agents; keep their
+        // remoting short so raising Advanced query timeout cannot stretch collect wall time.
+        long fallbackPerBrokerMs = Math.min(budgetMs, COLLISION_FALLBACK_PROBE_TIMEOUT_MS);
+        return collectConsumerGroupConfigs(
+            plan,
+            CONSUMER_GROUP_COLLECT_CONCURRENCY,
+            budgetMs,
+            budgetMs,
+            fallbackPerBrokerMs,
+            (brokerAddr, timeoutMs) -> {
+                SubscriptionGroupWrapper wrapper = admin.getAllSubscriptionGroup(brokerAddr, timeoutMs);
+                if (wrapper == null || wrapper.getSubscriptionGroupTable() == null) {
+                    return Map.of();
+                }
+                return wrapper.getSubscriptionGroupTable();
+            }
+        );
+    }
+
+    /**
+     * Topic-filtered lists still need every reachable master's subscription dump for FIFO typing,
+     * but must not serially walk unreachable collision-fallbacks. Reuse the two-phase parallel collect.
+     */
+    private static Map<String, SubscriptionGroupConfig> collectConsumerGroupConfigsForTopicFilter(
+        DefaultMQAdminExt admin, JsonObject conn) {
+        try {
+            return collectConsumerGroupConfigs(admin, conn);
+        } catch (Exception ignored) {
+            return new TreeMap<>();
+        }
+    }
+
+    @FunctionalInterface
+    interface SubscriptionGroupBrokerProbe {
+        Map<String, SubscriptionGroupConfig> load(String brokerAddr, long timeoutMs) throws Exception;
+    }
+
+    /**
+     * Merge broker subscription dumps. Prefer {@code consumeMessageOrderly=true} so a NORMAL
+     * stub on an earlier master cannot hide a FIFO group that exists on another broker.
+     */
+    static void mergeSubscriptionGroupConfigs(
+        Map<String, SubscriptionGroupConfig> target,
+        Map<String, SubscriptionGroupConfig> incoming
+    ) {
+        if (incoming == null || incoming.isEmpty()) {
+            return;
+        }
+        for (Map.Entry<String, SubscriptionGroupConfig> entry : incoming.entrySet()) {
+            String groupId = entry.getKey();
+            SubscriptionGroupConfig next = entry.getValue();
+            if (groupId == null || next == null) {
+                continue;
+            }
+            target.merge(groupId, next, (existing, candidate) -> {
+                if (candidate != null && candidate.isConsumeMessageOrderly()
+                    && (existing == null || !existing.isConsumeMessageOrderly())) {
+                    return candidate;
+                }
+                return existing != null ? existing : candidate;
+            });
+        }
+    }
+
+    /**
+     * Two-phase parallel subscription-group dump. Remapped masters first; collision-fallbacks
+     * only when the remapped merge is empty — same host-side Docker tradeoff as consume-stats.
+     * Slow/unreachable brokers are skipped so a large cluster does not burn the Agent RPC window.
+     */
+    static Map<String, SubscriptionGroupConfig> collectConsumerGroupConfigs(
+        MasterBrokerAddrPlan plan,
+        int concurrency,
+        long budgetMs,
+        long remappedPerBrokerTimeoutMs,
+        long fallbackPerBrokerTimeoutMs,
+        SubscriptionGroupBrokerProbe probe
+    ) throws Exception {
+        Map<String, SubscriptionGroupConfig> configs = collectConsumerGroupConfigsFromBrokers(
+            new ArrayList<>(plan.remappedAddrs()),
+            concurrency,
+            budgetMs,
+            remappedPerBrokerTimeoutMs,
+            probe
+        );
+        if (configs.isEmpty() && plan.fallbackCount() > 0) {
+            Map<String, SubscriptionGroupConfig> fallbackConfigs = collectConsumerGroupConfigsFromBrokers(
+                new ArrayList<>(plan.collisionFallbackAddrs()),
+                concurrency,
+                budgetMs,
+                fallbackPerBrokerTimeoutMs,
+                probe
+            );
+            mergeSubscriptionGroupConfigs(configs, fallbackConfigs);
+        }
+        return configs;
+    }
+
+    static Map<String, SubscriptionGroupConfig> collectConsumerGroupConfigsFromBrokers(
+        List<String> brokers,
+        int concurrency,
+        long budgetMs,
+        long perBrokerTimeoutMs,
+        SubscriptionGroupBrokerProbe probe
+    ) throws Exception {
+        Map<String, SubscriptionGroupConfig> configs = new TreeMap<>();
+        if (brokers == null || brokers.isEmpty()) {
+            return configs;
+        }
+        int workers = Math.max(1, Math.min(concurrency, brokers.size()));
+        ExecutorService executor = Executors.newFixedThreadPool(workers, runnable -> {
+            Thread thread = new Thread(runnable, "dbx-rocketmq-consumer-collect");
+            thread.setDaemon(true);
+            return thread;
+        });
+        List<Callable<Map<String, SubscriptionGroupConfig>>> tasks = new ArrayList<>(brokers.size());
+        long brokerTimeout = Math.max(1_000, perBrokerTimeoutMs);
+        for (String brokerAddr : brokers) {
+            tasks.add(() -> {
+                Map<String, SubscriptionGroupConfig> partial = new HashMap<>();
+                try {
+                    Map<String, SubscriptionGroupConfig> loaded = probe.load(brokerAddr, brokerTimeout);
+                    if (loaded != null && !loaded.isEmpty()) {
+                        partial.putAll(loaded);
+                    }
+                } catch (Exception ignored) {
+                    // Skip unreachable brokers; return whatever others collected.
+                }
+                return partial;
+            });
+        }
+        try {
+            List<Future<Map<String, SubscriptionGroupConfig>>> futures =
+                executor.invokeAll(tasks, Math.max(1, budgetMs), TimeUnit.MILLISECONDS);
+            for (Future<Map<String, SubscriptionGroupConfig>> future : futures) {
+                if (future.isCancelled()) {
+                    continue;
+                }
+                try {
+                    Map<String, SubscriptionGroupConfig> partial = future.get();
+                    mergeSubscriptionGroupConfigs(configs, partial);
+                } catch (Exception ignored) {
+                    // Partial page is better than failing the whole list.
+                }
+            }
+        } finally {
+            executor.shutdownNow();
+        }
+        return configs;
     }
 
     /**
      * DefaultMQAdminExt.examineConsumerConnectionInfo(group) picks a broker from route using
      * NameServer-registered addresses. Remap to the client-reachable host before querying.
+     * Live members short-circuit. Empty / 206 offline claims require full remapped coverage and
+     * complete collision fallbacks (same class of gate as lag/mutate) so a single remapped 206
+     * cannot paint memberCount 0 while consumers may be online on an unreached sibling.
      */
     private static ConsumerConnection examineConsumerConnectionInfoRemapped(
-        DefaultMQAdminExt admin, JsonObject conn, String groupId) {
-        try {
-            for (String brokerAddr : resolveMasterBrokerAddrs(admin, conn)) {
-                try {
-                    ConsumerConnection connection = admin.examineConsumerConnectionInfo(groupId, brokerAddr);
-                    if (connection.getConnectionSet() != null && !connection.getConnectionSet().isEmpty()) {
-                        return connection;
-                    }
-                } catch (Exception ignored) {
-                    // Try next broker; offline groups return an empty connection below.
-                }
-            }
-        } catch (Exception ignored) {
-            // No reachable broker addresses.
+        DefaultMQAdminExt admin, JsonObject conn, String groupId) throws Exception {
+        MasterBrokerAddrPlan plan = resolveMasterBrokerAddrPlan(admin, conn);
+        if (plan.isEmpty()) {
+            throw new MQClientException(
+                "No reachable RocketMQ master brokers for consumer connection of group " + groupId, null);
         }
-        return new ConsumerConnection();
+        Exception lastError = null;
+        int remappedSuccess = 0;
+        int fallbackSuccess = 0;
+        ConsumerConnection emptySuccess = null;
+        for (String brokerAddr : plan.allAddrs()) {
+            boolean collisionFallback = plan.isCollisionFallback(brokerAddr);
+            try {
+                ConsumerConnection connection = admin.examineConsumerConnectionInfo(groupId, brokerAddr);
+                if (connection.getConnectionSet() != null && !connection.getConnectionSet().isEmpty()) {
+                    return connection;
+                }
+                emptySuccess = connection != null ? connection : new ConsumerConnection();
+                if (collisionFallback) {
+                    fallbackSuccess++;
+                } else {
+                    remappedSuccess++;
+                }
+            } catch (Exception e) {
+                // 206 = group has no live clients on that broker — count as probed offline.
+                if (isConsumerGroupNotOnline(e)) {
+                    if (emptySuccess == null) {
+                        emptySuccess = new ConsumerConnection();
+                    }
+                    if (collisionFallback) {
+                        fallbackSuccess++;
+                    } else {
+                        remappedSuccess++;
+                    }
+                    continue;
+                }
+                lastError = e;
+            }
+        }
+        return requireConsumerConnectionProbeResult(
+            plan.remappedCount(),
+            remappedSuccess,
+            plan.fallbackCount(),
+            fallbackSuccess,
+            emptySuccess,
+            lastError,
+            groupId
+        );
+    }
+
+    /**
+     * RocketMQ broker/client code 206: consumer group has no online clients (definitive offline).
+     */
+    static boolean isConsumerGroupNotOnline(Throwable error) {
+        Throwable cursor = error;
+        while (cursor != null) {
+            if (cursor instanceof MQBrokerException brokerEx && brokerEx.getResponseCode() == 206) {
+                return true;
+            }
+            if (cursor instanceof MQClientException clientEx && clientEx.getResponseCode() == 206) {
+                return true;
+            }
+            cursor = cursor.getCause();
+        }
+        return false;
+    }
+
+    /**
+     * Accept empty/206 offline only when every remapped master (and every collision fallback)
+     * answered. Partial coverage must throw so enrich omits memberCount instead of fake 0.
+     */
+    static ConsumerConnection requireConsumerConnectionProbeResult(
+        int remappedCount,
+        int remappedSuccess,
+        int fallbackCount,
+        int fallbackSuccess,
+        ConsumerConnection emptySuccess,
+        Exception lastError,
+        String groupId
+    ) throws MQClientException {
+        if (remappedCount <= 0 && fallbackCount <= 0) {
+            throw new MQClientException(
+                "No reachable RocketMQ master brokers for consumer connection of group " + groupId, null);
+        }
+        if (remappedSuccess <= 0 && fallbackSuccess <= 0) {
+            throw new MQClientException(
+                "Failed to examine consumer connection for group " + groupId + " on all masters",
+                lastError);
+        }
+        if (remappedCount > 0 && remappedSuccess < remappedCount) {
+            throw new MQClientException(
+                "Failed to examine consumer connection for group " + groupId
+                    + " on some masters (partial remapped probe)",
+                lastError);
+        }
+        // Docker remap collisions: remapped host:port 206/empty is not enough — sibling masters
+        // may still have online consumers on unreachable internal addresses.
+        if (shouldFailClosedOnCollisionPartialMutation(fallbackCount, fallbackSuccess)) {
+            throw new MQClientException(
+                "Failed to examine consumer connection for group " + groupId
+                    + " after Docker remap address collision (unreachable sibling masters)",
+                lastError);
+        }
+        return emptySuccess != null ? emptySuccess : new ConsumerConnection();
     }
 
     private static ConsumeStats examineConsumeStatsRemapped(
         DefaultMQAdminExt admin, JsonObject conn, String groupId, String topic) throws Exception {
+        return examineConsumeStatsOnMasters(admin, groupId, topic, resolveMasterBrokerAddrPlan(admin, conn));
+    }
+
+    @FunctionalInterface
+    interface ConsumeStatsBrokerProbe {
+        ConsumeStats examine(String brokerAddr, String groupId, String topic, long timeout) throws Exception;
+    }
+
+    /**
+     * Probe consume stats on a pre-resolved master plan. Callers that fan out per group
+     * (lag attach) should resolve the plan once so each task does not re-hit clusterInfo.
+     */
+    private static ConsumeStats examineConsumeStatsOnMasters(
+        DefaultMQAdminExt admin, String groupId, String topic, MasterBrokerAddrPlan plan) throws Exception {
+        // RocketMQ 5.3.1: 3-arg examineConsumeStats(clusterName, group, topic) is NOT broker-scoped.
+        // Must use 4-arg (brokerAddr, group, topic, timeout) or remapped Docker addrs never hit brokers.
+        long timeout = adminTimeoutMillis(admin);
+        long fallbackTimeout = Math.min(timeout, COLLISION_FALLBACK_PROBE_TIMEOUT_MS);
+        return examineConsumeStatsOnMasters(
+            groupId,
+            topic,
+            plan,
+            timeout,
+            fallbackTimeout,
+            (brokerAddr, g, t, to) -> admin.examineConsumeStats(brokerAddr, g, t, to)
+        );
+    }
+
+    /**
+     * Two-phase probe: remapped masters first; collision-fallbacks only when the remapped merge
+     * is empty. Fail-closed ({@link #shouldFailClosedOnCollisionEmpty}) only guards empty merge,
+     * so non-empty remapped success must not spend adminTimeout on unreachable Docker IPs.
+     * Fallback remoting stays short — same host-side Docker tradeoff as subscription collect.
+     */
+    static ConsumeStats examineConsumeStatsOnMasters(
+        String groupId,
+        String topic,
+        MasterBrokerAddrPlan plan,
+        long remappedTimeout,
+        long fallbackTimeout,
+        ConsumeStatsBrokerProbe probe
+    ) throws Exception {
         ConsumeStats merged = new ConsumeStats();
-        for (String brokerAddr : resolveMasterBrokerAddrs(admin, conn)) {
+        int remappedSuccess = 0;
+        int fallbackSuccess = 0;
+        Exception lastError = null;
+        for (String brokerAddr : plan.remappedAddrs()) {
             try {
-                ConsumeStats stats = admin.examineConsumeStats(brokerAddr, groupId, topic);
+                ConsumeStats stats = probe.examine(brokerAddr, groupId, topic, remappedTimeout);
+                remappedSuccess++;
                 if (stats != null && stats.getOffsetTable() != null) {
                     merged.getOffsetTable().putAll(stats.getOffsetTable());
                     merged.setConsumeTps(merged.getConsumeTps() + stats.getConsumeTps());
                 }
-            } catch (Exception ignored) {
-                // Try next broker.
+            } catch (Exception e) {
+                lastError = e;
             }
         }
+        boolean mergedEmpty = merged.getOffsetTable() == null || merged.getOffsetTable().isEmpty();
+        // Remap collisions append Docker-internal originals as best-effort fallbacks. Host-side
+        // agents usually cannot reach them; skip those probes once remapped masters already
+        // returned offsets. Empty merge + unreachable collision siblings is still fail-closed:
+        // a single published host:port can answer for the wrong master and look like zero lag.
+        if (mergedEmpty) {
+            for (String brokerAddr : plan.collisionFallbackAddrs()) {
+                try {
+                    ConsumeStats stats = probe.examine(brokerAddr, groupId, topic, fallbackTimeout);
+                    fallbackSuccess++;
+                    if (stats != null && stats.getOffsetTable() != null) {
+                        merged.getOffsetTable().putAll(stats.getOffsetTable());
+                        merged.setConsumeTps(merged.getConsumeTps() + stats.getConsumeTps());
+                    }
+                } catch (Exception e) {
+                    lastError = e;
+                }
+            }
+            mergedEmpty = merged.getOffsetTable() == null || merged.getOffsetTable().isEmpty();
+        }
+        if (shouldFailClosedOnCollisionEmpty(mergedEmpty, plan.fallbackCount(), fallbackSuccess)) {
+            throw new MQClientException(
+                "Failed to examine consume stats for group " + groupId
+                    + " after Docker remap address collision (unreachable sibling masters)",
+                lastError);
+        }
+        int attemptedForGate;
+        int successForGate;
+        if (remappedSuccess > 0) {
+            attemptedForGate = plan.remappedCount();
+            successForGate = remappedSuccess;
+        } else if (fallbackSuccess > 0) {
+            attemptedForGate = plan.fallbackCount();
+            successForGate = fallbackSuccess;
+        } else {
+            attemptedForGate = plan.size();
+            successForGate = 0;
+        }
+        ensureConsumeStatsProbeSucceeded(attemptedForGate, successForGate, mergedEmpty, lastError, groupId);
         return merged;
+    }
+
+    /**
+     * Host-side Docker remap collisions collapse N masters onto one published address. An empty
+     * merge is only trustworthy when every collision-fallback original was also reachable (or
+     * there were no collisions).
+     */
+    static boolean shouldFailClosedOnCollisionEmpty(
+        boolean mergedEmpty, int fallbackCount, int fallbackSuccess) {
+        return mergedEmpty && fallbackCount > 0 && fallbackSuccess < fallbackCount;
+    }
+
+    /**
+     * Fail closed when no master answered, or when some masters failed and the merge is empty
+     * (partial outage otherwise looks like healthy zero lag).
+     */
+    static void ensureConsumeStatsProbeSucceeded(
+        int attemptedBrokers,
+        int successCount,
+        boolean mergedEmpty,
+        Exception lastError,
+        String groupId
+    ) throws MQClientException {
+        if (attemptedBrokers <= 0) {
+            throw new MQClientException(
+                "No reachable RocketMQ master brokers for consume stats of group " + groupId, null);
+        }
+        if (successCount <= 0) {
+            throw new MQClientException(
+                "Failed to examine consume stats for group " + groupId + " on all masters",
+                lastError);
+        }
+        if (mergedEmpty && successCount < attemptedBrokers) {
+            throw new MQClientException(
+                "Failed to examine consume stats for group " + groupId
+                    + " on some masters (empty merge after partial failure)",
+                lastError);
+        }
     }
 
     /**
@@ -1033,16 +1590,8 @@ public final class RocketMqAgent {
     private static GroupList queryTopicConsumeByWhoOnBroker(
         DefaultMQAdminExt admin, String brokerAddr, String topic) throws Exception {
         try {
-            var implField = DefaultMQAdminExt.class.getDeclaredField("defaultMQAdminExtImpl");
-            implField.setAccessible(true);
-            Object impl = implField.get(admin);
-            var mqClientMethod = impl.getClass().getMethod("getMqClientInstance");
-            Object mqClient = mqClientMethod.invoke(impl);
-            var apiMethod = mqClient.getClass().getMethod("getMQClientAPIImpl");
-            Object api = apiMethod.invoke(mqClient);
-            var timeoutField = impl.getClass().getDeclaredField("timeoutMillis");
-            timeoutField.setAccessible(true);
-            long timeout = timeoutField.getLong(impl);
+            Object api = mqClientApiImpl(admin);
+            long timeout = adminTimeoutMillis(admin);
             var queryMethod = api.getClass().getMethod(
                 "queryTopicConsumeByWho", String.class, String.class, long.class);
             return (GroupList) queryMethod.invoke(api, brokerAddr, topic, timeout);
@@ -1109,12 +1658,18 @@ public final class RocketMqAgent {
         if (limit <= 0) {
             limit = DEFAULT_LIST_LIMIT;
         }
+        boolean includeLag = boolOrDefault(params, "includeLag", false);
 
+        Map<String, SubscriptionGroupConfig> configs;
         Set<String> groups = new TreeSet<>();
         if (!topicFilter.isBlank()) {
+            // Dashboard-style: discover groups via topic; skip full-cluster subscription dump.
             groups.addAll(queryTopicConsumeByWhoRemapped(admin, conn, topicFilter));
+            // Merge every reachable master dump so FIFO typing is not stuck on the first broker.
+            configs = collectConsumerGroupConfigsForTopicFilter(admin, conn);
         } else {
-            groups.addAll(collectAllConsumerGroups(admin, conn));
+            configs = collectConsumerGroupConfigs(admin, conn);
+            groups.addAll(configs.keySet());
         }
 
         List<Map<String, Object>> rows = new ArrayList<>();
@@ -1126,7 +1681,8 @@ public final class RocketMqAgent {
             row.put("groupId", groupId);
             row.put("state", "UNKNOWN");
             row.put("simpleGroup", false);
-            row.put("groupType", "NORMAL");
+            // Placeholder until config classify runs; missing dump → UNKNOWN, not NORMAL.
+            row.put("groupType", "UNKNOWN");
             row.put("messageModel", "CLUSTERING");
             rows.add(row);
         }
@@ -1135,13 +1691,14 @@ public final class RocketMqAgent {
         List<Map<String, Object>> page = paginate(rows, offset, limit);
         for (Map<String, Object> row : page) {
             String groupId = String.valueOf(row.get("groupId"));
-            SubscriptionGroupConfig config = findSubscriptionGroupConfig(admin, conn, groupId);
+            SubscriptionGroupConfig config = configs.get(groupId);
             row.put("groupType", classifyConsumerGroupType(groupId, config));
         }
         if (boolOrDefault(params, "enrich", false)) {
-            for (Map<String, Object> row : page) {
-                enrichConsumerGroupRow(admin, conn, String.valueOf(row.get("groupId")), row);
-            }
+            enrichConsumerGroupRows(admin, conn, page);
+        }
+        if (includeLag && !topicFilter.isBlank()) {
+            attachConsumerLags(admin, conn, page, topicFilter);
         }
 
         Map<String, Object> result = new LinkedHashMap<>();
@@ -1152,18 +1709,149 @@ public final class RocketMqAgent {
         return result;
     }
 
-    private static void enrichConsumerGroupRow(
-        DefaultMQAdminExt admin, JsonObject conn, String groupId, Map<String, Object> row) {
+    /** Concurrent lag lookup for the current page; budget-capped like enrich. */
+    private static void attachConsumerLags(
+        DefaultMQAdminExt admin,
+        JsonObject conn,
+        List<Map<String, Object>> page,
+        String topic
+    ) {
+        if (page.isEmpty() || topic == null || topic.isBlank()) {
+            return;
+        }
+        final MasterBrokerAddrPlan masterPlan;
         try {
-            SubscriptionGroupConfig config = findSubscriptionGroupConfig(admin, conn, groupId);
-            row.put("groupType", classifyConsumerGroupType(groupId, config));
-            ConsumerConnection connection = examineConsumerConnectionInfoRemapped(admin, conn, groupId);
-            row.put("consumeType", connection.getConsumeType() != null ? connection.getConsumeType().name() : "UNKNOWN");
+            // Resolve/remap masters once — per-group examineBrokerClusterInfo burns the lag budget.
+            masterPlan = resolveMasterBrokerAddrPlan(admin, conn);
+        } catch (Exception e) {
+            for (Map<String, Object> row : page) {
+                row.put("totalLagFailed", true);
+            }
+            return;
+        }
+        int workers = Math.max(1, Math.min(CONSUMER_LAG_CONCURRENCY, page.size()));
+        ExecutorService executor = Executors.newFixedThreadPool(workers, runnable -> {
+            Thread thread = new Thread(runnable, "dbx-rocketmq-consumer-lag");
+            thread.setDaemon(true);
+            return thread;
+        });
+        // Nullable Long: omit totalLag on failure; mark totalLagFailed so list UI does not show 0.
+        List<Callable<Long>> tasks = new ArrayList<>(page.size());
+        for (Map<String, Object> row : page) {
+            String groupId = String.valueOf(row.get("groupId"));
+            tasks.add(() -> {
+                // examineConsumeStatsOnMasters throws when no master succeeds.
+                ConsumeStats stats = examineConsumeStatsOnMasters(admin, groupId, topic, masterPlan);
+                long totalLag = 0;
+                if (stats.getOffsetTable() != null) {
+                    for (var entry : stats.getOffsetTable().entrySet()) {
+                        totalLag += Math.max(0, entry.getValue().getBrokerOffset() - entry.getValue().getConsumerOffset());
+                    }
+                }
+                return totalLag;
+            });
+        }
+        try {
+            List<Future<Long>> results =
+                executor.invokeAll(
+                    tasks,
+                    Math.max(1, scaledOperationBudgetMs(conn, CONSUMER_LAG_BUDGET_BASELINE_MS)),
+                    TimeUnit.MILLISECONDS);
+            for (int i = 0; i < page.size(); i++) {
+                Future<Long> future = i < results.size() ? results.get(i) : null;
+                if (future == null || future.isCancelled()) {
+                    page.get(i).put("totalLagFailed", true);
+                    continue;
+                }
+                try {
+                    Long lag = future.get();
+                    if (lag != null) {
+                        page.get(i).put("totalLag", lag);
+                    } else {
+                        page.get(i).put("totalLagFailed", true);
+                    }
+                } catch (Exception ignored) {
+                    page.get(i).put("totalLagFailed", true);
+                }
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            for (Map<String, Object> row : page) {
+                if (!row.containsKey("totalLag")) {
+                    row.put("totalLagFailed", true);
+                }
+            }
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    @FunctionalInterface
+    interface ConsumerConnectionLookup {
+        ConsumerConnection load(String groupId) throws Exception;
+    }
+
+    private static void enrichConsumerGroupRows(
+        DefaultMQAdminExt admin, JsonObject conn, List<Map<String, Object>> page) {
+        enrichConsumerGroupRows(
+            page,
+            groupId -> examineConsumerConnectionInfoRemapped(admin, conn, groupId),
+            CONSUMER_GROUP_ENRICH_CONCURRENCY,
+            scaledOperationBudgetMs(conn, CONSUMER_GROUP_ENRICH_BUDGET_BASELINE_MS)
+        );
+    }
+
+    static void enrichConsumerGroupRows(
+        List<Map<String, Object>> page,
+        ConsumerConnectionLookup lookup,
+        int concurrency,
+        long budgetMs) {
+        if (page.isEmpty()) {
+            return;
+        }
+        int workers = Math.max(1, Math.min(concurrency, page.size()));
+        ExecutorService executor = Executors.newFixedThreadPool(workers, runnable -> {
+            Thread thread = new Thread(runnable, "dbx-rocketmq-consumer-enrich");
+            thread.setDaemon(true);
+            return thread;
+        });
+        List<Callable<Map<String, Object>>> tasks = new ArrayList<>(page.size());
+        for (Map<String, Object> row : page) {
+            tasks.add(() -> consumerGroupEnrichment(String.valueOf(row.get("groupId")), lookup));
+        }
+        List<Future<Map<String, Object>>> results = Collections.emptyList();
+        try {
+            results = executor.invokeAll(tasks, Math.max(1, budgetMs), TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } finally {
+            executor.shutdownNow();
+        }
+        for (int index = 0; index < page.size(); index++) {
+            Map<String, Object> row = page.get(index);
+            if (index < results.size() && !results.get(index).isCancelled()) {
+                try {
+                    row.putAll(results.get(index).get());
+                } catch (Exception ignored) {
+                    // Keep the base group row when enrichment fails.
+                }
+            }
+            // Omit memberCount on cancel/timeout/failure so UI shows '-' instead of fake offline 0.
+            row.putIfAbsent("topics", Collections.emptyList());
+        }
+    }
+
+    private static Map<String, Object> consumerGroupEnrichment(
+        String groupId, ConsumerConnectionLookup lookup) {
+        Map<String, Object> enrichment = new LinkedHashMap<>();
+        try {
+            ConsumerConnection connection = lookup.load(groupId);
+            enrichment.put("consumeType", connection.getConsumeType() != null ? connection.getConsumeType().name() : "UNKNOWN");
             if (connection.getMessageModel() != null) {
-                row.put("messageModel", connection.getMessageModel().name());
+                enrichment.put("messageModel", connection.getMessageModel().name());
             }
             int memberCount = connection.getConnectionSet() == null ? 0 : connection.getConnectionSet().size();
-            row.put("memberCount", memberCount);
+            enrichment.put("memberCount", memberCount);
             List<String> topics = new ArrayList<>();
             if (connection.getSubscriptionTable() != null) {
                 for (SubscriptionData sub : connection.getSubscriptionTable().values()) {
@@ -1172,11 +1860,12 @@ public final class RocketMqAgent {
                     }
                 }
             }
-            row.put("topics", topics);
+            enrichment.put("topics", topics);
         } catch (Exception ignored) {
-            row.putIfAbsent("memberCount", 0);
-            row.putIfAbsent("topics", Collections.emptyList());
+            // Leave memberCount unset — probe did not finish; list UI must not show 0.
+            enrichment.put("topics", Collections.emptyList());
         }
+        return enrichment;
     }
 
     private static Object describeConsumerGroup(JsonObject params) throws Exception {
@@ -1220,8 +1909,16 @@ public final class RocketMqAgent {
 
     private static Object deleteConsumerGroup(JsonObject params) throws Exception {
         DefaultMQAdminExt admin = requireAdmin();
+        JsonObject conn = connectionObject(params);
         String groupId = requireString(params, "groupId");
-        admin.deleteSubscriptionGroup(brokerAddr(params, admin), groupId);
+        // Dashboard deletes per broker; wipe every reachable master so the group does not reappear.
+        mutateSubscriptionGroupOnMasters(
+            admin,
+            conn,
+            groupId,
+            "delete",
+            brokerAddr -> admin.deleteSubscriptionGroup(brokerAddr, groupId)
+        );
         return Collections.singletonMap("ok", true);
     }
 
@@ -1246,14 +1943,103 @@ public final class RocketMqAgent {
             config.setGroupName(groupId);
         }
         applySubscriptionGroupConfigUpdates(config, params);
-        for (String brokerAddr : resolveMasterBrokerAddrs(admin, conn)) {
+        SubscriptionGroupConfig toWrite = config;
+        mutateSubscriptionGroupOnMasters(
+            admin,
+            conn,
+            groupId,
+            "update",
+            brokerAddr -> admin.createAndUpdateSubscriptionGroupConfig(brokerAddr, toWrite)
+        );
+        return Collections.singletonMap("ok", true);
+    }
+
+    @FunctionalInterface
+    interface BrokerSubscriptionMutation {
+        void apply(String brokerAddr) throws Exception;
+    }
+
+    /**
+     * Apply a subscription-group mutation on every remapped master (and collision fallbacks).
+     * Require full coverage of remapped addrs; Docker remap collisions must also succeed on
+     * fallback originals — a single published host:port hit must not report ok while sibling
+     * masters still hold the old group/config.
+     */
+    static void mutateSubscriptionGroupOnMasters(
+        DefaultMQAdminExt admin,
+        JsonObject conn,
+        String groupId,
+        String action,
+        BrokerSubscriptionMutation mutation
+    ) throws Exception {
+        MasterBrokerAddrPlan plan = resolveMasterBrokerAddrPlan(admin, conn);
+        int remappedSuccess = 0;
+        int fallbackSuccess = 0;
+        Exception lastError = null;
+        for (String brokerAddr : plan.allAddrs()) {
             try {
-                admin.createAndUpdateSubscriptionGroupConfig(brokerAddr, config);
-            } catch (Exception ignored) {
-                // Try next broker when Docker/internal broker addresses are unreachable.
+                mutation.apply(brokerAddr);
+                if (plan.isCollisionFallback(brokerAddr)) {
+                    fallbackSuccess++;
+                } else {
+                    remappedSuccess++;
+                }
+            } catch (Exception e) {
+                lastError = e;
             }
         }
-        return Collections.singletonMap("ok", true);
+        ensureSubscriptionGroupMutationSucceeded(
+            plan.remappedCount(),
+            remappedSuccess,
+            plan.fallbackCount(),
+            fallbackSuccess,
+            lastError,
+            action,
+            groupId
+        );
+    }
+
+    /**
+     * Gate subscription-group mutate/delete. Partial remapped updates and Docker collision
+     * fallbacks that never answered must fail closed (group would otherwise reappear / diverge).
+     */
+    static void ensureSubscriptionGroupMutationSucceeded(
+        int remappedCount,
+        int remappedSuccess,
+        int fallbackCount,
+        int fallbackSuccess,
+        Exception lastError,
+        String action,
+        String groupId
+    ) throws MQClientException {
+        if (remappedCount <= 0 && fallbackCount <= 0) {
+            throw new MQClientException(
+                "No reachable RocketMQ master brokers for " + action + " of group " + groupId, null);
+        }
+        if (remappedSuccess <= 0 && fallbackSuccess <= 0) {
+            throw new MQClientException(
+                "Failed to " + action + " consumer group " + groupId + " on all masters",
+                lastError);
+        }
+        if (remappedCount > 0 && remappedSuccess < remappedCount) {
+            throw new MQClientException(
+                "Failed to " + action + " consumer group " + groupId
+                    + " on some masters (partial remapped update)",
+                lastError);
+        }
+        // Remap collisions collapse N masters onto one published addr. Updating that addr once
+        // leaves sibling masters untouched unless collision-fallback originals also succeed.
+        if (shouldFailClosedOnCollisionPartialMutation(fallbackCount, fallbackSuccess)) {
+            throw new MQClientException(
+                "Failed to " + action + " consumer group " + groupId
+                    + " after Docker remap address collision (unreachable sibling masters)",
+                lastError);
+        }
+    }
+
+    /** True when collision fallbacks exist but were not all successfully mutated. */
+    static boolean shouldFailClosedOnCollisionPartialMutation(int fallbackCount, int fallbackSuccess) {
+        return fallbackCount > 0 && fallbackSuccess < fallbackCount;
     }
 
     private static Map<String, Object> subscriptionGroupConfigToMap(SubscriptionGroupConfig config) {
@@ -1332,30 +2118,187 @@ public final class RocketMqAgent {
         String groupId = requireString(params, "groupId");
         String topic = requireString(params, "topic");
         ConsumeStats stats = examineConsumeStatsRemapped(admin, conn, groupId, topic);
+        // Best-effort queue→client mapping (Dashboard getClientConnection); failures must not hide offsets.
+        Map<MessageQueue, String> queueClientMap = resolveQueueClientMap(admin, conn, groupId);
+        return buildConsumerLagResult(stats, queueClientMap);
+    }
 
+    /**
+     * Build lag payload from ConsumeStats. Keeps Kafka-compatible field names
+     * ({@code currentOffset}/{@code endOffset}/{@code lag}) and adds Dashboard fields
+     * ({@code brokerName}/{@code lastTimestamp}/{@code consumerClient}).
+     */
+    static Map<String, Object> buildConsumerLagResult(
+        ConsumeStats stats, Map<MessageQueue, String> queueClientMap) {
         long totalLag = 0;
         List<Map<String, Object>> partitions = new ArrayList<>();
-        if (stats.getOffsetTable() != null) {
+        if (stats != null && stats.getOffsetTable() != null) {
             for (var entry : stats.getOffsetTable().entrySet()) {
-                long consumerOffset = entry.getValue().getConsumerOffset();
-                long brokerOffset = entry.getValue().getBrokerOffset();
+                MessageQueue mq = entry.getKey();
+                OffsetWrapper offset = entry.getValue();
+                long consumerOffset = offset.getConsumerOffset();
+                long brokerOffset = offset.getBrokerOffset();
                 long lag = Math.max(0, brokerOffset - consumerOffset);
                 totalLag += lag;
 
                 Map<String, Object> partition = new LinkedHashMap<>();
-                partition.put("partition", entry.getKey().getQueueId());
+                partition.put("partition", mq.getQueueId());
                 partition.put("currentOffset", consumerOffset);
                 partition.put("endOffset", brokerOffset);
                 partition.put("lag", lag);
+                // Dashboard-compatible consume-detail columns.
+                partition.put("brokerName", mq.getBrokerName() != null ? mq.getBrokerName() : "");
+                partition.put("lastTimestamp", offset.getLastTimestamp());
+                String clientId = queueClientMap != null ? queueClientMap.get(mq) : null;
+                partition.put("consumerClient", clientId != null ? clientId : "");
                 partitions.add(partition);
             }
         }
-        partitions.sort(Comparator.comparingInt(a -> (int) a.get("partition")));
+        // Sort by broker then queue so multi-broker topics stay readable.
+        partitions.sort(Comparator
+            .comparing((Map<String, Object> a) -> String.valueOf(a.get("brokerName")))
+            .thenComparingInt(a -> (int) a.get("partition")));
 
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("partitions", partitions);
         result.put("totalLag", totalLag);
         return result;
+    }
+
+    /**
+     * Map MessageQueue → online consumer clientId via ConsumerRunningInfo.mqTable.
+     * Mirrors RocketMQ Dashboard ConsumerServiceImpl#getClientConnection; swallows errors.
+     */
+    static Map<MessageQueue, String> resolveQueueClientMap(
+        DefaultMQAdminExt admin, JsonObject conn, String groupId) {
+        Map<MessageQueue, String> results = new HashMap<>();
+        try {
+            ConsumerConnection connection = examineConsumerConnectionInfoRemapped(admin, conn, groupId);
+            if (connection.getConnectionSet() == null || connection.getConnectionSet().isEmpty()) {
+                return results;
+            }
+            for (Connection clientConn : connection.getConnectionSet()) {
+                String clientId = clientConn.getClientId();
+                if (clientId == null || clientId.isBlank()) {
+                    continue;
+                }
+                try {
+                    // DefaultMQAdminExt picks the first NameServer-registered broker (often Docker-internal).
+                    ConsumerRunningInfo runningInfo =
+                        getConsumerRunningInfoRemapped(admin, conn, groupId, clientId, false);
+                    if (runningInfo == null || runningInfo.getMqTable() == null) {
+                        continue;
+                    }
+                    for (MessageQueue mq : runningInfo.getMqTable().keySet()) {
+                        results.put(mq, clientId);
+                    }
+                } catch (Exception ignored) {
+                    // Offline/unreachable client: keep offsets without client assignment.
+                }
+            }
+        } catch (Exception ignored) {
+            // Connection lookup failed; return empty map.
+        }
+        return results;
+    }
+
+    /**
+     * Like {@link DefaultMQAdminExt#getConsumerRunningInfo}, but remaps broker addresses for
+     * Docker/host-published ports before invoking {@code MQClientAPIImpl}.
+     */
+    static ConsumerRunningInfo getConsumerRunningInfoRemapped(
+        DefaultMQAdminExt admin,
+        JsonObject conn,
+        String groupId,
+        String clientId,
+        boolean jstack
+    ) {
+        // Upstream walks %RETRY%{group} route and contacts the first broker addr as registered.
+        try {
+            String retryTopic = MixAll.RETRY_GROUP_TOPIC_PREFIX + groupId;
+            TopicRouteData route = admin.examineTopicRouteInfo(retryTopic);
+            if (route != null && route.getBrokerDatas() != null) {
+                for (BrokerData brokerData : route.getBrokerDatas()) {
+                    String rawAddr = brokerData.selectBrokerAddr();
+                    if (rawAddr == null || rawAddr.isBlank()) {
+                        continue;
+                    }
+                    String brokerAddr = remapBrokerAddrForClient(rawAddr, conn);
+                    try {
+                        ConsumerRunningInfo info =
+                            getConsumerRunningInfoOnBroker(admin, brokerAddr, groupId, clientId, jstack);
+                        if (info != null) {
+                            return info;
+                        }
+                    } catch (Exception ignored) {
+                        // Try next remapped broker.
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+            // Fall through to master-broker scan.
+        }
+        try {
+            for (String brokerAddr : resolveMasterBrokerAddrs(admin, conn)) {
+                try {
+                    ConsumerRunningInfo info =
+                        getConsumerRunningInfoOnBroker(admin, brokerAddr, groupId, clientId, jstack);
+                    if (info != null) {
+                        return info;
+                    }
+                } catch (Exception ignored) {
+                    // Try next master.
+                }
+            }
+        } catch (Exception ignored) {
+            // No reachable masters.
+        }
+        return null;
+    }
+
+    /** Broker-scoped ConsumerRunningInfo; DefaultMQAdminExt has no remapped overload. */
+    private static ConsumerRunningInfo getConsumerRunningInfoOnBroker(
+        DefaultMQAdminExt admin,
+        String brokerAddr,
+        String groupId,
+        String clientId,
+        boolean jstack
+    ) throws Exception {
+        try {
+            Object api = mqClientApiImpl(admin);
+            long timeout = adminTimeoutMillis(admin);
+            var method = api.getClass().getMethod(
+                "getConsumerRunningInfo",
+                String.class,
+                String.class,
+                String.class,
+                boolean.class,
+                long.class
+            );
+            return (ConsumerRunningInfo) method.invoke(api, brokerAddr, groupId, clientId, jstack, timeout);
+        } catch (ReflectiveOperationException e) {
+            throw new MQClientException(
+                "Failed to get consumer running info on broker " + brokerAddr, e);
+        }
+    }
+
+    private static Object mqClientApiImpl(DefaultMQAdminExt admin) throws ReflectiveOperationException {
+        var implField = DefaultMQAdminExt.class.getDeclaredField("defaultMQAdminExtImpl");
+        implField.setAccessible(true);
+        Object impl = implField.get(admin);
+        var mqClientMethod = impl.getClass().getMethod("getMqClientInstance");
+        Object mqClient = mqClientMethod.invoke(impl);
+        var apiMethod = mqClient.getClass().getMethod("getMQClientAPIImpl");
+        return apiMethod.invoke(mqClient);
+    }
+
+    private static long adminTimeoutMillis(DefaultMQAdminExt admin) throws ReflectiveOperationException {
+        var implField = DefaultMQAdminExt.class.getDeclaredField("defaultMQAdminExtImpl");
+        implField.setAccessible(true);
+        Object impl = implField.get(admin);
+        var timeoutField = impl.getClass().getDeclaredField("timeoutMillis");
+        timeoutField.setAccessible(true);
+        return timeoutField.getLong(impl);
     }
 
     private static Object listProducers(JsonObject params) throws Exception {
@@ -1510,7 +2453,7 @@ public final class RocketMqAgent {
                 consumer.assign(Collections.singletonList(queue));
                 consumer.seek(queue, seekOffset);
                 consumer.setPullBatchSize(count - messages.size());
-                List<MessageExt> polled = consumer.poll(3000);
+                List<MessageExt> polled = consumer.poll(MESSAGE_POLL_TIMEOUT_MS);
                 for (MessageExt message : polled) {
                     messages.add(peekedMessageFromRecord(topic, message));
                     if (messages.size() >= count) {
@@ -1676,10 +2619,12 @@ public final class RocketMqAgent {
     static DefaultMQAdminExt buildAdminClient(JsonObject conn) throws Exception {
         long timeoutMs = intOrDefault(conn, "request_timeout_ms", DEFAULT_REQUEST_TIMEOUT_MS);
         RPCHook rpcHook = buildRpcHook(conn);
+        // Always pass timeout — DefaultMQAdminExt() ignores request_timeout_ms.
         DefaultMQAdminExt admin = rpcHook != null
             ? new DefaultMQAdminExt(rpcHook, timeoutMs)
-            : new DefaultMQAdminExt();
+            : new DefaultMQAdminExt(timeoutMs);
         admin.setNamesrvAddr(namesrvAddr(conn));
+        applySocksProxy(admin, conn);
         admin.setAdminExtGroup("_DBX_ROCKETMQ_ADMIN_" + UUID.randomUUID());
         admin.setInstanceName("DBX_" + UUID.randomUUID());
         admin.start();
@@ -1692,7 +2637,10 @@ public final class RocketMqAgent {
             ? new DefaultMQProducer("_DBX_ROCKETMQ_PRODUCER", rpcHook)
             : new DefaultMQProducer("_DBX_ROCKETMQ_PRODUCER");
         nextProducer.setNamesrvAddr(namesrvAddr(conn));
+        applySocksProxy(nextProducer, conn);
         nextProducer.setInstanceName("DBX_" + UUID.randomUUID());
+        // Follow Advanced query timeout — SDK default sendMsgTimeout is only 3s.
+        nextProducer.setSendMsgTimeout(operationBudgetMsAsInt(conn));
         nextProducer.start();
         return nextProducer;
     }
@@ -1703,6 +2651,7 @@ public final class RocketMqAgent {
             ? new DefaultLitePullConsumer(rpcHook)
             : new DefaultLitePullConsumer();
         consumer.setNamesrvAddr(namesrvAddr(conn));
+        applySocksProxy(consumer, conn);
         consumer.setConsumerGroup("_DBX_PEEK_" + UUID.randomUUID());
         consumer.setInstanceName("DBX_" + UUID.randomUUID());
         consumer.setAutoCommit(false);
@@ -1715,6 +2664,7 @@ public final class RocketMqAgent {
             ? new DefaultMQPullConsumer(MixAll.TOOLS_CONSUMER_GROUP, rpcHook)
             : new DefaultMQPullConsumer(MixAll.TOOLS_CONSUMER_GROUP);
         consumer.setNamesrvAddr(namesrvAddr(conn));
+        applySocksProxy(consumer, conn);
         consumer.setInstanceName("DBX_" + UUID.randomUUID());
         return consumer;
     }
@@ -1739,27 +2689,38 @@ public final class RocketMqAgent {
         return addr;
     }
 
-    private static TopicList fetchTopicList(DefaultMQAdminExt admin, JsonObject conn) throws Exception {
-        String cluster = clusterName(conn, admin);
-        if (!cluster.isBlank()) {
+    static boolean applySocksProxy(ClientConfig client, JsonObject conn) {
+        if (!conn.has("socks_proxy") || !conn.get("socks_proxy").isJsonObject()) {
+            return false;
+        }
+        JsonObject proxy = conn.getAsJsonObject("socks_proxy");
+        String host = stringOrEmpty(proxy, "host");
+        int port = intOrDefault(proxy, "port", 0);
+        if (host.isBlank() || port <= 0 || port > 65_535) {
+            throw new IllegalArgumentException("socks_proxy host and port are required");
+        }
+
+        JsonObject route = new JsonObject();
+        route.addProperty("addr", formatSocketAddress(host, Integer.toString(port)));
+        String username = stringOrEmpty(proxy, "username");
+        String password = stringOrEmpty(proxy, "password");
+        if (!username.isBlank()) {
+            route.addProperty("username", username);
+        }
+        if (!password.isBlank()) {
+            route.addProperty("password", password);
+        }
+        JsonObject routes = new JsonObject();
+        routes.add("0.0.0.0/0", route);
+        client.setSocksProxyConfig(GSON.toJson(routes));
+        return true;
+    }
+
+    private static TopicList fetchTopicList(DefaultMQAdminExt admin, String cluster) throws Exception {
+        if (cluster != null && !cluster.isBlank()) {
             return admin.fetchTopicsByCLuster(cluster);
         }
         return admin.fetchAllTopicList();
-    }
-
-    private static Set<String> collectAllConsumerGroups(DefaultMQAdminExt admin, JsonObject conn) throws Exception {
-        Set<String> groups = new TreeSet<>();
-        for (String brokerAddr : resolveMasterBrokerAddrs(admin, conn)) {
-            try {
-                SubscriptionGroupWrapper wrapper = admin.getAllSubscriptionGroup(brokerAddr, DEFAULT_REQUEST_TIMEOUT_MS);
-                if (wrapper != null && wrapper.getSubscriptionGroupTable() != null) {
-                    groups.addAll(wrapper.getSubscriptionGroupTable().keySet());
-                }
-            } catch (Exception ignored) {
-                // Try next broker when Docker/internal broker addresses are unreachable.
-            }
-        }
-        return groups;
     }
 
     private static TopicConfig loadTopicConfig(DefaultMQAdminExt admin, String brokerAddr, String topic)
@@ -1798,32 +2759,121 @@ public final class RocketMqAgent {
         return resolveMasterBrokerAddrs(admin, conn, null);
     }
 
+    private static MasterBrokerAddrPlan resolveMasterBrokerAddrPlan(
+        DefaultMQAdminExt admin, JsonObject conn) throws Exception {
+        return resolveMasterBrokerAddrPlan(admin, conn, null, admin.examineBrokerClusterInfo());
+    }
+
     static List<String> resolveMasterBrokerAddrs(
         DefaultMQAdminExt admin, JsonObject conn, String brokerNameFilter) throws Exception {
-        ClusterInfo clusterInfo = admin.examineBrokerClusterInfo();
-        LinkedHashSet<String> addrs = new LinkedHashSet<>();
-        if (clusterInfo.getBrokerAddrTable() != null) {
-            for (BrokerData broker : clusterInfo.getBrokerAddrTable().values()) {
-                if (brokerNameFilter != null && !brokerNameFilter.isBlank()
-                    && !brokerNameFilter.equals(broker.getBrokerName())) {
-                    continue;
-                }
-                String masterAddr = null;
-                if (broker.getBrokerAddrs() != null && broker.getBrokerAddrs().containsKey(0L)) {
-                    masterAddr = broker.getBrokerAddrs().get(0L);
-                }
-                if (masterAddr == null || masterAddr.isBlank()) {
-                    masterAddr = broker.selectBrokerAddr();
-                }
-                if (masterAddr != null && !masterAddr.isBlank()) {
-                    addrs.add(remapBrokerAddrForClient(masterAddr, conn));
-                }
+        return resolveMasterBrokerAddrs(admin, conn, brokerNameFilter, admin.examineBrokerClusterInfo());
+    }
+
+    static List<String> resolveMasterBrokerAddrs(
+        DefaultMQAdminExt admin, JsonObject conn, String brokerNameFilter, ClusterInfo clusterInfo)
+        throws Exception {
+        return new ArrayList<>(resolveMasterBrokerAddrPlan(admin, conn, brokerNameFilter, clusterInfo).allAddrs());
+    }
+
+    static MasterBrokerAddrPlan resolveMasterBrokerAddrPlan(
+        DefaultMQAdminExt admin, JsonObject conn, String brokerNameFilter, ClusterInfo clusterInfo)
+        throws Exception {
+        MasterBrokerAddrPlan plan = masterBrokerAddrsFromClusterInfo(clusterInfo, conn, brokerNameFilter);
+        if (plan.isEmpty()) {
+            plan.addRemapped(resolveBrokerAddr(admin, conn, clusterInfo));
+        }
+        return plan;
+    }
+
+    /** Extract remapped master broker addresses from a ClusterInfo snapshot. */
+    static MasterBrokerAddrPlan masterBrokerAddrsFromClusterInfo(
+        ClusterInfo clusterInfo, JsonObject conn, String brokerNameFilter) {
+        MasterBrokerAddrPlan plan = new MasterBrokerAddrPlan();
+        if (clusterInfo == null || clusterInfo.getBrokerAddrTable() == null) {
+            return plan;
+        }
+        LinkedHashSet<String> remappedSeen = new LinkedHashSet<>();
+        for (BrokerData broker : clusterInfo.getBrokerAddrTable().values()) {
+            if (brokerNameFilter != null && !brokerNameFilter.isBlank()
+                && !brokerNameFilter.equals(broker.getBrokerName())) {
+                continue;
+            }
+            String masterAddr = null;
+            if (broker.getBrokerAddrs() != null && broker.getBrokerAddrs().containsKey(0L)) {
+                masterAddr = broker.getBrokerAddrs().get(0L);
+            }
+            if (masterAddr == null || masterAddr.isBlank()) {
+                masterAddr = broker.selectBrokerAddr();
+            }
+            if (masterAddr == null || masterAddr.isBlank()) {
+                continue;
+            }
+            String remapped = remapBrokerAddrForClient(masterAddr, conn);
+            // Multi-broker Docker often remaps every master to the same host:port. Keep the
+            // original address for collisions so in-network agents can still reach each broker.
+            if (remappedSeen.add(remapped)) {
+                plan.addRemapped(remapped);
+            } else if (!remapped.equals(masterAddr)) {
+                plan.addCollisionFallback(masterAddr);
             }
         }
-        if (addrs.isEmpty()) {
-            addrs.add(resolveBrokerAddr(admin, conn));
+        return plan;
+    }
+
+    /**
+     * Remapped masters plus optional collision-fallback originals. Fail-closed consume-stats
+     * gating treats fallbacks as best-effort so host-side Docker agents do not mark lag
+     * unavailable when only unreachable internal IPs fail.
+     */
+    static final class MasterBrokerAddrPlan {
+        private final LinkedHashSet<String> remapped = new LinkedHashSet<>();
+        private final LinkedHashSet<String> collisionFallbacks = new LinkedHashSet<>();
+
+        void addRemapped(String addr) {
+            if (addr != null && !addr.isBlank()) {
+                remapped.add(addr);
+            }
         }
-        return new ArrayList<>(addrs);
+
+        void addCollisionFallback(String addr) {
+            if (addr != null && !addr.isBlank() && !remapped.contains(addr)) {
+                collisionFallbacks.add(addr);
+            }
+        }
+
+        boolean isCollisionFallback(String addr) {
+            return collisionFallbacks.contains(addr);
+        }
+
+        LinkedHashSet<String> allAddrs() {
+            LinkedHashSet<String> all = new LinkedHashSet<>(remapped);
+            all.addAll(collisionFallbacks);
+            return all;
+        }
+
+        LinkedHashSet<String> remappedAddrs() {
+            return new LinkedHashSet<>(remapped);
+        }
+
+        LinkedHashSet<String> collisionFallbackAddrs() {
+            return new LinkedHashSet<>(collisionFallbacks);
+        }
+
+        int remappedCount() {
+            return remapped.size();
+        }
+
+        int fallbackCount() {
+            return collisionFallbacks.size();
+        }
+
+        int size() {
+            return remapped.size() + collisionFallbacks.size();
+        }
+
+        boolean isEmpty() {
+            return remapped.isEmpty() && collisionFallbacks.isEmpty();
+        }
     }
 
     private static void applyTopicConfigValue(TopicConfig config, String key, String value) {
@@ -2006,9 +3056,11 @@ public final class RocketMqAgent {
         };
     }
 
-    private static boolean probeAclSupport(DefaultMQAdminExt admin) {
+    private static boolean probeAclSupport(DefaultMQAdminExt admin, ClusterInfo clusterInfo) {
         try {
-            ClusterInfo clusterInfo = admin.examineBrokerClusterInfo();
+            if (clusterInfo == null || clusterInfo.getBrokerAddrTable() == null) {
+                return false;
+            }
             for (BrokerData broker : clusterInfo.getBrokerAddrTable().values()) {
                 String brokerAddr = broker.selectBrokerAddr();
                 if (brokerAddr == null || brokerAddr.isBlank()) {
@@ -2036,22 +3088,30 @@ public final class RocketMqAgent {
         if (!configured.isBlank()) {
             return configured;
         }
-        if (clusterInfo.getClusterAddrTable() != null && !clusterInfo.getClusterAddrTable().isEmpty()) {
+        if (clusterInfo != null
+            && clusterInfo.getClusterAddrTable() != null
+            && !clusterInfo.getClusterAddrTable().isEmpty()) {
             return clusterInfo.getClusterAddrTable().keySet().iterator().next();
         }
         return "DefaultCluster";
     }
 
     private static String resolveBrokerAddr(DefaultMQAdminExt admin, JsonObject conn) throws Exception {
+        return resolveBrokerAddr(admin, conn, admin.examineBrokerClusterInfo());
+    }
+
+    private static String resolveBrokerAddr(DefaultMQAdminExt admin, JsonObject conn, ClusterInfo clusterInfo)
+        throws Exception {
         String explicit = brokerAddress(conn);
         if (!explicit.isBlank()) {
             return explicit;
         }
-        ClusterInfo clusterInfo = admin.examineBrokerClusterInfo();
-        for (BrokerData broker : clusterInfo.getBrokerAddrTable().values()) {
-            String addr = broker.selectBrokerAddr();
-            if (addr != null && !addr.isBlank()) {
-                return remapBrokerAddrForClient(addr, conn);
+        if (clusterInfo != null && clusterInfo.getBrokerAddrTable() != null) {
+            for (BrokerData broker : clusterInfo.getBrokerAddrTable().values()) {
+                String addr = broker.selectBrokerAddr();
+                if (addr != null && !addr.isBlank()) {
+                    return remapBrokerAddrForClient(addr, conn);
+                }
             }
         }
         throw new IllegalStateException("No RocketMQ broker address found");
@@ -2117,6 +3177,9 @@ public final class RocketMqAgent {
         String explicit = brokerAddress(conn);
         if (!explicit.isBlank()) {
             return explicit;
+        }
+        if (conn.has("socks_proxy") && conn.get("socks_proxy").isJsonObject()) {
+            return brokerAddr;
         }
         String brokerHost = parseHostFromSocketAddress(brokerAddr);
         String brokerPort = parsePortFromSocketAddress(brokerAddr);
@@ -2249,18 +3312,47 @@ public final class RocketMqAgent {
         return true;
     }
 
-    private static boolean isLikelyUnreachableBrokerHost(String host) {
+    /** Package-visible for tests; RFC1918 + common Docker DNS names. */
+    static boolean isLikelyUnreachableBrokerHost(String host) {
         if (host == null || host.isBlank()) {
             return false;
         }
         if ("127.0.0.1".equals(host) || "localhost".equalsIgnoreCase(host) || "::1".equals(host)) {
             return false;
         }
-        return host.startsWith("172.")
-            || host.startsWith("10.")
-            || host.startsWith("192.168.")
+        // RFC1918: 10/8, 172.16/12, 192.168/16 — not every 172.* address.
+        return isRfc1918PrivateIpv4(host)
             || host.endsWith(".docker")
             || host.contains(".docker.");
+    }
+
+    static boolean isRfc1918PrivateIpv4(String host) {
+        if (host == null || host.isBlank()) {
+            return false;
+        }
+        String[] parts = host.split("\\.");
+        if (parts.length != 4) {
+            return false;
+        }
+        int[] octets = new int[4];
+        for (int i = 0; i < 4; i++) {
+            try {
+                octets[i] = Integer.parseInt(parts[i]);
+            } catch (NumberFormatException e) {
+                return false;
+            }
+            if (octets[i] < 0 || octets[i] > 255) {
+                return false;
+            }
+        }
+        if (octets[0] == 10) {
+            return true;
+        }
+        if (octets[0] == 192 && octets[1] == 168) {
+            return true;
+        }
+        // 172.16.0.0 – 172.31.255.255
+        return octets[0] == 172 && octets[1] >= 16 && octets[1] <= 31;
     }
 
     private static List<Map<String, Object>> brokerNodes(ClusterInfo clusterInfo) {
@@ -2299,18 +3391,23 @@ public final class RocketMqAgent {
     }
 
     private static Set<String> collectBrokerNames(DefaultMQAdminExt admin) {
-        Set<String> names = new HashSet<>();
         try {
-            ClusterInfo clusterInfo = admin.examineBrokerClusterInfo();
-            if (clusterInfo.getBrokerAddrTable() != null) {
-                for (BrokerData brokerData : clusterInfo.getBrokerAddrTable().values()) {
-                    if (brokerData.getBrokerName() != null && !brokerData.getBrokerName().isBlank()) {
-                        names.add(brokerData.getBrokerName());
-                    }
-                }
-            }
+            return collectBrokerNames(admin.examineBrokerClusterInfo());
         } catch (Exception ignored) {
             // Fall back to static reserved-topic filtering only.
+            return Set.of();
+        }
+    }
+
+    static Set<String> collectBrokerNames(ClusterInfo clusterInfo) {
+        Set<String> names = new HashSet<>();
+        if (clusterInfo == null || clusterInfo.getBrokerAddrTable() == null) {
+            return names;
+        }
+        for (BrokerData brokerData : clusterInfo.getBrokerAddrTable().values()) {
+            if (brokerData.getBrokerName() != null && !brokerData.getBrokerName().isBlank()) {
+                names.add(brokerData.getBrokerName());
+            }
         }
         return names;
     }
@@ -2332,29 +3429,45 @@ public final class RocketMqAgent {
     }
 
     private static Map<String, TopicConfig> collectBrokerTopicConfigs(DefaultMQAdminExt admin, JsonObject conn) {
-        Map<String, TopicConfig> merged = new LinkedHashMap<>();
         try {
-            for (String brokerAddr : resolveMasterBrokerAddrs(admin, conn)) {
-                try {
-                    TopicConfigSerializeWrapper wrapper =
-                        admin.getAllTopicConfig(brokerAddr, DEFAULT_REQUEST_TIMEOUT_MS);
-                    if (wrapper == null || wrapper.getTopicConfigTable() == null) {
+            return collectBrokerTopicConfigSnapshot(admin, conn, admin.examineBrokerClusterInfo()).topics();
+        } catch (Exception ignored) {
+            return new LinkedHashMap<>();
+        }
+    }
+
+    private static BrokerTopicConfigSnapshot collectBrokerTopicConfigSnapshot(
+        DefaultMQAdminExt admin, JsonObject conn, ClusterInfo clusterInfo) throws Exception {
+        List<String> brokerAddrs = resolveMasterBrokerAddrs(admin, conn, null, clusterInfo);
+        long timeoutMs = operationBudgetMs(conn);
+        return collectBrokerTopicConfigs(
+            brokerAddrs,
+            brokerAddr -> admin.getAllTopicConfig(brokerAddr, timeoutMs)
+        );
+    }
+
+    static BrokerTopicConfigSnapshot collectBrokerTopicConfigs(
+        List<String> brokerAddrs, BrokerTopicConfigLookup lookup) {
+        Map<String, TopicConfig> merged = new LinkedHashMap<>();
+        boolean complete = !brokerAddrs.isEmpty();
+        for (String brokerAddr : brokerAddrs) {
+            try {
+                TopicConfigSerializeWrapper wrapper = lookup.load(brokerAddr);
+                if (wrapper == null || wrapper.getTopicConfigTable() == null) {
+                    complete = false;
+                    continue;
+                }
+                for (TopicConfig config : wrapper.getTopicConfigTable().values()) {
+                    if (config.getTopicName() == null || config.getTopicName().isBlank()) {
                         continue;
                     }
-                    for (TopicConfig config : wrapper.getTopicConfigTable().values()) {
-                        if (config.getTopicName() == null || config.getTopicName().isBlank()) {
-                            continue;
-                        }
-                        merged.merge(config.getTopicName(), config, RocketMqAgent::preferTopicConfig);
-                    }
-                } catch (Exception ignored) {
-                    // Some brokers may reject bulk config reads.
+                    merged.merge(config.getTopicName(), config, RocketMqAgent::preferTopicConfig);
                 }
+            } catch (Exception ignored) {
+                complete = false;
             }
-        } catch (Exception ignored) {
-            // Fall back to nameserver topic list in listTopics.
         }
-        return merged;
+        return new BrokerTopicConfigSnapshot(merged, complete);
     }
 
     private static TopicConfig preferTopicConfig(TopicConfig left, TopicConfig right) {
@@ -2413,12 +3526,23 @@ public final class RocketMqAgent {
 
     private static String resolveTopicMessageType(DefaultMQAdminExt admin, JsonObject conn, String topic) {
         try {
+            return resolveTopicMessageType(admin, conn, topic, admin.examineBrokerClusterInfo());
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private static String resolveTopicMessageType(
+        DefaultMQAdminExt admin, JsonObject conn, String topic, ClusterInfo clusterInfo) {
+        try {
             TopicRouteData route = admin.examineTopicRouteInfo(topic);
             if (route.getQueueDatas() == null || route.getQueueDatas().isEmpty()) {
                 return null;
             }
             String brokerName = route.getQueueDatas().get(0).getBrokerName();
-            ClusterInfo clusterInfo = admin.examineBrokerClusterInfo();
+            if (clusterInfo == null || clusterInfo.getBrokerAddrTable() == null) {
+                return null;
+            }
             BrokerData brokerData = clusterInfo.getBrokerAddrTable().get(brokerName);
             if (brokerData == null) {
                 return null;
@@ -2434,9 +3558,16 @@ public final class RocketMqAgent {
         }
     }
 
+    /**
+     * Slice {@code items} from {@code offset}. When {@code limit <= 0}, return all remaining items
+     * (used by the Rust adapter's single-shot full list request).
+     */
     static <T> List<T> paginate(List<T> items, int offset, int limit) {
         if (offset >= items.size()) {
             return Collections.emptyList();
+        }
+        if (limit <= 0) {
+            return new ArrayList<>(items.subList(offset, items.size()));
         }
         int end = Math.min(items.size(), offset + limit);
         return new ArrayList<>(items.subList(offset, end));
@@ -2449,9 +3580,12 @@ public final class RocketMqAgent {
         return adminClient;
     }
 
-    private static DefaultMQProducer requireProducer() {
+    private static DefaultMQProducer requireProducer() throws Exception {
         if (producer == null) {
-            throw new IllegalStateException("Producer is not initialized. Call connect first.");
+            if (cachedConnection == null) {
+                throw new IllegalStateException("Not connected. Call connect first.");
+            }
+            producer = buildProducer(cachedConnection);
         }
         return producer;
     }
@@ -2572,6 +3706,31 @@ public final class RocketMqAgent {
     static int intOrDefault(JsonObject object, String key, int fallback) {
         Integer value = integerOrNull(object, key);
         return value == null ? fallback : value;
+    }
+
+    /**
+     * Full Advanced query timeout via {@code request_timeout_ms}. Use for single-shot ops
+     * (send/admin construct/topic-config per call). Multi-phase list paths must use
+     * {@link #scaledOperationBudgetMs} so phases still fit under one Rust RPC window.
+     * Message {@code LitePullConsumer.poll} stays on {@link #MESSAGE_POLL_TIMEOUT_MS}.
+     */
+    static long operationBudgetMs(JsonObject conn) {
+        return Math.max(1_000L, intOrDefault(conn, "request_timeout_ms", DEFAULT_REQUEST_TIMEOUT_MS));
+    }
+
+    /**
+     * Scale a legacy phase baseline with Advanced query timeout. At the 30s default, baselines are
+     * unchanged (12/8/10/8); at 120s they expand 4× but never exceed the RPC window.
+     */
+    static long scaledOperationBudgetMs(JsonObject conn, long baselineMs) {
+        long requestMs = operationBudgetMs(conn);
+        long scaled = baselineMs * requestMs / DEFAULT_REQUEST_TIMEOUT_MS;
+        return Math.max(1_000L, Math.min(requestMs, scaled));
+    }
+
+    /** {@link #operationBudgetMs} clamped to {@code int} for APIs like {@code setSendMsgTimeout}. */
+    static int operationBudgetMsAsInt(JsonObject conn) {
+        return (int) Math.min(Integer.MAX_VALUE, operationBudgetMs(conn));
     }
 
     static long longOrDefault(JsonObject object, String key, long fallback) {

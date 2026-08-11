@@ -10,6 +10,7 @@ import {
   nextTransposeState,
   nextTransposeStateForRecordCount,
   transposeAnchorRowIndex,
+  transposeEndAlignmentSpacerWidth,
   transposeFieldWidth,
   transposeScrollLeftForRecord,
   visibleTransposeRecordWindow,
@@ -36,7 +37,7 @@ test("row number double click closes transpose for the same row", () => {
   });
 });
 
-test("context menu transpose closes when invoked for the current anchor row", () => {
+test("context menu transpose keeps the requested row when multiple rows are selected", () => {
   assert.deepEqual(
     nextContextTransposeState({
       showTranspose: true,
@@ -47,8 +48,8 @@ test("context menu transpose closes when invoked for the current anchor row", ()
       selectedRange: null,
     }),
     {
-      showTranspose: false,
-      transposeRowIndex: null,
+      showTranspose: true,
+      transposeRowIndex: 3,
     },
   );
 });
@@ -239,6 +240,10 @@ test("transpose state is preserved and clamped after record refresh", () => {
     showTranspose: true,
     transposeRowIndex: 2,
   });
+  assert.deepEqual(nextTransposeStateForRecordCount(true, 1, 4), {
+    showTranspose: true,
+    transposeRowIndex: 1,
+  });
   assert.deepEqual(nextTransposeStateForRecordCount(true, 1, 0), {
     showTranspose: false,
     transposeRowIndex: null,
@@ -256,15 +261,15 @@ test("calculates a horizontal record window with spacer widths", () => {
       overscan: 1,
     }),
     {
-      start: 1,
-      end: 7,
-      beforeWidth: 160,
-      afterWidth: 14880,
+      start: 3,
+      end: 9,
+      beforeWidth: 480,
+      afterWidth: 14560,
     },
   );
 });
 
-test("uses the first selected row as the transpose anchor when context row is inside row selection", () => {
+test("keeps the requested row as the transpose anchor when context row is inside row selection", () => {
   assert.equal(
     transposeAnchorRowIndex({
       requestedRowIndex: 3,
@@ -272,11 +277,11 @@ test("uses the first selected row as the transpose anchor when context row is in
       selectedRowIds: new Set([12, 13, 14]),
       selectedRange: null,
     }),
-    2,
+    3,
   );
 });
 
-test("uses the first selected cell range row as the transpose anchor when context row is inside range", () => {
+test("keeps the requested row as the transpose anchor when context row is inside range", () => {
   assert.equal(
     transposeAnchorRowIndex({
       requestedRowIndex: 5,
@@ -284,7 +289,7 @@ test("uses the first selected cell range row as the transpose anchor when contex
       selectedRowIds: new Set(),
       selectedRange: { startRow: 2, endRow: 5, startCol: 0, endCol: 2 },
     }),
-    2,
+    5,
   );
 });
 
@@ -297,7 +302,7 @@ test("caps the transpose field column width for long field names", () => {
   assert.equal(transposeFieldWidth(["a_very_long_metric_column_name"]), 220);
 });
 
-test("aligns the selected transpose record at the start of the scrollable records", () => {
+test("start alignment places the selected transpose record at its exact offset", () => {
   assert.equal(
     transposeScrollLeftForRecord({
       recordIndex: 55,
@@ -305,7 +310,34 @@ test("aligns the selected transpose record at the start of the scrollable record
       viewportWidth: 1200,
       pinnedWidth: 104,
       recordWidth: 168,
+      currentScrollLeft: 0,
+      alignment: "start",
     }),
     9240,
+  );
+});
+
+test("start alignment uses trailing space to place the final variable-width record at the left edge", () => {
+  const recordOffsets = [0, 500, 596, 692];
+  const endSpacerWidth = transposeEndAlignmentSpacerWidth({
+    viewportWidth: 300,
+    pinnedWidth: 100,
+    lastRecordWidth: 96,
+  });
+
+  assert.equal(endSpacerWidth, 104);
+  assert.equal(
+    transposeScrollLeftForRecord({
+      recordIndex: 2,
+      totalRecords: 3,
+      viewportWidth: 300,
+      pinnedWidth: 100,
+      recordWidth: 230,
+      recordOffsets,
+      currentScrollLeft: 0,
+      alignment: "start",
+      endSpacerWidth,
+    }),
+    596,
   );
 });

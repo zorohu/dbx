@@ -5,6 +5,12 @@ export function hasExistingColumnTypeChange(columns: readonly EditableStructureC
   return columns.some((column) => !!column.original && !column.markedForDrop && column.dataType !== column.original.data_type);
 }
 
+const POSTGRES_SERIAL_PSEUDO_TYPES = new Set(["smallserial", "serial", "bigserial"]);
+
+function withPostgresArrayTypes(types: readonly string[]): string[] {
+  return [...types, ...types.filter((type) => !POSTGRES_SERIAL_PSEUDO_TYPES.has(type)).map((type) => `${type}[]`)];
+}
+
 export const DATA_TYPE_OPTIONS: Record<string, string[]> = {
   mysql: [
     "tinyint",
@@ -58,7 +64,7 @@ export const DATA_TYPE_OPTIONS: Record<string, string[]> = {
     "multipolygon",
     "geometrycollection",
   ],
-  postgres: [
+  postgres: withPostgresArrayTypes([
     "smallint",
     "int2",
     "integer",
@@ -122,7 +128,7 @@ export const DATA_TYPE_OPTIONS: Record<string, string[]> = {
     "tstzrange",
     "daterange",
     "oid",
-  ],
+  ]),
   sqlite: ["integer", "real", "text", "blob", "numeric"],
   rqlite: ["integer", "real", "text", "blob", "numeric"],
   turso: ["integer", "real", "text", "blob", "numeric"],
@@ -273,6 +279,8 @@ export const DATA_TYPE_OPTIONS: Record<string, string[]> = {
   ],
   questdb: ["boolean", "ipv4", "byte", "short", "char", "int", "float", "symbol", "varchar", "string", "long", "date", "timestamp", "timestamp_ns", "double", "uuid", "binary", "long256", "geohash", "array", "interval", "decimal"],
   xugu: ["BOOLEAN", "INTEGER", "SMALLINT", "BIGINT", "FLOAT", "NUMERIC", "CHAR", "VARCHAR", "CLOB", "DATE", "TIME", "TIMESTAMP", "BINARY", "VARBINARY", "BLOB", "XML", "BOOL", "INT", "SHORT", "LONGINT", "LONG", "REAL", "DECIMAL", "TEXT", "NCHAR", "NVARCHAR", "NVARCHAR2"],
+  duckdb: ["BOOLEAN", "TINYINT", "SMALLINT", "INTEGER", "BIGINT", "HUGEINT", "UTINYINT", "USMALLINT", "UINTEGER", "UBIGINT", "FLOAT", "DOUBLE", "DECIMAL", "VARCHAR", "TEXT", "BLOB", "DATE", "TIME", "TIMESTAMP", "TIMESTAMPTZ", "INTERVAL", "UUID", "JSON"],
+  h2: ["BOOLEAN", "TINYINT", "SMALLINT", "INTEGER", "BIGINT", "IDENTITY", "DECIMAL", "NUMERIC", "REAL", "DOUBLE", "FLOAT", "CHAR", "CHARACTER", "VARCHAR", "VARCHAR_IGNORECASE", "CLOB", "BINARY", "VARBINARY", "BLOB", "DATE", "TIME", "TIMESTAMP", "TIMESTAMP WITH TIME ZONE", "UUID", "ARRAY", "JSON"],
 };
 
 const DATA_TYPE_OPTION_ALIASES: Partial<Record<DatabaseType, string>> = {
@@ -287,13 +295,20 @@ const DATA_TYPE_OPTION_ALIASES: Partial<Record<DatabaseType, string>> = {
   opengauss: "postgres",
   questdb: "questdb",
   redshift: "postgres",
+  vertica: "postgres",
   highgo: "postgres",
   uxdb: "postgres",
   vastbase: "postgres",
   kingbase: "postgres",
+  firebird: "postgres",
   dameng: "oracle",
   "oceanbase-oracle": "oracle",
   iris: "oracle",
+  yashandb: "oracle",
+  rqlite: "sqlite",
+  turso: "sqlite",
+  "cloudflare-d1": "sqlite",
+  access: "h2",
 };
 
 export function getDataTypeOptions(dbType: DatabaseType | undefined): string[] {
@@ -768,6 +783,15 @@ export function sameStructureIndexType(left: string | null | undefined, right: s
   return normalizeStructureIndexType(left) === normalizeStructureIndexType(right);
 }
 
+/** Keep selected fields removable even after they are no longer available on the table. */
+export function filterStructureIndexColumnOptions(availableColumns: readonly string[], selectedColumns: readonly string[], search = ""): string[] {
+  const availableSet = new Set(availableColumns);
+  const unavailableSelected = selectedColumns.filter((column) => column.trim() && !availableSet.has(column));
+  const options = [...new Set([...unavailableSelected, ...availableColumns])];
+  const query = search.trim().toLowerCase();
+  return query ? options.filter((column) => column.toLowerCase().includes(query)) : options;
+}
+
 export function createIndexDrafts(indexes: IndexInfo[]): EditableStructureIndex[] {
   return indexes.map((index) => ({
     id: `existing:${index.name}`,
@@ -1104,6 +1128,22 @@ export function defaultNewColumnDataType(dbType: DatabaseType | undefined, dataT
     const baseType = dataTypeOptions[0] ?? "text";
     return combineDataTypeForDatabase(dbType, baseType, getDefaultLengthForType(dbType, baseType));
   }
+
+  const options = dataTypeOptions.length > 0 ? dataTypeOptions : getDataTypeOptions(dbType);
+  const dialectKey = dbType ? (DATA_TYPE_OPTION_ALIASES[dbType] ?? dbType) : "";
+
+  if (dialectKey === "sqlite" || dialectKey === "duckdb") {
+    const textType = options.find((type) => /^text$/i.test(type.trim()));
+    return textType ?? "text";
+  }
+
+  if (options.length > 0) {
+    const preferred = options.find((type) => /^(varchar|character varying|nvarchar)$/i.test(type.trim())) ?? options.find((type) => /^(string|clob|lvarchar|text)$/i.test(type.trim())) ?? options.find((type) => /^varchar/i.test(type.trim()));
+    if (preferred) {
+      return combineDataTypeForDatabase(dbType, preferred, getDefaultLengthForType(dbType, preferred));
+    }
+  }
+
   return dbType === "sqlite" ? "text" : "varchar(255)";
 }
 
@@ -1127,7 +1167,7 @@ export function isDataTypeLengthDisabled(_dbType: DatabaseType | undefined, base
   } else if (_dbType === "manticoresearch") {
     return key !== "bit" && key !== "float_vector";
   } else if (_dbType === "postgres" || _dbType === "gaussdb" || _dbType === "kwdb" || _dbType === "opengauss" || _dbType === "highgo" || _dbType === "uxdb" || _dbType === "vastbase" || _dbType === "kingbase") {
-    return POSTGRES_TYPE_LENGTH_DISABLES.includes(key);
+    return key.endsWith("[]") || POSTGRES_TYPE_LENGTH_DISABLES.includes(key);
   } else if (isOracleLikeStructureType(_dbType)) {
     // Dameng/Oracle integer aliases have fixed precision; MySQL-style display widths generate invalid DDL.
     return ORACLE_LIKE_TYPE_LENGTH_DISABLES.includes(key);

@@ -9,12 +9,14 @@ import {
   mongoCountToQueryResult,
   mongoDistinctToQueryResult,
   mongoDocumentsToQueryResult,
+  mongoDroppedIndexesToQueryResult,
   mongoFindLogicalTotal,
   mongoIndexesToQueryResult,
   normalizeRustMongoCommand,
   parseMongoAggregateCommand,
   parseMongoCollectionStatsCommand,
   parseMongoCommand,
+  parseMongoCreateUserCommand,
   parseMongoCountDocumentsCommand,
   parseMongoDistinctCommand,
   parseMongoFindCommand,
@@ -48,6 +50,41 @@ test("normalizeRustMongoCommand preserves the desktop command contract", () => {
   assert.deepEqual(normalizeRustMongoCommand({ kind: "findOne", collection: "users", filter: "{}", projection: null, options: null }), { kind: "findOne", collection: "users", filter: "{}" });
 });
 
+test("parseMongoCreateUserCommand normalizes user and write concern documents", () => {
+  assert.deepEqual(
+    parseMongoCreateUserCommand(`db.createUser({
+      user: "test-db",
+      pwd: "test-password",
+      roles: [{ role: "readWrite", db: "db1" }]
+    }, { w: "majority", wtimeout: 5000 })`),
+    {
+      userJson: '{"user":"test-db","pwd":"test-password","roles":[{"role":"readWrite","db":"db1"}]}',
+      writeConcernJson: '{"w":"majority","wtimeout":5000}',
+    },
+  );
+  assert.equal(parseMongoCreateUserCommand('db.createUser({pwd: "missing-user", roles: []})'), null);
+  assert.equal(parseMongoCreateUserCommand('db.createUser({user: "test"}, "majority")'), null);
+});
+
+test("splitMongoCommands executes use before createUser", () => {
+  const commands = splitMongoCommands(`use admin
+
+db.createUser({
+  user: "test-db",
+  pwd: "test-password",
+  roles: [{ role: "readWrite", db: "db1" }]
+})`);
+
+  assert.deepEqual(commands.map(({ command }) => command.kind), ["use", "createUser"]);
+  const createUser = commands[1]?.command;
+  assert.equal(createUser?.kind, "createUser");
+  if (createUser?.kind === "createUser") {
+    assert.equal(JSON.parse(createUser.userJson).user, "test-db");
+    assert.match(evaluateMongoWriteSafety(createUser, { allowWrites: true }).reason || "", /high-risk operations/i);
+    assert.equal(evaluateMongoWriteSafety(createUser, { allowWrites: true, allowDangerous: true }).allowed, true);
+  }
+});
+
 test("parseMongoFindCommand parses getCollection find with chained sort skip and limit", () => {
   assert.deepEqual(parseMongoFindCommand('db.getCollection("audit.logs").find({"level":"warn"}).sort({"createdAt":-1}).skip(20).limit(10)'), {
     collection: "audit.logs",
@@ -56,6 +93,19 @@ test("parseMongoFindCommand parses getCollection find with chained sort skip and
     limit: 10,
     sort: '{"createdAt":-1}',
   });
+});
+
+test("parseMongoFindCommand preserves chained collation for execution and pagination", () => {
+  const command = parseMongoFindCommand(`db.t_user.find({name: 'xxx'})
+    .collation({ locale: "en", strength: 1 })
+    .limit(20)`);
+
+  assert.ok(command);
+  assert.equal(command.collection, "t_user");
+  assert.deepEqual(JSON.parse(command.filter), { name: "xxx" });
+  assert.deepEqual(JSON.parse(command.collation ?? "null"), { locale: "en", strength: 1 });
+  assert.equal(command.skip, 0);
+  assert.equal(command.limit, 20);
 });
 
 test("planMongoFindPagination pages unbounded find queries", () => {
@@ -1053,6 +1103,17 @@ test("mongoDocumentsToQueryResult keeps aligned extended documents for copying",
   assert.deepEqual(result.mongo_documents, documents);
   assert.deepEqual(result.mongo_copy_documents, copyDocuments);
   assert.equal(mongoDocumentsToQueryResult(documents, 5, 1, []).mongo_copy_documents, undefined);
+});
+
+test("mongoDroppedIndexesToQueryResult exposes partial failures", () => {
+  const result = mongoDroppedIndexesToQueryResult(["email_1"], 5, [{ name: "missing_1", message: "index not found" }]);
+
+  assert.deepEqual(result.columns, ["name", "status", "message"]);
+  assert.deepEqual(result.rows, [
+    ["email_1", "dropped", null],
+    ["missing_1", "failed", "index not found"],
+  ]);
+  assert.equal(result.affected_rows, 1);
 });
 
 test("mongoDocumentsToQueryResult preserves an inexact total marker", () => {

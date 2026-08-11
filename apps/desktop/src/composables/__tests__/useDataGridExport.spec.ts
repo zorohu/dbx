@@ -111,9 +111,10 @@ function createExportState(
   hasColumnSelection = false,
   visibleColumnIndexes?: number[],
   isSyntheticContext = false,
+  contextRowId?: number | null,
 ) {
   const rows = (rowDataList ?? [rowData ?? columns.map((column, index) => (column === "id" ? 1 : `value-${index}`))]).map((data, index) => ({ ...row(data), id: index + 1 }));
-  const item = rows[0]!;
+  const resolvedContextRowId = contextRowId === undefined ? (rows[0]?.id ?? null) : contextRowId;
   const selectedRowIds = ref(new Set(selectedRowIdValues));
   const options: UseDataGridExportOptions = {
     columns: computed(() => columns),
@@ -136,7 +137,7 @@ function createExportState(
     selectedCells: computed(() => selectedCellMatrix ?? selectedCellsOverride ?? { columns: [], rows: [] }),
     selectedCellMatrix: computed(() => selectedCellMatrix ?? null),
     selectedRange: computed(() => null),
-    contextCell: ref({ rowId: item.id, rowIndex: 0, col: isSyntheticContext ? 0 : -1 }),
+    contextCell: ref(resolvedContextRowId === null ? null : { rowId: resolvedContextRowId, rowIndex: 0, col: isSyntheticContext ? 0 : -1 }),
     contextSelectionIsSynthetic: ref(isSyntheticContext),
     getRowItem: (rowId) => rows.find((candidate) => candidate.id === rowId),
     selectedRowIds,
@@ -158,6 +159,42 @@ describe("useDataGridExport prepared row statements", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     clearDataGridClipboardCopy();
+  });
+
+  it("disables row copy when the result has no rows", () => {
+    const state = createExportState(editableTable, ["id", "name"], undefined, undefined, undefined, [], [], DEFAULT_DATA_GRID_EXTRACTOR_OPTIONS, false, undefined, false, null);
+
+    expect(state.canCopyRow.value).toBe(false);
+  });
+
+  it("disables row copy when rows exist but none is selected or targeted", () => {
+    const state = createExportState(editableTable, ["id", "name"], undefined, [1, "Ada"], undefined, undefined, [], DEFAULT_DATA_GRID_EXTRACTOR_OPTIONS, false, undefined, false, null);
+
+    expect(state.canCopyRow.value).toBe(false);
+  });
+
+  it("enables row copy for a valid context row without a prior selection", () => {
+    const state = createExportState(editableTable, ["id", "name"], undefined, [1, "Ada"], undefined, undefined, [], DEFAULT_DATA_GRID_EXTRACTOR_OPTIONS, false, undefined, false, 1);
+
+    expect(state.canCopyRow.value).toBe(true);
+  });
+
+  it("counts only visible non-draft rows selected for copying", () => {
+    const first = { ...row([1, "Ada"]), sourceIndex: 0 };
+    const draft = { ...row([2, "Draft"]), id: 2, sourceIndex: 1, isDraft: true };
+    const state = createMongoExportState({
+      columns: ["id", "name"],
+      item: first,
+      items: [first, draft],
+      mongoDocuments: [
+        { id: 1, name: "Ada" },
+        { id: 2, name: "Draft" },
+      ],
+      selectedRowIds: new Set([1, 2, 999]),
+    });
+
+    expect(state.copyRowCount.value).toBe(1);
+    expect(state.canCopyRow.value).toBe(true);
   });
 
   it("builds SQL UPDATE from only selected writable columns while retaining a hidden primary key", async () => {
@@ -333,6 +370,87 @@ describe("useDataGridExport prepared row statements", () => {
     ]);
   });
 
+  it("uses escaped TSV for a multi-cell smart copy without relying on clipboard metadata", async () => {
+    const rows = [
+      [1, '{"msg":"success"}'],
+      [2, "inside\ttab\nnext line"],
+    ];
+    const matrix: CellSelectionMatrix = {
+      rowIndexes: [0, 1],
+      columnIndexes: [0, 1],
+      columns: ["id", "name"],
+      rows,
+    };
+    const text = '1\t"{""msg"":""success""}"\n2\t"inside\ttab\nnext line"';
+    vi.mocked(extractDataGridSelection).mockResolvedValueOnce({ text, mimeType: "text/tab-separated-values", fileExtension: "tsv", rowCount: 2, columnCount: 2 });
+    const state = createExportState(editableTable, ["id", "name"], matrix, undefined, undefined, rows);
+
+    await expect(state.copyWithPreference("smart")).resolves.toBe(true);
+
+    expect(extractDataGridSelection).toHaveBeenCalledWith(expect.objectContaining({ extractor: "tsv" }));
+    expect(copyToClipboard).toHaveBeenCalledWith(text);
+  });
+
+  it("preserves JSON-column text in a single-cell smart copy", async () => {
+    const tableMeta: DataGridTableMeta = {
+      tableName: "events",
+      primaryKeys: ["id"],
+      columns: [
+        { name: "id", data_type: "int", is_nullable: false, is_primary_key: true },
+        { name: "payload", data_type: "json", is_nullable: true },
+      ],
+    };
+    const payload = '{ "id": 9007199254740993, "items": [ 1, 2 ] }';
+    const matrix: CellSelectionMatrix = {
+      rowIndexes: [0],
+      columnIndexes: [1],
+      columns: ["payload"],
+      rows: [[payload]],
+    };
+    vi.mocked(extractDataGridSelection).mockResolvedValueOnce({ text: payload, mimeType: "text/plain", fileExtension: "txt", rowCount: 1, columnCount: 1 });
+    const state = createExportState(tableMeta, ["id", "payload"], matrix, [7, payload]);
+
+    await expect(state.copyWithPreference("smart")).resolves.toBe(true);
+
+    expect(extractDataGridSelection).toHaveBeenCalledWith(expect.objectContaining({ extractor: "raw", rows: [[payload]] }));
+    expect(copyToClipboard).toHaveBeenCalledWith(payload);
+  });
+
+  it("does not allow raw output for a multi-cell selection", async () => {
+    const matrix: CellSelectionMatrix = {
+      rowIndexes: [0, 1],
+      columnIndexes: [0],
+      columns: ["id"],
+      rows: [[1], [2]],
+    };
+    const state = createExportState(editableTable, ["id", "name"], matrix, undefined, undefined, [
+      [1, "Ada"],
+      [2, "Linus"],
+    ]);
+
+    expect(state.canCopyWithExtractor("raw")).toBe(false);
+    await expect(state.copyWithExtractor("raw")).resolves.toBe(false);
+    expect(extractDataGridSelection).not.toHaveBeenCalled();
+  });
+
+  it("uses the same TSV extractor for smart copy previews of multiple cells", async () => {
+    const matrix: CellSelectionMatrix = {
+      rowIndexes: [0, 1],
+      columnIndexes: [0],
+      columns: ["id"],
+      rows: [[1], [2]],
+    };
+    vi.mocked(extractDataGridSelection).mockResolvedValueOnce({ text: "1\n2", mimeType: "text/tab-separated-values", fileExtension: "tsv", rowCount: 2, columnCount: 1 });
+    const state = createExportState(editableTable, ["id", "name"], matrix, undefined, undefined, [
+      [1, "Ada"],
+      [2, "Linus"],
+    ]);
+
+    await expect(state.previewWithPreference("smart", DEFAULT_DATA_GRID_EXTRACTOR_OPTIONS)).resolves.toEqual(expect.objectContaining({ text: "1\n2" }));
+
+    expect(extractDataGridSelection).toHaveBeenCalledWith(expect.objectContaining({ extractor: "tsv" }));
+  });
+
   it("rejects SQL UPDATE when the selection contains no writable non-key column", () => {
     const matrix: CellSelectionMatrix = {
       rowIndexes: [0],
@@ -415,6 +533,53 @@ describe("useDataGridExport prepared row statements", () => {
     const state = createExportState(editableTable, ["id"], matrix, [1], undefined, undefined, [], excludePrimaryKeys);
 
     expect(state.canCopyWithExtractor("sql-inserts")).toBe(false);
+  });
+
+  it("keeps an auto-increment primary key when copying only the primary key column as INSERT", () => {
+    const autoIncrementTable: DataGridTableMeta = {
+      tableName: "users",
+      primaryKeys: ["id"],
+      columns: [
+        { name: "id", data_type: "int", is_nullable: false, is_primary_key: true, extra: "auto_increment" },
+        { name: "name", data_type: "varchar", is_nullable: false },
+      ],
+    };
+    const matrix: CellSelectionMatrix = { rowIndexes: [0], columnIndexes: [0], columns: ["id"], rows: [[1]] };
+
+    const state = createExportState(autoIncrementTable, ["id", "name"], matrix);
+
+    expect(state.canCopyWithExtractor("sql-inserts")).toBe(true);
+  });
+
+  it("supports a one-off INSERT primary-key override without changing saved options", async () => {
+    const autoIncrementTable: DataGridTableMeta = {
+      tableName: "users",
+      primaryKeys: ["id"],
+      columns: [{ name: "id", data_type: "int", is_nullable: false, is_primary_key: true, extra: "auto_increment" }],
+    };
+    const matrix: CellSelectionMatrix = { rowIndexes: [0], columnIndexes: [0], columns: ["id"], rows: [[7]] };
+    const savedOptions = {
+      ...DEFAULT_DATA_GRID_EXTRACTOR_OPTIONS,
+      sql: { ...DEFAULT_DATA_GRID_EXTRACTOR_OPTIONS.sql, excludePrimaryKeysFromInsert: true },
+    };
+    const includePrimaryKeys = {
+      ...savedOptions,
+      sql: { ...savedOptions.sql, excludePrimaryKeysFromInsert: false },
+    };
+    vi.mocked(extractDataGridSelection).mockResolvedValueOnce({
+      text: "INSERT INTO `users` (`id`) VALUES (7);",
+      mimeType: "text/sql",
+      fileExtension: "sql",
+      rowCount: 1,
+      columnCount: 1,
+    });
+    const state = createExportState(autoIncrementTable, ["id"], matrix, [7], undefined, undefined, [], savedOptions);
+
+    expect(state.canCopyWithExtractor("sql-inserts")).toBe(false);
+    expect(state.canCopyWithExtractor("sql-inserts", includePrimaryKeys)).toBe(true);
+    await expect(state.copyWithExtractor("sql-inserts", includePrimaryKeys)).resolves.toBe(true);
+    expect(extractDataGridSelection).toHaveBeenCalledWith(expect.objectContaining({ options: expect.objectContaining({ sql: expect.objectContaining({ excludePrimaryKeysFromInsert: false }) }) }));
+    expect(savedOptions.sql.excludePrimaryKeysFromInsert).toBe(true);
   });
 
   it("sends only selected values for non-SQL extraction and marks column selections", async () => {
@@ -643,5 +808,113 @@ describe("useDataGridExport prepared row statements", () => {
       }),
     );
     expect(extractDataGridSelection).not.toHaveBeenCalled();
+  });
+
+  it("uses the Mongo update formatter for SQL Updates", async () => {
+    const item = { ...row(['ObjectId("507f1f77bcf86cd799439011")', "Alice"]), sourceIndex: 0 };
+    const state = createMongoExportState({
+      columns: ["_id", "name"],
+      item,
+      mongoDocuments: [{ _id: { $oid: "507f1f77bcf86cd799439011" }, name: "Alice" }],
+      selectedCellMatrix: {
+        rowIndexes: [0],
+        columnIndexes: [0, 1],
+        columns: ["_id", "name"],
+        rows: [[item.data[0], item.data[1]]],
+      },
+    });
+
+    expect(state.canCopyWithExtractor("sql-updates")).toBe(true);
+    await expect(state.copyWithExtractor("sql-updates")).resolves.toBe(true);
+
+    const copied = vi.mocked(copyToClipboard).mock.calls[0]?.[0] ?? "";
+    expect(copied).toContain('db.getCollection("documents")');
+    expect(copied).toContain(".updateOne(");
+    expect(copied).toContain('"_id": ObjectId("507f1f77bcf86cd799439011")');
+    expect(copied).toContain('"name": "Alice"');
+    expect(extractDataGridSelection).not.toHaveBeenCalled();
+  });
+
+  it("updates only explicitly selected Mongo fields while keeping _id as the filter", async () => {
+    const item = { ...row(['ObjectId("507f1f77bcf86cd799439011")', "Alice", "active"]), sourceIndex: 0 };
+    const state = createMongoExportState({
+      columns: ["_id", "name", "status"],
+      item,
+      mongoDocuments: [{ _id: { $oid: "507f1f77bcf86cd799439011" }, name: "Alice", status: "active" }],
+      selectedCellMatrix: {
+        rowIndexes: [0],
+        columnIndexes: [1],
+        columns: ["name"],
+        rows: [[item.data[1]]],
+      },
+    });
+
+    expect(state.canCopyWithExtractor("sql-updates")).toBe(true);
+    await expect(state.copyWithExtractor("sql-updates")).resolves.toBe(true);
+
+    const copied = vi.mocked(copyToClipboard).mock.calls[0]?.[0] ?? "";
+    expect(copied).toContain('"_id": ObjectId("507f1f77bcf86cd799439011")');
+    expect(copied).toContain('"name": "Alice"');
+    expect(copied).not.toContain('"status"');
+  });
+
+  it("does not expose Mongo SQL Updates for an _id-only selection", async () => {
+    const item = { ...row(['ObjectId("507f1f77bcf86cd799439011")', "Alice"]), sourceIndex: 0 };
+    const state = createMongoExportState({
+      columns: ["_id", "name"],
+      item,
+      mongoDocuments: [{ _id: { $oid: "507f1f77bcf86cd799439011" }, name: "Alice" }],
+      selectedCellMatrix: {
+        rowIndexes: [0],
+        columnIndexes: [0],
+        columns: ["_id"],
+        rows: [[item.data[0]]],
+      },
+    });
+
+    expect(state.canCopyWithExtractor("sql-updates")).toBe(false);
+    await expect(state.copyWithExtractor("sql-updates")).resolves.toBe(false);
+    expect(copyToClipboard).not.toHaveBeenCalled();
+  });
+
+  it("filters new and deleted Mongo rows from SQL Updates", async () => {
+    const current = { ...row(['ObjectId("507f1f77bcf86cd799439011")', "Alice"]), id: 1, sourceIndex: 0 };
+    const added = { ...row(['ObjectId("507f1f77bcf86cd799439012")', "New"]), id: 2, sourceIndex: 1, isNew: true };
+    const deleted = { ...row(['ObjectId("507f1f77bcf86cd799439013")', "Deleted"]), id: 3, sourceIndex: 2, isDeleted: true };
+    const state = createMongoExportState({
+      columns: ["_id", "name"],
+      item: current,
+      items: [current, added, deleted],
+      mongoDocuments: [
+        { _id: { $oid: "507f1f77bcf86cd799439011" }, name: "Alice" },
+        { _id: { $oid: "507f1f77bcf86cd799439012" }, name: "New" },
+        { _id: { $oid: "507f1f77bcf86cd799439013" }, name: "Deleted" },
+      ],
+      selectedRowIds: new Set([1, 2, 3]),
+    });
+
+    expect(state.canCopyWithExtractor("sql-updates")).toBe(true);
+    await expect(state.copyWithExtractor("sql-updates")).resolves.toBe(true);
+
+    const copied = vi.mocked(copyToClipboard).mock.calls[0]?.[0] ?? "";
+    expect(copied.match(/\.updateOne\(/g)).toHaveLength(1);
+    expect(copied).toContain('"name": "Alice"');
+    expect(copied).not.toContain('"name": "New"');
+    expect(copied).not.toContain('"name": "Deleted"');
+  });
+
+  it("does not expose Mongo SQL Updates without an explicit update target", async () => {
+    const item = { ...row(["507f1f77bcf86cd799439011", "Alice"]), sourceIndex: 0 };
+    const state = createMongoExportState({
+      columns: ["_id", "name"],
+      item,
+      mongoDocuments: [{ _id: { $oid: "507f1f77bcf86cd799439011" }, name: "Alice" }],
+      mongoUpdateTarget: false,
+    });
+
+    expect(state.canCopyWithExtractor("sql-updates")).toBe(false);
+    await expect(state.copyWithExtractor("sql-updates")).resolves.toBe(false);
+    expect(extractDataGridSelection).not.toHaveBeenCalled();
+    expect(copyToClipboard).not.toHaveBeenCalled();
   });
 });

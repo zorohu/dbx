@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it as test } from "vitest";
 import { createI18n } from "vue-i18n";
 import { translateBackendError, type BackendErrorTranslate } from "@/i18n/backend-errors";
+import { BackendErrorException, formatError, normalizeBackendError, sanitizeBackendErrorMessage } from "@/lib/backend/errorUtils";
 import en from "@/i18n/locales/en";
 import es from "@/i18n/locales/es";
 import it from "@/i18n/locales/it";
@@ -10,6 +11,7 @@ import ko from "@/i18n/locales/ko";
 import ptBR from "@/i18n/locales/pt-BR";
 import zhCN from "@/i18n/locales/zh-CN";
 import zhTW from "@/i18n/locales/zh-TW";
+import { PHOENIX_DRIVER_NOT_INSTALLED_ERROR, PHOENIX_JDBC_PLUGIN_NOT_INSTALLED_ERROR } from "@/lib/database/phoenixConnection";
 
 const LOCALES = {
   en,
@@ -23,6 +25,21 @@ const LOCALES = {
 } as const;
 
 type LocaleKey = keyof typeof LOCALES;
+
+const STRUCTURED_BACKEND_ERROR_KEYS = [
+  "backendErrors.jdbc.connectionFailed",
+  "backendErrors.jdbc.connectionInterrupted",
+  "backendErrors.jdbc.operationTimedOut",
+  "backendErrors.jdbc.operationCanceled",
+  "backendErrors.jdbc.busyRetryLater",
+  "backendErrors.jdbc.runtimeReplaced",
+  "backendErrors.jdbc.sqlFailed",
+  "backendErrors.jdbc.protocolFailed",
+  "backendErrors.jdbc.contractInvalid",
+  "backendErrors.jdbc.legacyFailure",
+  "backendErrors.legacy",
+  "backendErrors.unknown",
+] as const;
 
 // Reproduces the exact string crates/dbx-core/src/agent_service.rs builds on
 // Windows: `\` line continuations strip the newline plus the following indent.
@@ -39,10 +56,19 @@ const WINDOWS_JRE_REMOVE_ERROR = [
 // key and params it must resolve to.
 const CASES: { name: string; message: string; key: string; params?: Record<string, string> }[] = [
   {
-    name: "XLSX row limit",
-    message: "XLSX supports at most 1,048,575 data rows. Use CSV export for the full result.",
-    key: "exportProgress.xlsxRowLimit",
-    params: { limit: "1,048,575" },
+    name: "Apache Phoenix JDBC driver missing",
+    message: PHOENIX_DRIVER_NOT_INSTALLED_ERROR,
+    key: "connection.phoenixDriverNotInstalled",
+  },
+  {
+    name: "shared JDBC plugin missing for Apache Phoenix",
+    message: PHOENIX_JDBC_PLUGIN_NOT_INSTALLED_ERROR,
+    key: "connection.phoenixDriverNotInstalled",
+  },
+  {
+    name: "SSH TOTP prompt cancelled",
+    message: "SSH layer 1 failed: SSH keyboard-interactive authentication was cancelled",
+    key: "connection.sshTotpCancelled",
   },
   {
     name: "streaming export unsupported",
@@ -89,6 +115,11 @@ const CASES: { name: string; message: string; key: string; params?: Record<strin
     params: { labels: "Prod MySQL, Stage PG" },
   },
   {
+    name: "GBase 8s server name mismatch",
+    message: "Agent RPC error (-1): java.sql.SQLException: GBASEDBTSERVER 与 DBSERVERNAME 或 DBSERVERALIASES 不匹配。",
+    key: "connection.gbaseServerMismatch",
+  },
+  {
     name: "Kafka topic unload unsupported",
     message: "Kafka does not support unloading topics",
     key: "mqClients.unloadTopicUnsupportedKafka",
@@ -131,6 +162,12 @@ describe("backend error translation", () => {
   // alongside the other non-English locales.
   const localeKeys = Object.keys(LOCALES) as LocaleKey[];
 
+  test.each(localeKeys)("all structured catalog keys exist in %s", (locale) => {
+    for (const key of STRUCTURED_BACKEND_ERROR_KEYS) {
+      expect(lookup(LOCALES[locale] as unknown as Record<string, unknown>, key), `${locale}:${key}`).toEqual(expect.any(String));
+    }
+  });
+
   describe.each(localeKeys)("in %s", (locale) => {
     const t = translatorFor(locale);
 
@@ -155,6 +192,23 @@ describe("backend error translation", () => {
     expect(translateBackendError(t, "some driver specific failure")).toBe("some driver specific failure");
   });
 
+  test("hides internal Agent error data from user-facing messages", () => {
+    const t = translatorFor("zh-CN");
+    const message = 'Agent RPC error (-1): driver: bad connection\nDBX_AGENT_ERROR_DATA:{"category":null,"retryable":null,"sessionDisposition":null,"stage":null,"operationOutcome":null,"agentSessionId":"e1a4d0a2907947b8adf31abb10c4dff9"}';
+    const expected = "Agent RPC error (-1): driver: bad connection";
+
+    expect(sanitizeBackendErrorMessage(message)).toBe(expected);
+    expect(formatError(new Error(message))).toBe(expected);
+    expect(new BackendErrorException(message).message).toBe(expected);
+    expect(translateBackendError(t, message)).toBe(expected);
+  });
+
+  test("preserves marker-like database messages without valid internal data", () => {
+    const message = "database returned\nDBX_AGENT_ERROR_DATA:not-json";
+
+    expect(sanitizeBackendErrorMessage(message)).toBe(message);
+  });
+
   test("normalizes Error and structural message objects before translation", () => {
     const t = translatorFor("zh-CN");
     const message = "file does not exist: /tmp/missing.sqlite";
@@ -162,6 +216,191 @@ describe("backend error translation", () => {
 
     expect(translateBackendError(t, new Error(message))).toBe(expected);
     expect(translateBackendError(t, { message })).toBe(expected);
+  });
+
+  test("preserves and translates structured BackendError envelopes", () => {
+    const t = translatorFor("zh-CN");
+    const error = {
+      version: 1,
+      code: "DBX-JDBC-2002",
+      messageKey: "backendErrors.jdbc.operationTimedOut",
+      messageParams: { stage: "execute" },
+      source: "jdbcAgent",
+      operationOutcome: "unknown",
+      detail: "relation dbx_table_that_does_not_exist does not exist",
+    } as const;
+
+    expect(normalizeBackendError(error)).toEqual(error);
+    const expected = `${t(error.messageKey, error.messageParams)}\n\n${error.detail}`;
+    expect(translateBackendError(t, error)).toBe(expected);
+    expect(translateBackendError(t, new BackendErrorException(error))).toBe(expected);
+  });
+
+  test("shows the database detail after an unclassified Agent summary", () => {
+    const t = translatorFor("zh-CN");
+    const error = {
+      version: 1,
+      code: "DBX-JDBC-9001",
+      messageKey: "backendErrors.jdbc.legacyFailure",
+      messageParams: {},
+      source: "jdbcAgentLegacy",
+      operationOutcome: "unknown",
+      detail: "Table dbx_table_that_does_not_exist does not exist",
+    } as const;
+
+    expect(translateBackendError(t, error)).toBe(`${t(error.messageKey)}\n\n${error.detail}`);
+  });
+
+  test("shows a native adapter code with the DuckDB detail", () => {
+    const t = translatorFor("en");
+    const error = {
+      version: 1,
+      code: "DBX-JDBC-4001",
+      messageKey: "backendErrors.jdbc.sqlFailed",
+      messageParams: { stage: "execute" },
+      source: "jdbcAgent",
+      operationOutcome: "unknown",
+      origin: { subsystem: "database", adapter: "native", driver: "duckdb" },
+      diagnostics: { category: "sql", stage: "execute", adapterCode: "duckdb_execute_failed" },
+      detail: "Catalog Error: Table missing_table does not exist",
+    } as const;
+
+    expect(translateBackendError(t, error)).toBe(`${t(error.messageKey, error.messageParams)}\n\n[duckdb_execute_failed] ${error.detail}`);
+  });
+
+  test("hides internal Agent error data from structured error details", () => {
+    const t = translatorFor("zh-CN");
+    const detail = 'driver: bad connection\nDBX_AGENT_ERROR_DATA:{"category":null,"agentSessionId":"session-1"}';
+    const error = {
+      version: 1,
+      code: "DBX-JDBC-9001",
+      messageKey: "backendErrors.jdbc.legacyFailure",
+      messageParams: {},
+      source: "jdbcAgentLegacy",
+      operationOutcome: "unknown",
+      detail,
+    } as const;
+
+    expect(translateBackendError(t, error)).toBe(`${t(error.messageKey)}\n\ndriver: bad connection`);
+  });
+
+  test.each([
+    ["array params", { messageParams: ["execute"] }],
+    ["nested params", { messageParams: { stage: { name: "execute" } } }],
+    ["non-finite params", { messageParams: { retryAfter: Number.POSITIVE_INFINITY } }],
+    ["non-string detail", { detail: 42 }],
+    ["object detail", { detail: { message: "database failure" } }],
+    ["non-string source", { source: 42 }],
+    ["unknown outcome", { operationOutcome: "completed" }],
+  ])("rejects malformed structured envelopes with %s", (_name, override) => {
+    expect(
+      normalizeBackendError({
+        version: 1,
+        code: "DBX-JDBC-2002",
+        messageKey: "backendErrors.jdbc.operationTimedOut",
+        messageParams: { stage: "execute" },
+        source: "jdbcAgent",
+        operationOutcome: "unknown",
+        ...override,
+      }),
+    ).toBeNull();
+  });
+
+  test("accepts unknown compatibility sources and extensible origins", () => {
+    const error = normalizeBackendError({
+      version: 1,
+      code: "DBX-DB-4001",
+      messageKey: "backendErrors.jdbc.sqlFailed",
+      messageParams: { stage: "execute" },
+      source: "nativeDatabase",
+      operationOutcome: "unknown",
+      origin: { subsystem: "database", adapter: "native", driver: "postgresql" },
+      detail: "relation missing_table does not exist",
+    });
+    expect(error?.source).toBe("nativeDatabase");
+    expect(error?.origin?.driver).toBe("postgresql");
+  });
+
+  test("falls back to legacy text for plain HTTP and Tauri failures", () => {
+    const t = translatorFor("zh-CN");
+    const error = new BackendErrorException("legacy backend failure");
+    expect(error.backendError.code).toBe("DBX-LEGACY-0001");
+    expect(translateBackendError(t, error)).toBe(`${t("backendErrors.legacy")}\n\nlegacy backend failure`);
+  });
+
+  test("preserves JSON envelopes carried by strings and Error messages", () => {
+    const envelope = {
+      version: 1,
+      code: "DBX-JDBC-4001",
+      messageKey: "backendErrors.jdbc.sqlFailed",
+      messageParams: { stage: "execute" },
+      source: "jdbcAgent",
+      operationOutcome: "unknown",
+      detail: "relation missing_table does not exist",
+    } as const;
+    expect(normalizeBackendError(JSON.stringify(envelope))).toEqual(envelope);
+    expect(normalizeBackendError(new Error(JSON.stringify(envelope)))).toEqual(envelope);
+  });
+
+  test("retains bounded diagnostics from unknown rejection objects", () => {
+    const error = new BackendErrorException({ reason: "database worker returned a vendor diagnostic" });
+    expect(error.backendError.code).toBe("DBX-LEGACY-0001");
+    expect(error.backendError.detail).toBe("database worker returned a vendor diagnostic");
+    expect(new BackendErrorException({ reason: "x".repeat(70_000) }).backendError.detail).toHaveLength(64 * 1024);
+  });
+
+  test("normalizes structured errors across Error realms and module copies", () => {
+    const envelope = {
+      version: 1,
+      code: "DBX-JDBC-5001",
+      messageKey: "backendErrors.jdbc.protocolFailed",
+      messageParams: {},
+      source: "jdbcAgent" as const,
+      operationOutcome: "unknown" as const,
+      detail: "connection reset by peer",
+    };
+    const copiedError = Object.assign(new Error("Backend request failed"), {
+      name: "BackendErrorException",
+      backendError: envelope,
+    });
+    const workerError = { name: "BackendErrorException", message: JSON.stringify(envelope) };
+
+    expect(normalizeBackendError(copiedError)).toEqual(envelope);
+    expect(normalizeBackendError(workerError)).toEqual(envelope);
+  });
+
+  test("does not recurse forever through cyclic error wrappers", () => {
+    const self: Record<string, unknown> = {};
+    self.error = self;
+    expect(normalizeBackendError(self)).toBeNull();
+    expect(() => new BackendErrorException(self)).not.toThrow();
+
+    const first: Record<string, unknown> = {};
+    const second: Record<string, unknown> = {};
+    first.backendError = second;
+    second.error = first;
+    expect(normalizeBackendError(first)).toBeNull();
+    expect(() => new BackendErrorException(first)).not.toThrow();
+  });
+
+  test("stops at a finite wrapper depth", () => {
+    let wrapper: Record<string, unknown> = { error: { message: "deep legacy error" } };
+    for (let index = 0; index < 32; index += 1) wrapper = { backendError: wrapper };
+
+    expect(normalizeBackendError(wrapper)).toBeNull();
+  });
+
+  test("does not stringify a structured envelope as [object Object]", () => {
+    expect(
+      formatError({
+        version: 1,
+        code: "DBX-JDBC-5001",
+        messageKey: "backendErrors.jdbc.protocolFailed",
+        messageParams: {},
+        source: "jdbcAgent",
+        operationOutcome: "unknown",
+      }),
+    ).toBe("DBX-JDBC-5001");
   });
 });
 
@@ -172,7 +411,6 @@ describe("backend error wording is pinned to the Rust sources", () => {
   const rust = (path: string) => readFileSync(new URL(`../../../../../${path}`, import.meta.url), "utf8");
 
   test.each([
-    ["crates/dbx-core/src/query_result_export.rs", "XLSX supports at most 1,048,575 data rows. Use CSV export for the full result."],
     ["crates/dbx-core/src/query_result_export.rs", "Streaming export is unsupported for this query. Simplify it or use a supported driver."],
     ["crates/dbx-core/src/query_result_export.rs", "Streaming export needs a result-set session, but this driver returned no session_id."],
     ["crates/dbx-core/src/agent_service.rs", "Failed to remove the old JRE directory: "],

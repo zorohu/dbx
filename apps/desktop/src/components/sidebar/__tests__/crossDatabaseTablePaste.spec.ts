@@ -4,6 +4,15 @@ import { describe, expect, it } from "vitest";
 const runtimeSource = readFileSync(new URL("../SidebarTreeRuntimeHost.vue", import.meta.url), "utf8");
 
 describe("cross-database table paste", () => {
+  it("keeps the live node active after async tree loads", () => {
+    expect(runtimeSource).toContain("function emitNodeToggled(node: TreeNode, wasExpanded: boolean, expandedOverride?: boolean)");
+    expect(runtimeSource).toContain("findSidebarActionTarget(connectionStore.treeNodes, createSidebarActionTarget(node)) ?? node");
+    expect(runtimeSource).toContain("activeNode.value = liveNode");
+    expect(runtimeSource).toContain("emitNodeToggled(node, wasExpanded, false)");
+    expect(runtimeSource).toMatch(/await connectionStore\.loadMongoDatabases\(node\.connectionId\);[\s\S]*?emitNodeToggled\(node, wasExpanded\)/);
+    expect(runtimeSource).toContain("connectionStore.cancelTreeNodeLoad(node.id)");
+  });
+
   it("routes a table clipboard from another context to data transfer", () => {
     expect(runtimeSource).toContain("function canTransferTreeClipboardToCurrentNode()");
     expect(runtimeSource).toContain("function openTransferFromTreeClipboard()");
@@ -16,5 +25,20 @@ describe("cross-database table paste", () => {
   it("retains the local duplicate-table paste path", () => {
     expect(runtimeSource).toContain("if (canTransferTreeClipboardToCurrentNode()) return openTransferFromTreeClipboard();");
     expect(runtimeSource).toContain("pasteTableMode.value = defaultPasteTableMode(currentDatabaseType());");
+    expect(runtimeSource).toContain('normalizeNewTargetName: mode === "structure-and-data"');
+  });
+
+  it("carries table comments through the local sidebar paste path", () => {
+    expect(runtimeSource).toMatch(/tableName: node\.label,\s*tableComment: node\.comment/);
+    expect(runtimeSource).toMatch(/targetName: `\$\{entry\.tableName\}_copy`,[\s\S]*?tableComment: entry\.tableComment/);
+    expect(runtimeSource).toMatch(/targetName,\s*tableComment: entry\.tableComment/);
+    expect(runtimeSource).toContain("executeAsScript: plan.executeAsScript");
+  });
+
+  it("uses the shared metadata-aware structure plan for duplicate and paste", () => {
+    expect(runtimeSource).toContain("buildDuplicateTableStructurePlan");
+    expect(runtimeSource).toMatch(/buildDuplicateTableStructurePlan\(\{[\s\S]*?connectionId: node\.connectionId[\s\S]*?sourceName: node\.label[\s\S]*?tableComment: node\.comment/);
+    expect(runtimeSource).toMatch(/buildDuplicateTableStructurePlan\(\{[\s\S]*?connectionId: entry\.connectionId[\s\S]*?sourceName: entry\.sourceName[\s\S]*?tableComment: entry\.tableComment/);
+    expect(runtimeSource).toContain("sourceColumns = plan.sourceColumns");
   });
 });

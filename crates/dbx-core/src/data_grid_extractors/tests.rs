@@ -51,6 +51,27 @@ fn extracts_csv_with_minimal_standard_quoting() {
 }
 
 #[test]
+fn extracts_raw_values_without_escaping_quotes() {
+    let mut request = request(DataGridExtractorId::Raw);
+    request.columns = vec![column("payload", 0)];
+    request.selected_column_indexes = vec![0];
+    request.rows = vec![vec![json!(r#"{"msg":"success"}"#)]];
+
+    let result = extract_data_grid_selection(request).expect("raw extraction");
+
+    assert_eq!(result.text, r#"{"msg":"success"}"#);
+    assert_eq!(result.mime_type, "text/plain");
+}
+
+#[test]
+fn raw_rejects_multiple_selected_cells() {
+    let error =
+        extract_data_grid_selection(request(DataGridExtractorId::Raw)).expect_err("raw must reject multiple cells");
+
+    assert_eq!(error.code, DataGridExtractErrorCode::InvalidRawSelection);
+}
+
+#[test]
 fn csv_distinguishes_null_from_null_string() {
     let mut request = request(DataGridExtractorId::Csv);
     request.rows = vec![vec![json!(1), Value::Null], vec![json!(2), json!("NULL")]];
@@ -486,18 +507,54 @@ fn sql_insert_skips_generated_and_computed_columns() {
     let result = extract_data_grid_selection(request).expect("SQL INSERT extraction");
     assert!(result.text.contains("name"));
     assert!(!result.text.contains("search_text"));
-    assert!(!result.text.contains("(id,"));
-    assert_eq!(result.omitted_columns, vec!["id", "search_text"]);
+    assert!(result.text.contains("(\"id\", \"name\")"));
+    assert_eq!(result.omitted_columns, vec!["search_text"]);
 
     let included =
         extract_data_grid_selection(include_computed_request).expect("SQL INSERT extraction with computed columns");
     assert!(included.text.contains("search_text"));
-    assert_eq!(included.omitted_columns, vec!["id"]);
+    assert!(included.omitted_columns.is_empty());
 
     let included =
         extract_data_grid_selection(include_generated_request).expect("SQL INSERT extraction with generated columns");
     assert!(included.text.contains("(\"id\", \"name\")"));
     assert_eq!(included.omitted_columns, vec!["search_text"]);
+}
+
+#[test]
+fn sql_insert_keeps_autoincrement_primary_key_by_default() {
+    let mut request = request(DataGridExtractorId::SqlInserts);
+    request.table_meta = Some(DataGridTableMeta {
+        catalog: None,
+        database: None,
+        schema: None,
+        table_name: "users".to_string(),
+        primary_keys: vec!["id".to_string()],
+        columns: Some(vec![
+            DataGridColumnInfo {
+                name: "id".to_string(),
+                data_type: "int".to_string(),
+                is_nullable: false,
+                is_primary_key: true,
+                column_default: None,
+                extra: Some("auto_increment".to_string()),
+            },
+            DataGridColumnInfo {
+                name: "name".to_string(),
+                data_type: "varchar".to_string(),
+                is_nullable: false,
+                is_primary_key: false,
+                column_default: None,
+                extra: None,
+            },
+        ]),
+    });
+
+    let result = extract_data_grid_selection(request).expect("SQL INSERT extraction");
+
+    assert!(result.text.contains("INSERT INTO \"users\" (\"id\", \"name\")"));
+    assert!(result.text.contains("(1, 'Ada')"));
+    assert!(result.omitted_columns.is_empty());
 }
 
 #[test]

@@ -41,12 +41,17 @@ export function buildProcedureExecutionSql(options: BuildRoutineExecutionSqlOpti
 export function buildProcedureExecutionSqlFromValues(options: BuildRoutineExecutionSqlOptions & { parameters: RoutineParameterValue[] }): string {
   const routine = qualifiedRoutineName(options);
   const sortedParameters = [...options.parameters].sort((a, b) => a.ordinal - b.ordinal);
+  if (options.databaseType === "sqlserver") {
+    return buildSqlServerProcedureExecutionSql(routine, sortedParameters);
+  }
+  if (options.databaseType === "mysql") {
+    return buildMySqlProcedureExecutionSql(routine, sortedParameters);
+  }
+  if (options.databaseType === "xugu") {
+    return buildXuguProcedureExecutionSql(routine, sortedParameters);
+  }
   const values = sortedParameters.filter((parameter) => shouldIncludeParameter(parameter));
   const useNamedArguments = shouldUseNamedArguments(options.databaseType, sortedParameters);
-  if (options.databaseType === "sqlserver") {
-    const args = values.map((parameter) => `${sqlServerParameterName(parameter.name)} = ${routineParameterSqlValue(options.databaseType, parameter)}`).join(", ");
-    return args ? `EXEC ${routine} ${args};` : `EXEC ${routine};`;
-  }
   if (options.databaseType === "oracle" || options.databaseType === "dameng" || options.databaseType === "oceanbase-oracle") {
     return `BEGIN\n  ${routine}(${values.map((parameter) => routineArgumentSql(options.databaseType, parameter, useNamedArguments)).join(", ")});\nEND;`;
   }
@@ -54,6 +59,30 @@ export function buildProcedureExecutionSqlFromValues(options: BuildRoutineExecut
     return `CALL PROCEDURE ${routine}(${values.map((parameter) => routineArgumentSql(options.databaseType, parameter, useNamedArguments)).join(", ")});`;
   }
   return `CALL ${routine}(${values.map((parameter) => routineArgumentSql(options.databaseType, parameter, useNamedArguments)).join(", ")});`;
+}
+
+function buildXuguProcedureExecutionSql(routine: string, sortedParameters: RoutineParameterValue[]): string {
+  const callableParameters = sortedParameters.filter((parameter) => parameter.mode !== "RETURN");
+  const useNamedArguments = shouldUseXuguNamedArguments(callableParameters);
+  const args = callableParameters.flatMap((parameter) => {
+    if (parameter.useDefault && parameter.hasDefault && acceptsRoutineInput(parameter)) return [];
+    const value = parameter.mode === "OUT" ? "NULL" : routineParameterSqlValue("xugu", parameter);
+    if (!useNamedArguments) return [value];
+    return [`${quoteTableIdentifier("xugu", parameter.name)} => ${value}`];
+  });
+  return `CALL ${routine}(${args.join(", ")});`;
+}
+
+function shouldUseXuguNamedArguments(parameters: RoutineParameterValue[]): boolean {
+  let omittedDefault = false;
+  for (const parameter of parameters) {
+    if (parameter.useDefault && parameter.hasDefault && acceptsRoutineInput(parameter)) {
+      omittedDefault = true;
+      continue;
+    }
+    if (omittedDefault) return parameters.every((item) => !!item.name);
+  }
+  return false;
 }
 
 export function shouldIncludeParameter(parameter: RoutineParameterValue): boolean {
@@ -76,6 +105,73 @@ export function routineParameterSqlValue(databaseType: DatabaseType | undefined,
 
 function sqlServerParameterName(name: string): string {
   return name.startsWith("@") ? name : `@${name}`;
+}
+
+function buildMySqlProcedureExecutionSql(routine: string, sortedParameters: RoutineParameterValue[]): string {
+  const outputBindings = new Map<RoutineParameterValue, { variableName: string; alias: string }>();
+  const initializations: string[] = [];
+
+  sortedParameters.forEach((parameter, index) => {
+    if (!returnsRoutineOutput(parameter)) return;
+    const variableName = `@dbx_output_${index + 1}`;
+    const initialValue = parameter.mode === "INOUT" ? routineParameterSqlValue("mysql", parameter) : "NULL";
+    initializations.push(`SET ${variableName} = ${initialValue};`);
+    outputBindings.set(parameter, {
+      variableName,
+      alias: quoteTableIdentifier("mysql", parameter.name.replace(/^@/, "") || `output_${index + 1}`),
+    });
+  });
+
+  const args = sortedParameters.flatMap((parameter) => {
+    const outputBinding = outputBindings.get(parameter);
+    if (outputBinding) return [outputBinding.variableName];
+    if (!shouldIncludeParameter(parameter)) return [];
+    return [routineParameterSqlValue("mysql", parameter)];
+  });
+  const statements = [...initializations, `CALL ${routine}(${args.join(", ")});`];
+  if (outputBindings.size > 0) {
+    statements.push(`SELECT ${[...outputBindings.values()].map(({ variableName, alias }) => `${variableName} AS ${alias}`).join(", ")};`);
+  }
+  return statements.join("\n");
+}
+
+function buildSqlServerProcedureExecutionSql(routine: string, sortedParameters: RoutineParameterValue[]): string {
+  const outputBindings = new Map<RoutineParameterValue, { variableName: string; alias: string }>();
+  const declarations: string[] = [];
+
+  sortedParameters.forEach((parameter, index) => {
+    if (!returnsRoutineOutput(parameter)) return;
+    if (parameter.mode === "INOUT" && parameter.useDefault && parameter.hasDefault) return;
+    const declarationType = parameter.dataType.trim();
+    if (!declarationType) return;
+
+    const variableName = `@dbx_output_${index + 1}`;
+    const initialValue = parameter.mode === "INOUT" ? ` = ${routineParameterSqlValue("sqlserver", parameter)}` : "";
+    declarations.push(`DECLARE ${variableName} ${declarationType}${initialValue};`);
+    outputBindings.set(parameter, {
+      variableName,
+      alias: quoteTableIdentifier("sqlserver", parameter.name.replace(/^@/, "") || `output_${index + 1}`),
+    });
+  });
+
+  const args = sortedParameters.flatMap((parameter) => {
+    const outputBinding = outputBindings.get(parameter);
+    if (outputBinding) {
+      return [`${sqlServerParameterName(parameter.name)} = ${outputBinding.variableName} OUTPUT`];
+    }
+    if (returnsRoutineOutput(parameter) || !shouldIncludeParameter(parameter)) return [];
+    return [`${sqlServerParameterName(parameter.name)} = ${routineParameterSqlValue("sqlserver", parameter)}`];
+  });
+  const statements = [...declarations, args.length > 0 ? `EXEC ${routine} ${args.join(", ")};` : `EXEC ${routine};`];
+
+  if (outputBindings.size > 0) {
+    statements.push(`SELECT ${[...outputBindings.values()].map(({ variableName, alias }) => `${variableName} AS ${alias}`).join(", ")};`);
+  }
+  return statements.join("\n");
+}
+
+function returnsRoutineOutput(parameter: Pick<RoutineParameterValue, "mode">): boolean {
+  return parameter.mode === "OUT" || parameter.mode === "INOUT";
 }
 
 function routineArgumentSql(databaseType: DatabaseType | undefined, parameter: RoutineParameterValue, useNamedArguments: boolean): string {

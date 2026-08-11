@@ -16,18 +16,22 @@ import { translateBackendError } from "@/i18n/backend-errors";
 import { generateDatabaseExportId } from "@/lib/export/databaseExport";
 import { nextDatabaseBackupRunAt, normalizeDatabaseBackupTablePatterns, supportsScheduledDatabaseBackup, type DatabaseBackupFile, type DatabaseBackupRun, type DatabaseBackupSchedule } from "@/lib/backup/scheduledDatabaseBackup";
 import { useConnectionStore } from "@/stores/connectionStore";
+import { fetchNamespaceOptionsForConnection } from "@/composables/useDatabaseOptions";
 
 const { t, locale } = useI18n();
 const { toast } = useToast();
 const connectionStore = useConnectionStore();
-const { schedules, runs, activeScheduleIds, activeRunIds, activeRuns, saveSchedule, setScheduleEnabled, deleteSchedule, deleteRun, runSchedule, cancelRun } = useScheduledDatabaseBackups();
+const { schedules, runs, activeScheduleIds, activeRunIds, activeRuns, saveSchedule, setScheduleEnabled, deleteSchedule, deleteRun, renameRun, runSchedule, cancelRun } = useScheduledDatabaseBackups();
 
 const scheduleDialogOpen = ref(false);
 const deleteScheduleDialogOpen = ref(false);
 const deleteRunDialogOpen = ref(false);
+const renameRunDialogOpen = ref(false);
 const editingScheduleId = ref("");
 const pendingDeleteSchedule = ref<DatabaseBackupSchedule | null>(null);
 const pendingDeleteRun = ref<DatabaseBackupRun | null>(null);
+const pendingRenameRun = ref<DatabaseBackupRun | null>(null);
+const renameRunName = ref("");
 const loadingDatabases = ref(false);
 const saving = ref(false);
 const databaseOptions = ref<string[]>([]);
@@ -37,6 +41,7 @@ const tablePatternsInput = ref("");
 const expandedRunIds = reactive(new Set<string>());
 
 const sqlConnections = computed(() => connectionStore.connections.filter((connection) => supportsScheduledDatabaseBackup(connection.db_type)));
+const canCreateSchedule = computed(() => sqlConnections.value.length > 0);
 const sortedRuns = computed(() => [...runs.value].sort((left, right) => Date.parse(right.startedAt) - Date.parse(left.startedAt)));
 const weekdays = computed(() => [
   { value: 0, label: t("databaseBackup.weekdays.sunday") },
@@ -136,7 +141,8 @@ async function loadDatabases(connectionId: string, preserveSelection: boolean) {
   loadingDatabases.value = true;
   try {
     await connectionStore.ensureConnected(connectionId);
-    const names = (await api.listDatabases(connectionId)).map((database) => database.name);
+    const config = connectionStore.getConfig(connectionId);
+    const names = config?.db_type === "dameng" ? await fetchNamespaceOptionsForConnection(connectionId, config) : (await api.listDatabases(connectionId)).map((database) => database.name);
     databaseOptions.value = names;
     if (!preserveSelection) {
       selectedDatabases.value = [];
@@ -240,6 +246,22 @@ function requestDeleteRun(run: DatabaseBackupRun) {
   deleteRunDialogOpen.value = true;
 }
 
+function requestRenameRun(run: DatabaseBackupRun) {
+  if (activeRunIds.has(run.id)) return;
+  pendingRenameRun.value = run;
+  renameRunName.value = run.displayName || run.scheduleName;
+  renameRunDialogOpen.value = true;
+}
+
+function confirmRenameRun() {
+  const run = pendingRenameRun.value;
+  if (!run || !renameRunName.value.trim()) return;
+  if (!renameRun(run.id, renameRunName.value)) return;
+  renameRunDialogOpen.value = false;
+  pendingRenameRun.value = null;
+  toast(t("databaseBackup.backupRenamed"), 2500);
+}
+
 async function confirmDeleteRun() {
   const run = pendingDeleteRun.value;
   if (!run) return;
@@ -281,8 +303,9 @@ function restoreBackup(run: DatabaseBackupRun, file: DatabaseBackupFile) {
       <div class="min-w-0">
         <h3 class="text-base font-semibold">{{ t("databaseBackup.schedules") }}</h3>
         <p class="mt-1 text-sm text-muted-foreground">{{ t("databaseBackup.runtimeRequirement") }}</p>
+        <p v-if="!canCreateSchedule" class="mt-1 text-xs text-muted-foreground">{{ t("databaseBackup.noSupportedConnections") }}</p>
       </div>
-      <Button size="sm" :disabled="sqlConnections.length === 0" @click="openCreateSchedule">
+      <Button size="sm" :disabled="!canCreateSchedule" :title="canCreateSchedule ? t('databaseBackup.addSchedule') : t('databaseBackup.noSupportedConnections')" @click="openCreateSchedule">
         <Plus class="mr-2 h-4 w-4" />
         {{ t("databaseBackup.addSchedule") }}
       </Button>
@@ -338,7 +361,7 @@ function restoreBackup(run: DatabaseBackupRun, file: DatabaseBackupFile) {
             </Button>
             <div class="min-w-0">
               <div class="flex min-w-0 flex-wrap items-center gap-2">
-                <span class="truncate text-sm font-medium">{{ run.scheduleName }}</span>
+                <span class="truncate text-sm font-medium">{{ run.displayName || run.scheduleName }}</span>
                 <Badge :variant="runStatusVariant(run.status)" class="font-normal">{{ runStatusLabel(run.status) }}</Badge>
                 <Badge variant="outline" class="font-normal">{{ run.trigger === "scheduled" ? t("databaseBackup.scheduledTrigger") : t("databaseBackup.manualTrigger") }}</Badge>
               </div>
@@ -348,9 +371,18 @@ function restoreBackup(run: DatabaseBackupRun, file: DatabaseBackupFile) {
                 <span>{{ t("databaseBackup.fileCount", { count: run.files.length }) }}</span>
                 <span v-if="run.error" class="break-all text-destructive">{{ translateBackendError(t, run.error) }}</span>
               </div>
+              <div v-if="activeRunIds.has(run.id)" class="mt-2 flex items-center gap-2">
+                <div class="h-1.5 min-w-0 flex-1 overflow-hidden rounded-full bg-muted" role="progressbar" :aria-label="t('databaseBackup.progress')" aria-valuemin="0" aria-valuemax="100" :aria-valuenow="run.progressPercent ?? 0">
+                  <div class="h-full rounded-full bg-primary transition-[width] duration-300" :style="{ width: `${run.progressPercent ?? 0}%` }" />
+                </div>
+                <span class="w-9 shrink-0 text-right text-xs tabular-nums text-muted-foreground">{{ run.progressPercent ?? 0 }}%</span>
+              </div>
             </div>
             <div class="flex items-center justify-end gap-1">
               <Loader2 v-if="activeRunIds.has(run.id)" class="mr-2 h-4 w-4 animate-spin text-primary" />
+              <Button variant="ghost" size="icon" class="h-8 w-8" :disabled="activeRunIds.has(run.id)" :title="t('databaseBackup.renameBackup')" @click="requestRenameRun(run)">
+                <Pencil class="h-4 w-4" />
+              </Button>
               <Button v-if="run.files[0]" variant="ghost" size="icon" class="h-8 w-8" :title="t('databaseBackup.revealFile')" @click="revealBackup(run.files[0])">
                 <FolderOpen class="h-4 w-4" />
               </Button>
@@ -382,7 +414,7 @@ function restoreBackup(run: DatabaseBackupRun, file: DatabaseBackupFile) {
   </div>
 
   <Dialog v-model:open="scheduleDialogOpen">
-    <DialogContent class="max-h-[min(760px,calc(var(--dbx-viewport-height)-32px))] max-w-[min(720px,calc(100vw-32px))] overflow-y-auto">
+    <DialogContent class="dbx-form-dialog dbx-form-dialog--lg max-h-[min(760px,calc(var(--dbx-viewport-height)-32px))] max-w-[min(720px,calc(100vw-32px))] overflow-y-auto">
       <DialogHeader>
         <DialogTitle>{{ editingScheduleId ? t("databaseBackup.editSchedule") : t("databaseBackup.addSchedule") }}</DialogTitle>
       </DialogHeader>
@@ -539,6 +571,22 @@ function restoreBackup(run: DatabaseBackupRun, file: DatabaseBackupFile) {
       <DialogFooter>
         <Button variant="outline" @click="deleteRunDialogOpen = false">{{ t("common.cancel") }}</Button>
         <Button variant="destructive" @click="confirmDeleteRun">{{ t("databaseBackup.delete") }}</Button>
+      </DialogFooter>
+    </DialogContent>
+  </Dialog>
+
+  <Dialog v-model:open="renameRunDialogOpen">
+    <DialogContent class="max-w-md">
+      <DialogHeader
+        ><DialogTitle>{{ t("databaseBackup.renameBackup") }}</DialogTitle></DialogHeader
+      >
+      <div class="space-y-2">
+        <Label>{{ t("databaseBackup.backupName") }}</Label>
+        <Input v-model="renameRunName" autofocus @keyup.enter="confirmRenameRun" />
+      </div>
+      <DialogFooter>
+        <Button variant="outline" @click="renameRunDialogOpen = false">{{ t("common.cancel") }}</Button>
+        <Button :disabled="!renameRunName.trim()" @click="confirmRenameRun">{{ t("common.save") }}</Button>
       </DialogFooter>
     </DialogContent>
   </Dialog>

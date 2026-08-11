@@ -92,6 +92,8 @@ pub struct AiAgentStreamRequest {
     pub request: AiCompletionRequest,
     pub connection_id: String,
     pub database: String,
+    #[serde(default)]
+    pub schema: Option<String>,
     pub db_type: String,
     /// Agent mode: "ask" (read-only tools) or "agent" (all tools including execute_query).
     /// Defaults to "ask" if not provided.
@@ -107,6 +109,8 @@ pub struct AiAgentStreamRequest {
     pub confirmed_connection_id: Option<String>,
     #[serde(default)]
     pub confirmed_database: Option<String>,
+    #[serde(default)]
+    pub confirmed_schema: Option<String>,
 }
 
 fn default_agent_mode() -> String {
@@ -424,8 +428,10 @@ pub async fn ai_agent_stream(
         body.confirmed_write_sql,
         body.confirmed_connection_id,
         body.confirmed_database,
+        body.confirmed_schema,
         &body.connection_id,
         &body.database,
+        body.schema.as_deref(),
     );
     // Writes are only allowed when a specific SQL statement was confirmed —
     // an empty confirmed_write_sql is treated as "no confirmation" so the
@@ -439,6 +445,7 @@ pub async fn ai_agent_stream(
         state: state.app.clone(),
         connection_id: body.connection_id,
         database: body.database,
+        schema: body.schema,
         db_type: parsed_db_type,
         cli_mcp_server_command: None,
         sql_permissions,
@@ -520,12 +527,28 @@ mod tests {
             claude_code_cli_env: Default::default(),
             pi_agent_cli_path: None,
             pi_agent_cli_env: Default::default(),
+            opencode_cli_path: None,
+            opencode_cli_env: Default::default(),
+            cursor_cli_path: None,
+            cursor_cli_env: Default::default(),
+            grok_cli_path: None,
+            grok_cli_env: Default::default(),
+            codebuddy_cli_path: None,
+            codebuddy_cli_env: Default::default(),
         }
     }
 
     #[test]
     fn rejects_local_cli_providers_single() {
-        for provider in [AiProvider::CodexCli, AiProvider::ClaudeCodeCli, AiProvider::PiAgentCli] {
+        for provider in [
+            AiProvider::CodexCli,
+            AiProvider::ClaudeCodeCli,
+            AiProvider::PiAgentCli,
+            AiProvider::OpenCodeCli,
+            AiProvider::CursorCli,
+            AiProvider::GrokCli,
+            AiProvider::CodeBuddyCli,
+        ] {
             let config = make_config(provider);
             assert!(reject_web_unsupported_ai_provider(&config).is_err());
         }
@@ -542,6 +565,7 @@ mod tests {
             AiProvider::Gemini,
             AiProvider::Deepseek,
             AiProvider::Qwen,
+            AiProvider::MiniMax,
             AiProvider::Ollama,
         ] {
             let config = make_config(provider.clone());
@@ -606,6 +630,14 @@ mod tests {
             claude_code_cli_env: Default::default(),
             pi_agent_cli_path: None,
             pi_agent_cli_env: Default::default(),
+            opencode_cli_path: None,
+            opencode_cli_env: Default::default(),
+            cursor_cli_path: None,
+            cursor_cli_env: Default::default(),
+            grok_cli_path: None,
+            grok_cli_env: Default::default(),
+            codebuddy_cli_path: None,
+            codebuddy_cli_env: Default::default(),
         };
 
         let body = super::AiTestConnectionRequest { config };

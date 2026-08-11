@@ -673,8 +673,10 @@ pub fn profile_for(db_type: DatabaseType) -> DdlDialectProfile {
         | Bigquery | Kylin | Oscar | Tdengine | Iotdb | Databricks | Jdbc => conservative_ansi(db_type),
 
         // Non-tabular / not applicable for relational CREATE TABLE
-        Redis | MongoDb | Elasticsearch | Qdrant | Milvus | Weaviate | ChromaDb | Neo4j | Cassandra | Etcd
-        | ZooKeeper | Nacos | InfluxDb | MessageQueue | Hbase => conservative_ansi(db_type),
+        Redis | MongoDb | Elasticsearch | Easysearch | Qdrant | Milvus | Weaviate | ChromaDb | Neo4j | Cassandra
+        | Etcd | ZooKeeper | Nacos | Consul | InfluxDb | VictoriaMetrics | MessageQueue | Mqtt | Hbase => {
+            conservative_ansi(db_type)
+        }
     }
 }
 

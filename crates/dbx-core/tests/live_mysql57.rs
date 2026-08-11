@@ -10,6 +10,7 @@ use dbx_core::sql::{split_sql_statements_for_database, SqlFileRequest};
 use dbx_core::sql_file_import::execute_sql_file_path;
 use dbx_core::storage::Storage;
 use dbx_core::table_import::parse_xlsx_file;
+use mysql_async::prelude::Queryable;
 use tokio_util::sync::CancellationToken;
 
 fn live_mysql_sql_file_config(id: &str) -> ConnectionConfig {
@@ -100,6 +101,38 @@ async fn live_mysql57_text_protocol_select_succeeds() {
 }
 
 #[tokio::test]
+#[ignore = "requires a MySQL endpoint that permits stored procedure creation"]
+async fn live_mysql_stored_procedure_preserves_all_result_sets() {
+    let url = std::env::var("DBX_LIVE_MYSQL57_URL").expect("DBX_LIVE_MYSQL57_URL");
+    let pool = dbx_core::db::mysql::connect(&url, std::time::Duration::from_secs(5)).await.unwrap();
+    let procedure = format!("dbx_issue_4609_{}", uuid::Uuid::new_v4().simple());
+    let mut conn = dbx_core::db::mysql::get_conn_with_health_check(&pool).await.unwrap();
+    conn.query_drop(format!(
+        "CREATE PROCEDURE `{procedure}`() BEGIN SELECT 1 AS value; SELECT 2 AS value; SELECT 3 AS value; END"
+    ))
+    .await
+    .unwrap();
+
+    let results = dbx_core::db::mysql::execute_query_results_on_conn_with_max_rows(
+        &mut conn,
+        &format!("CALL `{procedure}`()"),
+        false,
+        Some(10),
+        Default::default(),
+    )
+    .await;
+    let cleanup = conn.query_drop(format!("DROP PROCEDURE `{procedure}`")).await;
+
+    let results = results.unwrap();
+    cleanup.unwrap();
+    assert_eq!(results.len(), 3);
+    assert_eq!(
+        results.iter().map(|result| result.rows[0][0].clone()).collect::<Vec<_>>(),
+        vec![serde_json::json!("1"), serde_json::json!("2"), serde_json::json!("3")]
+    );
+}
+
+#[tokio::test]
 #[ignore = "requires a remote MySQL-compatible endpoint with a limited result-set query"]
 async fn live_mysql_compatible_limited_text_protocol_query_succeeds() {
     let url = std::env::var("DBX_LIVE_MYSQL_COMPAT_URL").expect("DBX_LIVE_MYSQL_COMPAT_URL");
@@ -152,6 +185,7 @@ async fn live_mysql_query_result_export_xlsx_streams_single_query_without_duplic
         connection_id: connection_id.clone(),
         database: database.clone(),
         schema: None,
+        catalog: None,
         sql: sql.clone(),
         query_base_sql: sql,
         setup_sql: Vec::new(),
@@ -241,6 +275,7 @@ async fn live_mysql_xlsx_export_can_outlive_query_timeout_while_rows_keep_arrivi
         connection_id: connection_id.clone(),
         database: database.clone(),
         schema: None,
+        catalog: None,
         sql: sql.clone(),
         query_base_sql: sql,
         setup_sql: Vec::new(),
